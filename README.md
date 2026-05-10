@@ -14,6 +14,7 @@ Sungkyunkwan University
 [![Paper](https://img.shields.io/badge/Paper-CVPR%202026-blue)](https://arxiv.org/abs/2603.22758)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](.)
 [![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-yellow)](https://huggingface.co/WJ0830/SlotCurri)
+[![Presentation](https://img.shields.io/badge/Presentation-Video-red?logo=youtube)](https://www.youtube.com/watch?v=x4xYsj64JGk)
 
 </div>
 
