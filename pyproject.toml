@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "slotcurry"
+name = "slotcurri"
 version = "0.1.0"
 description = "SlotCurri"
 authors = [
