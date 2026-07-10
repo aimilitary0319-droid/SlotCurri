@@ -28,6 +28,7 @@ class ModelConfig:
     visualize_every_n_steps: Optional[int] = 25000
     max_steps: int = 100000
     noise_scale: float = 0.1
+    attn_mass_curriculum: Optional[Dict[str, Any]] = None
     masks_to_visualize: Optional[List[str]] = None
     load_weights: Optional[str] = None
     modules_to_load: Optional[Dict[str, str]] = None

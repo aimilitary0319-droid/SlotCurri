@@ -59,7 +59,9 @@ class MLPDecoder(nn.Module):
         self.mlp = networks.MLP(inp_dim, outp_dim + 1, hidden_dims, activation=activation)
         self.pos_emb = nn.Parameter(torch.randn(1, 1, n_patches, inp_dim) * inp_dim**-0.5)
 
-    def forward(self, slots: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, slots: torch.Tensor, active_mask: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
         bs, n_slots, dims = slots.shape
 
         if not self.training and self.eval_output_size is not None:
@@ -75,6 +77,14 @@ class MLPDecoder(nn.Module):
         slots = slots + pos_emb
 
         recons, alpha = self.mlp(slots).split((self.outp_dim, 1), dim=-1)
+
+        if active_mask is not None:
+            # Exclude non-active slots from the reconstruction: their alpha is driven to
+            # a large negative value so their softmax mask becomes ~0 (no contribution).
+            m = active_mask.to(torch.bool)
+            if m.dim() == 2:
+                m = m[:, :, None, None]  # (bs, n_slots, 1, 1)
+            alpha = alpha.masked_fill(~m, torch.finfo(alpha.dtype).min)
 
         masks = torch.softmax(alpha, dim=1)
         recon = torch.sum(recons * masks, dim=1)

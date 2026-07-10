@@ -272,16 +272,31 @@ class Slot_Slot_Contrastive_Loss(Loss):
         self.temperature = temperature
         self.batch_contrast = batch_contrast
 
-    def forward(self, slots, _):
+    def forward(self, slots, _, active_mask=None):
+        # slots: (B, T, S, D); active_mask (optional): (B, T, S) bool.
         slots = nn.functional.normalize(slots, p=2.0, dim=-1)
         if self.batch_contrast:
             slots = slots.split(1)  # [1xTxKxD]
             slots = torch.cat(slots, dim=-2)  # 1xTxK*BxD
+            if active_mask is not None:
+                # match the (batch-concatenated) slot layout: (1, T, B*K)
+                active_mask = einops.rearrange(active_mask, "b t k -> t (b k)").unsqueeze(0)
         s1 = slots[:, :-1, :, :]
         s2 = slots[:, 1:, :, :]
         ss = torch.matmul(s1, s2.transpose(-2, -1)) / self.temperature
         B, T, S, D = ss.shape
         ss = ss.reshape(B * T, S, S)
-        target = torch.eye(S).expand(B * T, S, S).to(ss.device)
-        loss = self.criterion(ss, target)
+        if active_mask is None:
+            target = torch.eye(S).expand(B * T, S, S).to(ss.device)
+            loss = self.criterion(ss, target)
+            return loss
+
+        # active-only: only slots active at both frame t and t+1 count as anchors.
+        a1 = active_mask[:, :-1]
+        a2 = active_mask[:, 1:]
+        pair = (a1.bool() & a2.bool()).reshape(B * T, S).float()  # (B*T, S)
+        # CrossEntropy with identity target == -log_softmax over candidate rows at the diagonal.
+        logp = torch.log_softmax(ss, dim=1)
+        diag = torch.diagonal(logp, dim1=1, dim2=2)  # (B*T, S)
+        loss = -(diag * pair).sum() / pair.sum().clamp(min=1.0)
         return loss

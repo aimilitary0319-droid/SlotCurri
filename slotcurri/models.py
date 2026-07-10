@@ -141,6 +141,7 @@ def build(
         max_steps=model_config.get("max_steps", 100000),
         experiment_name=model_config.get("experiment_name", "default_experiment"),
         experiment_group=model_config.get("experiment_group", "default_group"),
+        attn_mass_curriculum=model_config.get("attn_mass_curriculum", None),
     )
 
     if model_config.load_weights:
@@ -173,6 +174,7 @@ class ObjectCentricModel(pl.LightningModule):
         max_steps: int = 100000,
         experiment_name: str = "default_experiment",
         experiment_group: str = "default_group",
+        attn_mass_curriculum: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.experiment_name = experiment_name
@@ -241,6 +243,43 @@ class ObjectCentricModel(pl.LightningModule):
         self.slot_loss_scale.requires_grad_(False)
         # self.noise_scale = self.initializer.initial_std * noise_scale
 
+        # --- attention-mass curriculum (dynamic slot gating) ---
+        amc = attn_mass_curriculum or {}
+        self.attn_mass_enabled = bool(amc.get("enabled", False))
+        # default (always-active) slots: `n_default` leading slots, or explicit `default_slot_idx`
+        n_default = amc.get("n_default", None)
+        if n_default is not None:
+            self.amc_default_idx = list(range(int(n_default)))
+        else:
+            di = amc.get("default_slot_idx", 0)
+            self.amc_default_idx = [int(di)] if isinstance(di, int) else [int(x) for x in di]
+        # thresholds: prefer multipliers of the uniform mass (1/n_slots), else absolute values
+        uniform = 1.0 / max(self.n_slots, 1)
+        if amc.get("p_start_mult", None) is not None:
+            self.amc_p_start = float(amc.get("p_start_mult")) * uniform
+        else:
+            self.amc_p_start = float(amc.get("p_start", 0.05))
+        if amc.get("p_end_mult", None) is not None:
+            self.amc_p_end = float(amc.get("p_end_mult")) * uniform
+        else:
+            self.amc_p_end = float(amc.get("p_end", 0.005))
+        self.amc_anneal_steps = int(amc.get("anneal_steps", self.max_steps // 4))
+        self._active_mask = None  # stashed per forward for loss/logging
+
+    def _gate_threshold(self, train: bool) -> Optional[float]:
+        """Attention-mass threshold p for the current step.
+
+        Training linearly anneals p_start -> p_end over `amc_anneal_steps` (strict->loose,
+        i.e. coarse-to-fine). Evaluation always uses the final (loosest) threshold p_end.
+        """
+        if not self.attn_mass_enabled:
+            return None
+        if not train:
+            return self.amc_p_end
+        step = self.trainer.global_step
+        frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
+        return self.amc_p_start + (self.amc_p_end - self.amc_p_start) * frac
+
     def configure_optimizers(self):
         modules = {
             "initializer": self.initializer,
@@ -261,7 +300,7 @@ class ObjectCentricModel(pl.LightningModule):
         H = W = int(HW**0.5) if HW > 0 else 1
 
         ### --- slot expansion schedule --- ###
-        if train:
+        if train and not self.attn_mass_enabled:
             for hi in range(len(self.hier_steps)):
                 if self.trainer.global_step == self.hier_steps[hi]: #
                     half = self.hier_n_slots[hi+1] # Next slot num
@@ -310,15 +349,27 @@ class ObjectCentricModel(pl.LightningModule):
                                 prev += cnt
 
         slots_initial = self.initializer(batch_size=batch_size) # batch x n_slots x slot_dim
-        if train:
+        if train and not self.attn_mass_enabled:
             for hi in range(len(self.hier_steps)):
                 if self.trainer.global_step <= self.hier_steps[hi]:
                     slots_initial = slots_initial[:, :self.hier_n_slots[hi], :]
                     break
 
-        processor_output = self.processor(slots_initial, features, cycle=cycle)
-        slots = processor_output["state"]
-        decoder_output = self.decoder(slots)
+        if self.attn_mass_enabled:
+            gate_p = self._gate_threshold(train)
+            processor_output = self.processor(
+                slots_initial, features, cycle=cycle,
+                gate_p=gate_p, default_idx=self.amc_default_idx,
+            )
+            slots = processor_output["state"]
+            active_mask = processor_output.get("active_mask")
+            self._active_mask = active_mask
+            decoder_output = self.decoder(slots, active_mask)
+        else:
+            self._active_mask = None
+            processor_output = self.processor(slots_initial, features, cycle=cycle)
+            slots = processor_output["state"]
+            decoder_output = self.decoder(slots)
         # feat_orig, feat_recon: (B, C, H, W)
         # 1) compute sobel gradients
         feat_recon = decoder_output['reconstruction'] #
@@ -419,7 +470,7 @@ class ObjectCentricModel(pl.LightningModule):
         for name, loss_fn in self.loss_fns.items():
             prediction = loss_fn.get_prediction(outputs)
             target = outputs["targets"][name]
-            if name == 'loss_featrec':
+            if name == 'loss_featrec' and not self.attn_mass_enabled:
                 if self.trainer.global_step + 1 == self.hier_steps[0] or self.trainer.global_step + 1 == self.hier_steps[1]:
                     loss_all = loss_fn(prediction, target, True).mean(-1, keepdim=True) # 64 2304 384 -> 64 2304 1
                     decoding_masks = outputs["decoder"]["masks"].permute(0, 1, 3, 2).flatten(1, 2) # 64 2304 2
@@ -428,7 +479,11 @@ class ObjectCentricModel(pl.LightningModule):
 
                     self.slot_loss_scale[:len(slot_loss_per_slot)] = slot_loss_per_slot.detach() # 2
 
-            losses[name] = loss_fn(prediction, target)
+            if name == 'loss_ss' and self.attn_mass_enabled and self._active_mask is not None:
+                # restrict the slot-slot contrastive loss to active slots
+                losses[name] = loss_fn(prediction, target, active_mask=self._active_mask)
+            else:
+                losses[name] = loss_fn(prediction, target)
 
         losses_weighted = [loss * self.loss_weights.get(name, 1.0) for name, loss in losses.items()]
         total_loss = torch.stack(losses_weighted).sum()
@@ -448,6 +503,10 @@ class ObjectCentricModel(pl.LightningModule):
         else:
             to_log = {f"train/{name}": loss for name, loss in losses.items()}
             to_log["train/loss"] = total_loss
+
+        if self.attn_mass_enabled and self._active_mask is not None:
+            to_log["train/active_slots"] = self._active_mask.float().sum(-1).mean()
+            to_log["train/gate_p"] = float(self._gate_threshold(True))
 
         if self.train_metrics:
             for key, metric in self.train_metrics.items():

@@ -31,7 +31,8 @@ class LatentProcessor(nn.Module):
             self.first_step_corrector_args = None
 
     def forward(
-        self, state: torch.Tensor, inputs: Optional[torch.Tensor], time_step: Optional[int] = None, onetoone: bool = False
+        self, state: torch.Tensor, inputs: Optional[torch.Tensor], time_step: Optional[int] = None,
+        onetoone: bool = False, gate_p: Optional[float] = None, default_idx: Any = 0,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -55,17 +56,46 @@ class LatentProcessor(nn.Module):
             updated_state = state
             state_attn_mask = None
 
+        # --- attention-mass gating: freeze non-active slots to their incoming state ---
+        # `state_attn_mask` is the last-iteration softmax-over-slots attention (B, S, F).
+        # Per-slot attention mass = fraction of patches claimed by that slot.
+        active_mask = None
+        if gate_p is not None and state_attn_mask is not None:
+            mass_frac = state_attn_mask.sum(dim=-1) / state_attn_mask.shape[-1]  # (B, S)
+            active = mass_frac >= gate_p  # (B, S)
+            # default slots are always active (exempt from the threshold)
+            default_list = [default_idx] if isinstance(default_idx, int) else list(default_idx)
+            for di in default_list:
+                if 0 <= int(di) < active.shape[1]:
+                    active[:, int(di)] = True
+            active_mask = active
+            a = active.unsqueeze(-1).to(updated_state.dtype)  # (B, S, 1)
+            # non-active slots keep the incoming (previous-frame) state (no corrector update)
+            updated_state = a * updated_state + (1.0 - a) * state
+
         if self.predictor:
             predicted_state = self.predictor(updated_state)
         else:
             # Just pass updated_state along as prediction
             predicted_state = updated_state
 
+        if active_mask is not None:
+            a = active_mask.unsqueeze(-1).to(predicted_state.dtype)
+            # non-active slots carry their incoming state unchanged to the next frame
+            predicted_state = a * predicted_state + (1.0 - a) * state
+
+        if active_mask is None:
+            # keep a consistent output tree; all slots are "active" when gating is off
+            active_mask = torch.ones(
+                updated_state.shape[:2], dtype=torch.bool, device=updated_state.device
+            )
+
         return {
             "state": updated_state,
             "state_predicted": predicted_state,
             "corrector": corrector_output,
             "state_attn_mask": state_attn_mask,
+            "active_mask": active_mask,
         }
 
 
@@ -124,7 +154,14 @@ class ScanOverTime(nn.Module):
         self.next_state_key = next_state_key
         self.pass_step = pass_step
 
-    def forward(self, initial_state: torch.Tensor, inputs: torch.Tensor, cycle: bool = False):
+    def forward(
+        self,
+        initial_state: torch.Tensor,
+        inputs: torch.Tensor,
+        cycle: bool = False,
+        gate_p: Optional[float] = None,
+        default_idx: Any = 0,
+    ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
         seq_len = inputs.shape[1]
@@ -133,9 +170,9 @@ class ScanOverTime(nn.Module):
         outputs = []
         for t in range(seq_len):
             if self.pass_step:
-                output = self.module(state, inputs[:, t], t)
+                output = self.module(state, inputs[:, t], t, gate_p=gate_p, default_idx=default_idx)
             else:
-                output = self.module(state, inputs[:, t])
+                output = self.module(state, inputs[:, t], gate_p=gate_p, default_idx=default_idx)
             outputs.append(output)
             state = output[self.next_state_key]
 
@@ -147,10 +184,7 @@ class ScanOverTime(nn.Module):
             state = outputs[-1][self.next_state_key]
             for t in range(seq_len - 1):
                 back_t = seq_len - t - 2
-                if self.pass_step:
-                    out = self.module(state, inputs[:, back_t])
-                else:
-                    out = self.module(state, inputs[:, back_t])
+                out = self.module(state, inputs[:, back_t], gate_p=gate_p, default_idx=default_idx)
                 new_outputs.append(out)
                 state = out[self.next_state_key]
             new_outputs = new_outputs[::-1]  # reverse the order of outputs
