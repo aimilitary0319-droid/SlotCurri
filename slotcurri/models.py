@@ -264,6 +264,18 @@ class ObjectCentricModel(pl.LightningModule):
         else:
             self.amc_p_end = float(amc.get("p_end", 0.005))
         self.amc_anneal_steps = int(amc.get("anneal_steps", self.max_steps // 4))
+        # gating mode: "hard" (binary active/dormant) or "soft" (sigmoid gate in [0, 1]).
+        # For soft gating, tau anneals from tau_start (soft) -> tau_end (sharp) so the gate
+        # gradually converges to the hard decision (soft-to-hard curriculum).
+        self.amc_gate_mode = str(amc.get("gate_mode", "hard"))
+        if amc.get("gate_tau_start_mult", None) is not None:
+            self.amc_tau_start = float(amc.get("gate_tau_start_mult")) * uniform
+        else:
+            self.amc_tau_start = float(amc.get("gate_tau_start", 0.05))
+        if amc.get("gate_tau_end_mult", None) is not None:
+            self.amc_tau_end = float(amc.get("gate_tau_end_mult")) * uniform
+        else:
+            self.amc_tau_end = float(amc.get("gate_tau_end", 0.01))
         self._active_mask = None  # stashed per forward for loss/logging
 
     def _gate_threshold(self, train: bool) -> Optional[float]:
@@ -279,6 +291,21 @@ class ObjectCentricModel(pl.LightningModule):
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
         return self.amc_p_start + (self.amc_p_end - self.amc_p_start) * frac
+
+    def _gate_tau(self, train: bool) -> Optional[float]:
+        """Sigmoid gate temperature for soft gating at the current step.
+
+        Training linearly anneals tau_start -> tau_end over `amc_anneal_steps` (soft->sharp,
+        i.e. soft-to-hard). Evaluation always uses the final (sharpest) tau_end.
+        Returns None when soft gating is disabled.
+        """
+        if not self.attn_mass_enabled or self.amc_gate_mode not in ("soft", "ste"):
+            return None
+        if not train:
+            return self.amc_tau_end
+        step = self.trainer.global_step
+        frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
+        return self.amc_tau_start + (self.amc_tau_end - self.amc_tau_start) * frac
 
     def configure_optimizers(self):
         modules = {
@@ -357,9 +384,11 @@ class ObjectCentricModel(pl.LightningModule):
 
         if self.attn_mass_enabled:
             gate_p = self._gate_threshold(train)
+            gate_tau = self._gate_tau(train)
             processor_output = self.processor(
                 slots_initial, features, cycle=cycle,
                 gate_p=gate_p, default_idx=self.amc_default_idx,
+                gate_mode=self.amc_gate_mode, gate_tau=gate_tau,
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
@@ -505,8 +534,11 @@ class ObjectCentricModel(pl.LightningModule):
             to_log["train/loss"] = total_loss
 
         if self.attn_mass_enabled and self._active_mask is not None:
+            # for soft gating this is the effective (summed-gate) active slot count
             to_log["train/active_slots"] = self._active_mask.float().sum(-1).mean()
             to_log["train/gate_p"] = float(self._gate_threshold(True))
+            if self.amc_gate_mode in ("soft", "ste"):
+                to_log["train/gate_tau"] = float(self._gate_tau(True))
 
         if self.train_metrics:
             for key, metric in self.train_metrics.items():

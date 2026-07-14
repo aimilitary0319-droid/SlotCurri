@@ -292,9 +292,11 @@ class Slot_Slot_Contrastive_Loss(Loss):
             return loss
 
         # active-only: only slots active at both frame t and t+1 count as anchors.
-        a1 = active_mask[:, :-1]
-        a2 = active_mask[:, 1:]
-        pair = (a1.bool() & a2.bool()).reshape(B * T, S).float()  # (B*T, S)
+        # Works for hard (bool) and soft (float gate in [0, 1]) masks: the product is a
+        # per-anchor weight, so partially-gated slots contribute proportionally.
+        a1 = active_mask[:, :-1].float()
+        a2 = active_mask[:, 1:].float()
+        pair = (a1 * a2).reshape(B * T, S)  # (B*T, S)
         # CrossEntropy with identity target == -log_softmax over candidate rows at the diagonal.
         logp = torch.log_softmax(ss, dim=1)
         diag = torch.diagonal(logp, dim1=1, dim2=2)  # (B*T, S)

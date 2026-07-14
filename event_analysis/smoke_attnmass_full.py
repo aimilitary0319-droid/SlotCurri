@@ -38,12 +38,17 @@ print("active_mask:", tuple(active.shape), active.dtype)
 print("decoder.masks:", tuple(dec_masks.shape))
 print("decoder.reconstruction:", tuple(recon.shape))
 
-print("\n-- gating stats (p_end = %.4f) --" % model.amc_p_end)
-print("mean active slots / frame:", active.float().sum(-1).mean().item())
-print("default slot always active:", bool(active[:, :, model.amc_default_idx].all()))
-mass = dec_masks.sum(-1)  # (B,T,S)
-print("max decoder mask mass on non-active slots:", mass[~active].abs().max().item()
-      if (~active).any() else "n/a (all active)")
+print("\n-- gating stats (mode=%s, p_end=%.4f) --" % (model.amc_gate_mode, model.amc_p_end))
+print("mean (effective) active slots / frame:", active.float().sum(-1).mean().item())
+# default slots: bool mask -> all True; float gate -> all ~1.0
+default_gate = active[:, :, model.amc_default_idx].float()
+print("default slots always active:", bool(torch.allclose(default_gate, torch.ones_like(default_gate))))
+if active.dtype == torch.bool:
+    mass = dec_masks.sum(-1)  # (B,T,S)
+    print("max decoder mask mass on non-active slots:", mass[~active].abs().max().item()
+          if (~active).any() else "n/a (all active)")
+else:
+    print("soft gate min/max:", active.min().item(), active.max().item())
 
 total, losses = model.compute_loss(out)
 print("\n-- losses --")

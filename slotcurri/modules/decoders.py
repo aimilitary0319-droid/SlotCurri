@@ -78,15 +78,25 @@ class MLPDecoder(nn.Module):
 
         recons, alpha = self.mlp(slots).split((self.outp_dim, 1), dim=-1)
 
-        if active_mask is not None:
-            # Exclude non-active slots from the reconstruction: their alpha is driven to
-            # a large negative value so their softmax mask becomes ~0 (no contribution).
-            m = active_mask.to(torch.bool)
+        if active_mask is None:
+            masks = torch.softmax(alpha, dim=1)
+        elif active_mask.dtype == torch.bool:
+            # hard gating: exclude non-active slots by driving their alpha to a large
+            # negative value so their softmax mask becomes ~0 (no contribution).
+            m = active_mask
             if m.dim() == 2:
                 m = m[:, :, None, None]  # (bs, n_slots, 1, 1)
             alpha = alpha.masked_fill(~m, torch.finfo(alpha.dtype).min)
+            masks = torch.softmax(alpha, dim=1)
+        else:
+            # soft gating: down-weight each slot's mask by its gate g in [0, 1], then
+            # renormalize over slots so the per-patch masks still sum to 1.
+            g = active_mask
+            if g.dim() == 2:
+                g = g[:, :, None, None]  # (bs, n_slots, 1, 1)
+            masks = torch.softmax(alpha, dim=1) * g
+            masks = masks / masks.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
-        masks = torch.softmax(alpha, dim=1)
         recon = torch.sum(recons * masks, dim=1)
 
         return {"reconstruction": recon, "masks": masks.squeeze(-1)}

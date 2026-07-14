@@ -85,4 +85,71 @@ print(f"loss_ss full={l_full.item():.4f}  active-only={l_active.item():.4f}  all
 assert torch.isfinite(l_active), "active-only contrastive loss must be finite"
 assert abs(l_full.item() - l_allA.item()) < 1e-4, "masked loss with all-active must match full loss"
 
+# ------------------------------------------------------------------
+# SOFT GATING: sigmoid gate in [0,1], default slots -> 1, decoder renormalized, differentiable
+# ------------------------------------------------------------------
+out_s = scan(slots0, feats, cycle=False, gate_p=0.2, default_idx=[0, 1],
+             gate_mode="soft", gate_tau=0.02)
+g = out_s["active_mask"]  # (B, T, S) float
+print("\n[soft] gate", tuple(g.shape), g.dtype, "min/max:", g.min().item(), g.max().item())
+assert g.dtype.is_floating_point, "soft gate must be float"
+assert (g >= 0).all() and (g <= 1.0 + 1e-5).all(), "soft gate must lie in [0,1]"
+assert torch.allclose(g[:, :, 0], torch.ones_like(g[:, :, 0])) and \
+       torch.allclose(g[:, :, 1], torch.ones_like(g[:, :, 1])), "default slots must have gate=1"
+
+# soft decoder: per-patch masks still sum to 1 after gate + renormalization
+dec_s = dec(out_s["state"], g)
+masks_s = dec_s["masks"]  # (B, T, S, F)
+persum_s = masks_s.sum(2)  # (B, T, F)
+print("[soft] per-patch mask sum min/max:", persum_s.min().item(), persum_s.max().item())
+assert torch.allclose(persum_s, torch.ones_like(persum_s), atol=1e-4)
+# limiting behavior: a gate of exactly 0 removes the slot entirely (mask mass -> 0),
+# while per-patch masses still renormalize to 1 over the remaining slots (hard-consistent).
+g_ctrl = torch.ones(B, T, S)
+g_ctrl[:, :, 3] = 0.0  # force slot 3 fully off
+dec_ctrl = dec(out_s["state"], g_ctrl)
+mask_ctrl = dec_ctrl["masks"]  # (B, T, S, F)
+off_mass = mask_ctrl[:, :, 3].abs().max().item()
+print("[soft] mask mass on gate==0 slot:", off_mass)
+assert off_mass < 1e-6, "a gate of 0 must remove the slot from reconstruction"
+assert torch.allclose(mask_ctrl.sum(2), torch.ones(B, T, F), atol=1e-4), \
+    "per-patch masks must still sum to 1 after removing a slot"
+
+# soft contrastive loss is finite
+l_soft = loss_fn(out_s["state"], None, active_mask=g)
+assert torch.isfinite(l_soft), "soft contrastive loss must be finite"
+
+# key advantage over hard gating: the gate itself is differentiable (gradient reaches corrector)
+corrector.zero_grad()
+g.sum().backward()
+gate_grad = sum(p.grad.abs().sum().item() for p in corrector.parameters() if p.grad is not None)
+print(f"[soft] loss_ss={l_soft.item():.4f}  gate grad-norm into corrector={gate_grad:.3e}")
+assert gate_grad > 0, "soft gate must be differentiable (gradient flows to corrector)"
+
+# ------------------------------------------------------------------
+# STE GATING: forward = hard 0/1 (true dormancy), backward = sigmoid surrogate (differentiable)
+# ------------------------------------------------------------------
+out_e = scan(slots0, feats, cycle=False, gate_p=0.2, default_idx=[0, 1],
+             gate_mode="ste", gate_tau=0.02)
+ge = out_e["active_mask"]  # (B, T, S) float, but exactly 0/1 in the forward pass
+uniq = torch.unique(ge.detach()).tolist()
+print("\n[ste] gate", tuple(ge.shape), ge.dtype, "unique values:", uniq)
+assert torch.all((ge == 0) | (ge == 1)), "STE forward gate must be exactly 0/1 (true dormancy)"
+assert ge[:, :, 0].all() and ge[:, :, 1].all(), "default slots must be active"
+
+# decoder: a gate of 0 removes the slot; per-patch masks still sum to 1
+dec_e = dec(out_e["state"], ge)
+mask_e = dec_e["masks"]  # (B, T, S, F)
+off_e = mask_e[ge == 0].abs().max().item() if (ge == 0).any() else 0.0
+print("[ste] max mask mass on gate==0 slots:", off_e)
+assert off_e < 1e-6, "STE dormant (gate=0) slots must not contribute to reconstruction"
+assert torch.allclose(mask_e.sum(2), torch.ones(B, T, F), atol=1e-4)
+
+# differentiability: gradient still reaches the corrector via the surrogate
+corrector.zero_grad()
+ge.sum().backward()
+ste_grad = sum(p.grad.abs().sum().item() for p in corrector.parameters() if p.grad is not None)
+print("[ste] gate grad-norm into corrector:", f"{ste_grad:.3e}")
+assert ste_grad > 0, "STE gate must be differentiable (surrogate gradient flows to corrector)"
+
 print("\nALL SMOKE CHECKS PASSED")

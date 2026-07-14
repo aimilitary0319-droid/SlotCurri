@@ -33,6 +33,7 @@ class LatentProcessor(nn.Module):
     def forward(
         self, state: torch.Tensor, inputs: Optional[torch.Tensor], time_step: Optional[int] = None,
         onetoone: bool = False, gate_p: Optional[float] = None, default_idx: Any = 0,
+        gate_mode: str = "hard", gate_tau: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -59,18 +60,40 @@ class LatentProcessor(nn.Module):
         # --- attention-mass gating: freeze non-active slots to their incoming state ---
         # `state_attn_mask` is the last-iteration softmax-over-slots attention (B, S, F).
         # Per-slot attention mass = fraction of patches claimed by that slot.
+        # `gate_mode`:
+        #   "hard" -> binary active/dormant (active_mask is bool); dormant slots removed.
+        #   "soft" -> continuous gate g = sigmoid((mass - p) / tau) in [0, 1] (float);
+        #            a small tau (annealed over training) sharpens toward the hard decision.
+        #   "ste"  -> straight-through: forward uses the hard 0/1 gate (true dormancy) while
+        #            the backward pass uses the sigmoid surrogate gradient (differentiable).
         active_mask = None
         if gate_p is not None and state_attn_mask is not None:
             mass_frac = state_attn_mask.sum(dim=-1) / state_attn_mask.shape[-1]  # (B, S)
-            active = mass_frac >= gate_p  # (B, S)
-            # default slots are always active (exempt from the threshold)
             default_list = [default_idx] if isinstance(default_idx, int) else list(default_idx)
-            for di in default_list:
-                if 0 <= int(di) < active.shape[1]:
-                    active[:, int(di)] = True
-            active_mask = active
-            a = active.unsqueeze(-1).to(updated_state.dtype)  # (B, S, 1)
-            # non-active slots keep the incoming (previous-frame) state (no corrector update)
+            if gate_mode in ("soft", "ste"):
+                tau = gate_tau if (gate_tau is not None and gate_tau > 0) else 1e-2
+                soft = torch.sigmoid((mass_frac - gate_p) / tau)  # (B, S) in (0, 1), differentiable
+                # default slots are always fully active (value 1, no gradient there)
+                default_vec = torch.zeros_like(soft[:1])  # (1, S)
+                for di in default_list:
+                    if 0 <= int(di) < default_vec.shape[1]:
+                        default_vec[0, int(di)] = 1.0
+                soft = torch.maximum(soft, default_vec)
+                if gate_mode == "ste":
+                    # forward = hard 0/1 (defaults forced on); backward = soft (sigmoid) gradient
+                    hard = torch.maximum((mass_frac >= gate_p).float(), default_vec)
+                    active_mask = hard + (soft - soft.detach())
+                else:
+                    active_mask = soft  # float gate weights in [0, 1]
+            else:
+                active = mass_frac >= gate_p  # (B, S)
+                # default slots are always active (exempt from the threshold)
+                for di in default_list:
+                    if 0 <= int(di) < active.shape[1]:
+                        active[:, int(di)] = True
+                active_mask = active  # bool
+            a = active_mask.unsqueeze(-1).to(updated_state.dtype)  # (B, S, 1)
+            # non-active (or partially gated) slots retain the incoming (previous-frame) state
             updated_state = a * updated_state + (1.0 - a) * state
 
         if self.predictor:
@@ -161,18 +184,24 @@ class ScanOverTime(nn.Module):
         cycle: bool = False,
         gate_p: Optional[float] = None,
         default_idx: Any = 0,
+        gate_mode: str = "hard",
+        gate_tau: Optional[float] = None,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
         seq_len = inputs.shape[1]
 
+        gate_kwargs = dict(
+            gate_p=gate_p, default_idx=default_idx, gate_mode=gate_mode, gate_tau=gate_tau,
+        )
+
         state = initial_state
         outputs = []
         for t in range(seq_len):
             if self.pass_step:
-                output = self.module(state, inputs[:, t], t, gate_p=gate_p, default_idx=default_idx)
+                output = self.module(state, inputs[:, t], t, **gate_kwargs)
             else:
-                output = self.module(state, inputs[:, t], gate_p=gate_p, default_idx=default_idx)
+                output = self.module(state, inputs[:, t], **gate_kwargs)
             outputs.append(output)
             state = output[self.next_state_key]
 
@@ -184,7 +213,7 @@ class ScanOverTime(nn.Module):
             state = outputs[-1][self.next_state_key]
             for t in range(seq_len - 1):
                 back_t = seq_len - t - 2
-                out = self.module(state, inputs[:, back_t], gate_p=gate_p, default_idx=default_idx)
+                out = self.module(state, inputs[:, back_t], **gate_kwargs)
                 new_outputs.append(out)
                 state = out[self.next_state_key]
             new_outputs = new_outputs[::-1]  # reverse the order of outputs
