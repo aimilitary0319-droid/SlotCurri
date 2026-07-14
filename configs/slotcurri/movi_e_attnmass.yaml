@@ -2,9 +2,10 @@ experiment_group: slotcurri
 experiment_name: movi_e_attnmass
 
 globals:
-  # attention-mass curriculum: over-provisioned slot pool. 24 covers MOVi-E's max
-  # object count (~23) + background while leaving memory headroom for a larger batch.
-  NUM_SLOTS: 24
+  # attention-mass curriculum: slot pool matched to the SlotContrast/SlotCurri
+  # baselines (max 15 slots) for a fair comparison. The curriculum gates how many
+  # of these 15 are active per frame rather than growing the pool over training.
+  NUM_SLOTS: 15
   SLOT_DIM: 128
   DINO_MODEL: vit_base_patch14_dinov2
   FEAT_DIM: 768
@@ -46,7 +47,7 @@ model:
     enabled: true
     n_default: 2        # slots 0,1 are always active (exempt from the threshold)
     p_start_mult: 5     # p_start = 5 / n_slots (strict: 5x the uniform mass 1/n_slots)
-    p_end_mult: 1       # p_end   = 1 / n_slots (uniform); also used at eval
+    p_end_mult: 0.4     # p_end   = 0.4 / n_slots (loose; ~all real objects pass); also used at eval
     anneal_steps: 75000 # linear anneal over max_steps / 4
 
   losses:
