@@ -152,4 +152,78 @@ ste_grad = sum(p.grad.abs().sum().item() for p in corrector.parameters() if p.gr
 print("[ste] gate grad-norm into corrector:", f"{ste_grad:.3e}")
 assert ste_grad > 0, "STE gate must be differentiable (surrogate gradient flows to corrector)"
 
+# ------------------------------------------------------------------
+# SCORE SHAPING: gamma-sharpened mass + purity rescue
+# ------------------------------------------------------------------
+class FakeCorrector(nn.Module):
+    """Returns a predetermined attention map so gating inputs are fully controlled."""
+    def __init__(self, masks):
+        super().__init__()
+        self.masks = masks  # (B, S, F)
+
+    def forward(self, state, inputs, **kwargs):
+        return {"slots": state + 0.5, "masks": self.masks}
+
+
+# 4 slots x 10 patches. Column-normalized (per-patch softmax over slots):
+#   slot 0: default; wins patches 3..9 (per-patch winner)
+#   slot 1: diffuse ghost, tiny attention everywhere
+#   slot 2: small-but-pure object: dominantly owns only patches 0..2
+#   slot 3: "always-second" ghost: 0.40 on patches 3..9, never wins
+Bp, Sp, Fp = 1, 4, 10
+A = torch.zeros(Bp, Sp, Fp)
+A[0, :, 0:3] = torch.tensor([[0.01], [0.01], [0.97], [0.01]])
+A[0, :, 3:10] = torch.tensor([[0.50], [0.05], [0.01], [0.40]])
+A = A / A.sum(dim=1, keepdim=True)  # exact per-patch normalization
+
+mass = A.sum(-1) / Fp                                   # (B, S) plain mass
+purity = (A * A).sum(-1) / A.sum(-1).clamp_min(1e-8)    # (B, S)
+print("\n[score] plain mass:", [f"{v:.3f}" for v in mass[0].tolist()])
+print("[score] purity:    ", [f"{v:.3f}" for v in purity[0].tolist()])
+
+fake_proc = LatentProcessor(FakeCorrector(A), predictor=None)
+state_in = torch.randn(Bp, Sp, 8)
+GATE_P, PURITY_Q = 0.4, 0.5
+
+# hard mode + purity rescue: small-but-pure slot 2 must be rescued (mass 0.30 < p),
+# ghosts 1 and 3 must stay dormant (low mass AND low purity), default 0 active.
+out_h = fake_proc(state_in, torch.randn(Bp, Fp, 8), gate_p=GATE_P, default_idx=[0],
+                  gate_mode="hard", purity_q=PURITY_Q)
+act = out_h["active_mask"][0]
+print("[score] hard active with purity rescue:", act.tolist())
+assert act.tolist() == [True, False, True, False], \
+    "expected: default on, ghost off, small-pure rescued, always-second off"
+
+# without the rescue, slot 2 must be dormant (mass below threshold) -> rescue is causal
+out_h0 = fake_proc(state_in, torch.randn(Bp, Fp, 8), gate_p=GATE_P, default_idx=[0],
+                   gate_mode="hard", purity_q=None)
+assert out_h0["active_mask"][0].tolist() == [True, False, False, False], \
+    "without purity rescue the small-pure slot must fall below the mass threshold"
+
+# ste mode: forward gate must be exactly 0/1 and match the hard decision (incl. rescue)
+out_e2 = fake_proc(state_in, torch.randn(Bp, Fp, 8), gate_p=GATE_P, default_idx=[0],
+                   gate_mode="ste", gate_tau=0.02, purity_q=PURITY_Q, purity_tau=0.05)
+ge2 = out_e2["active_mask"][0].detach()
+print("[score] ste forward gate with purity rescue:", ge2.tolist())
+assert torch.all((ge2 == 0) | (ge2 == 1)) and ge2.tolist() == [1.0, 0.0, 1.0, 0.0]
+
+# soft mode: rescued slot's gate ~1, ghosts' gates well below 0.5
+out_s2 = fake_proc(state_in, torch.randn(Bp, Fp, 8), gate_p=GATE_P, default_idx=[0],
+                   gate_mode="soft", gate_tau=0.02, purity_q=PURITY_Q, purity_tau=0.05)
+gs2 = out_s2["active_mask"][0]
+print("[score] soft gate with purity rescue:", [f"{v:.3f}" for v in gs2.tolist()])
+assert gs2[2] > 0.9 and gs2[1] < 0.5 and gs2[3] < 0.5
+
+# gamma sharpening: the always-second slot 3 must lose mass, the per-patch winner
+# slot 0 must gain, and the sharpened score must stay normalized over slots.
+out_g = fake_proc(state_in, torch.randn(Bp, Fp, 8), gate_p=GATE_P, default_idx=[0],
+                  gate_mode="hard", mass_gamma=3.0)
+A3 = A.pow(3.0)
+A3 = A3 / A3.sum(dim=1, keepdim=True)
+mass3 = A3.sum(-1) / Fp
+print("[score] gamma=3 mass:", [f"{v:.3f}" for v in mass3[0].tolist()])
+assert mass3[0, 3] < mass[0, 3], "always-second ghost must lose mass under sharpening"
+assert mass3[0, 0] > mass[0, 0], "per-patch winner must gain mass under sharpening"
+assert abs(mass3[0].sum().item() - 1.0 / Fp * Fp) < 1e-5, "sharpened mass must stay normalized"
+
 print("\nALL SMOKE CHECKS PASSED")

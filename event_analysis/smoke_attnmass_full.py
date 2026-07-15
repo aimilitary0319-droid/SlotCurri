@@ -51,9 +51,38 @@ else:
     print("soft gate min/max:", active.min().item(), active.max().item())
 
 total, losses = model.compute_loss(out)
-print("\n-- losses --")
+print("\n-- losses (eval mode: no gate sparsity) --")
 for k, v in losses.items():
     print(f"  {k}: {v.item():.5f}")
 print(f"  total: {total.item():.5f}")
 assert torch.isfinite(total), "total loss must be finite"
+assert "loss_gate_sparsity" not in losses, "gate sparsity must be training-only (skipped in eval)"
+
+# --- L1 gate sparsity penalty (training-mode) ---
+print("\n-- gate L1 sparsity (mode=%s, gate_l1=%s) --" % (model.amc_gate_mode, model.amc_gate_l1))
+if model.amc_gate_l1 > 0.0 and model.amc_gate_mode in ("soft", "ste"):
+    model.train()
+    # eval-path gate (train=False -> no trainer needed) but grad-enabled this time
+    out2 = model.forward(batch, train=False, cycle=True)
+    total2, losses2 = model.compute_loss(out2)
+    assert "loss_gate_sparsity" in losses2, "gate sparsity term must appear in training mode"
+    gp = losses2["loss_gate_sparsity"]
+    print("  loss_gate_sparsity (raw):", gp.item(),
+          "-> weighted:", (model.amc_gate_l1 * gp).item())
+    assert torch.isfinite(total2), "training total loss must be finite"
+    assert 0.0 <= gp.item() <= 1.0, "mean gate must be in [0, 1]"
+    # penalty alone must backprop into the processor (i.e. gate -> mass -> slot attention)
+    model.zero_grad()
+    (model.amc_gate_l1 * gp).backward()
+    proc_grad = sum(
+        p.grad.abs().sum().item() for p in model.processor.parameters() if p.grad is not None
+    )
+    print("  gate-sparsity grad into processor (abs sum):", proc_grad)
+    assert proc_grad > 0.0, "gate sparsity should backprop into the processor (differentiable gate)"
+    model.zero_grad()
+    model.eval()
+    print("  gate L1 sparsity OK")
+else:
+    print("  gate_l1 disabled or non-differentiable mode; skipped")
+
 print("\nFULL INTEGRATION SMOKE PASSED")

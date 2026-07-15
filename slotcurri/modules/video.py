@@ -34,6 +34,8 @@ class LatentProcessor(nn.Module):
         self, state: torch.Tensor, inputs: Optional[torch.Tensor], time_step: Optional[int] = None,
         onetoone: bool = False, gate_p: Optional[float] = None, default_idx: Any = 0,
         gate_mode: str = "hard", gate_tau: Optional[float] = None,
+        mass_gamma: float = 1.0, purity_q: Optional[float] = None,
+        purity_tau: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -68,11 +70,33 @@ class LatentProcessor(nn.Module):
         #            the backward pass uses the sigmoid surrogate gradient (differentiable).
         active_mask = None
         if gate_p is not None and state_attn_mask is not None:
-            mass_frac = state_attn_mask.sum(dim=-1) / state_attn_mask.shape[-1]  # (B, S)
+            att = state_attn_mask  # (B, S, F), per-patch softmax over slots
+            if mass_gamma is not None and float(mass_gamma) != 1.0:
+                # gamma-sharpened mass: per-patch attention raised to gamma and renormalized.
+                # gamma=1 -> plain attention mass (unchanged); gamma -> inf -> per-patch argmax
+                # winner share. Sharpening suppresses "always-second" ghost slots that gather
+                # mass without ever winning a patch, while keeping the score differentiable
+                # and normalized (sums to 1 over slots, mean 1/S -> p_mult semantics hold).
+                att_g = att.pow(float(mass_gamma))
+                att_g = att_g / att_g.sum(dim=1, keepdim=True).clamp_min(1e-8)
+                mass_frac = att_g.sum(dim=-1) / att_g.shape[-1]  # (B, S)
+            else:
+                mass_frac = att.sum(dim=-1) / att.shape[-1]  # (B, S)
+            purity = None
+            if purity_q is not None:
+                # size-invariant "ownership quality": attention-weighted mean of the slot's own
+                # per-patch attention (sum A^2 / sum A, in (0, 1]). High for slots that dominantly
+                # own the (few) patches they claim; low for diffuse ghost slots. Used as an OR
+                # rescue so small-but-cleanly-owned objects survive the mass threshold.
+                purity = (att * att).sum(dim=-1) / att.sum(dim=-1).clamp_min(1e-8)  # (B, S)
             default_list = [default_idx] if isinstance(default_idx, int) else list(default_idx)
             if gate_mode in ("soft", "ste"):
                 tau = gate_tau if (gate_tau is not None and gate_tau > 0) else 1e-2
                 soft = torch.sigmoid((mass_frac - gate_p) / tau)  # (B, S) in (0, 1), differentiable
+                if purity is not None:
+                    ptau = purity_tau if (purity_tau is not None and purity_tau > 0) else 5e-2
+                    # OR-combination: active if big enough (mass) OR cleanly owned (purity)
+                    soft = torch.maximum(soft, torch.sigmoid((purity - purity_q) / ptau))
                 # default slots are always fully active (value 1, no gradient there)
                 default_vec = torch.zeros_like(soft[:1])  # (1, S)
                 for di in default_list:
@@ -81,12 +105,17 @@ class LatentProcessor(nn.Module):
                 soft = torch.maximum(soft, default_vec)
                 if gate_mode == "ste":
                     # forward = hard 0/1 (defaults forced on); backward = soft (sigmoid) gradient
-                    hard = torch.maximum((mass_frac >= gate_p).float(), default_vec)
+                    hard_bool = mass_frac >= gate_p
+                    if purity is not None:
+                        hard_bool = hard_bool | (purity >= purity_q)
+                    hard = torch.maximum(hard_bool.float(), default_vec)
                     active_mask = hard + (soft - soft.detach())
                 else:
                     active_mask = soft  # float gate weights in [0, 1]
             else:
                 active = mass_frac >= gate_p  # (B, S)
+                if purity is not None:
+                    active = active | (purity >= purity_q)
                 # default slots are always active (exempt from the threshold)
                 for di in default_list:
                     if 0 <= int(di) < active.shape[1]:
@@ -186,6 +215,9 @@ class ScanOverTime(nn.Module):
         default_idx: Any = 0,
         gate_mode: str = "hard",
         gate_tau: Optional[float] = None,
+        mass_gamma: float = 1.0,
+        purity_q: Optional[float] = None,
+        purity_tau: Optional[float] = None,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -193,6 +225,7 @@ class ScanOverTime(nn.Module):
 
         gate_kwargs = dict(
             gate_p=gate_p, default_idx=default_idx, gate_mode=gate_mode, gate_tau=gate_tau,
+            mass_gamma=mass_gamma, purity_q=purity_q, purity_tau=purity_tau,
         )
 
         state = initial_state

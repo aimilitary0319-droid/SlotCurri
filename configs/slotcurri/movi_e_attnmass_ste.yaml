@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: movi_e_attnmass
+experiment_name: movi_e_attnmass_ste
 
 globals:
   # attention-mass curriculum: slot pool matched to the SlotContrast/SlotCurri
@@ -38,10 +38,10 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum ---
+  # --- attention-mass curriculum (STE gating) ---
   # Slots whose per-slot attention mass (fraction of patches claimed in the last
   # cross-attention iteration) exceeds `p` are "active"; only active slots (plus the
-  # always-active default slot) are decoded and contribute to the loss. Non-active
+  # always-active default slots) are decoded and contribute to the loss. Non-active
   # slots freeze their state and carry it unchanged to the next frame.
   attn_mass_curriculum:
     enabled: true
@@ -55,18 +55,18 @@ model:
     #          annealed wide -> sharp (soft-to-hard curriculum); no true dormancy until tau->0.
     #   ste  = straight-through: forward = hard 0/1 (true dormancy every step, like hard),
     #          backward = sigmoid surrogate gradient (differentiable, like soft).
-    # tau_* apply to both soft and ste (ste uses them only for the backward surrogate).
-    gate_mode: soft
-    gate_tau_start_mult: 0.5  # tau_start = 0.5 / n_slots (soft, wide transition band)
-    gate_tau_end_mult: 0.05   # tau_end   = 0.05 / n_slots (very sharp, near-hard); also used at eval
-                              #   -> sharpens the cut *at* p_end so sub-threshold (unused) slots go
-                              #      to ~0 without moving the boundary toward small real objects.
-    # L1 sparsity penalty on the (non-default) soft gates: a constant "rent" per active slot
-    # that pushes redundant/fragment slots toward g=0. Restores the anti-over-fragmentation
-    # pressure that decoder renormalization cancels for spatially-disjoint fragments in pure
-    # soft mode. Applied during training only; default slots are exempt. Tune by watching
-    # train/active_slots and val mBO/FG-ARI: too large -> under-segmentation; 0 disables it.
-    gate_l1: 0.02
+    # STE gets hard's crisp forward removal (no decoder-renorm loophole -> real
+    # over-fragmentation suppression) AND a differentiable boundary, with no extra
+    # sparsity knob. tau here shapes ONLY the backward surrogate; the forward decision
+    # is a plain threshold at `p`, so at eval STE == pure hard thresholding at p_end
+    # (tau is irrelevant at inference).
+    gate_mode: ste
+    gate_tau_start_mult: 0.5  # tau_start = 0.5 / n_slots (wide backward surrogate early)
+    gate_tau_end_mult: 0.05   # tau_end   = 0.05 / n_slots (sharp surrogate late; reduces STE bias)
+    # gate_l1: not needed for STE. Forward-hard removal already forces consolidation
+    # (removed fragments -> reconstruction penalty), unlike pure soft. Left at 0; a small
+    # value (e.g. 0.01) may be added as an ablation for extra slot-count control.
+    gate_l1: 0.0
     # --- slot score shaping ---
     # mass_gamma: per-patch attention raised to gamma and renormalized before the mass
     # average. 1.0 = plain attention mass (existing score, unchanged); >1 sharpens toward
@@ -78,13 +78,13 @@ model:
     # active even below the mass threshold, protecting small-but-cleanly-owned objects
     # from the p_end cutoff (~3.3% of patches). q anneals q_start -> q_end alongside p.
     # DISABLED for the first run: the rescue also protects small *fragments* (which
-    # cleanly own their patches too) and makes them immune to the L1 rent, weakening the
-    # core anti-over-fragmentation pressure. Kept as an ablation card: if validation
+    # cleanly own their patches too), weakening the core anti-over-fragmentation
+    # pressure of the forward-hard removal. Kept as an ablation card: if validation
     # shows small objects being absorbed, first try lowering p_end_mult (e.g. 0.3),
     # then re-enable by uncommenting purity_q_end below.
     # purity_q_start: 1.5
     # purity_q_end: 0.5   # "owns its claimed patches by majority on average"
-    # purity_tau: 0.05    # sigmoid temperature for the purity gate (soft/ste backward)
+    # purity_tau: 0.05    # sigmoid temperature for the purity gate (ste backward surrogate)
 
   losses:
     loss_featrec:
@@ -113,10 +113,13 @@ model:
     loss_ss: 0.5
 
   initializer:
-    # aligned with the SlotCurri/SlotContrast baseline (learnable prototypes) so the only
-    # change vs. baseline is the attention-mass gating, not the slot initialization.
-    # (FixedOrthogonalInit remains available as an ablation.)
-    name: FixedLearnedInit
+    # STE uses forward-hard gating, so dormant slots receive NO reconstruction gradient
+    # (only a weak counterfactual gate-path gradient). Learnable prototypes can therefore
+    # under-train / collapse under this regime, so we use a FIXED orthonormal init:
+    # it guarantees diverse, well-separated starting directions for every slot for free,
+    # without relying on the (weak) dormant gradient. (FixedLearnedInit -- the baseline --
+    # remains available as an ablation if you want a pure "gating-only" comparison.)
+    name: FixedOrthogonalInit
     n_slots: ${globals.NUM_SLOTS}
     dim: ${globals.SLOT_DIM}
 

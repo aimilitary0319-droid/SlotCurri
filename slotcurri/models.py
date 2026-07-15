@@ -276,6 +276,20 @@ class ObjectCentricModel(pl.LightningModule):
             self.amc_tau_end = float(amc.get("gate_tau_end_mult")) * uniform
         else:
             self.amc_tau_end = float(amc.get("gate_tau_end", 0.01))
+        # optional L1 sparsity penalty on the (soft/ste) gate. Charges a constant "rent"
+        # lambda per active non-default slot, pushing redundant slots' gates toward 0. This
+        # restores the anti-over-fragmentation pressure that decoder renormalization cancels
+        # for spatially-disjoint (lone-claimant) fragments in pure soft mode. 0 disables it.
+        self.amc_gate_l1 = float(amc.get("gate_l1", 0.0))
+        # score shaping: gamma-sharpened mass (1.0 = plain attention mass, unchanged) and an
+        # optional size-invariant purity rescue for small-but-cleanly-owned slots. The purity
+        # threshold q anneals q_start -> q_end alongside p (q_start > 1 keeps the rescue off
+        # early so the strict few-slots curriculum is not bypassed); eval uses q_end.
+        self.amc_mass_gamma = float(amc.get("mass_gamma", 1.0))
+        pq_end = amc.get("purity_q_end", None)
+        self.amc_purity_q_end = float(pq_end) if pq_end is not None else None
+        self.amc_purity_q_start = float(amc.get("purity_q_start", 1.5))
+        self.amc_purity_tau = float(amc.get("purity_tau", 0.05))
         self._active_mask = None  # stashed per forward for loss/logging
 
     def _gate_threshold(self, train: bool) -> Optional[float]:
@@ -306,6 +320,22 @@ class ObjectCentricModel(pl.LightningModule):
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
         return self.amc_tau_start + (self.amc_tau_end - self.amc_tau_start) * frac
+
+    def _purity_q(self, train: bool) -> Optional[float]:
+        """Purity-rescue threshold q for the current step (None = rescue disabled).
+
+        Training linearly anneals q_start -> q_end over `amc_anneal_steps`. With
+        q_start > 1 the rescue is effectively off early on (purity <= 1), so the strict
+        few-slots phase of the curriculum is preserved; the rescue phases in together
+        with the loosening mass threshold. Evaluation always uses q_end.
+        """
+        if not self.attn_mass_enabled or self.amc_purity_q_end is None:
+            return None
+        if not train:
+            return self.amc_purity_q_end
+        step = self.trainer.global_step
+        frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
+        return self.amc_purity_q_start + (self.amc_purity_q_end - self.amc_purity_q_start) * frac
 
     def configure_optimizers(self):
         modules = {
@@ -385,10 +415,13 @@ class ObjectCentricModel(pl.LightningModule):
         if self.attn_mass_enabled:
             gate_p = self._gate_threshold(train)
             gate_tau = self._gate_tau(train)
+            purity_q = self._purity_q(train)
             processor_output = self.processor(
                 slots_initial, features, cycle=cycle,
                 gate_p=gate_p, default_idx=self.amc_default_idx,
                 gate_mode=self.amc_gate_mode, gate_tau=gate_tau,
+                mass_gamma=self.amc_mass_gamma,
+                purity_q=purity_q, purity_tau=self.amc_purity_tau,
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
@@ -517,6 +550,30 @@ class ObjectCentricModel(pl.LightningModule):
         losses_weighted = [loss * self.loss_weights.get(name, 1.0) for name, loss in losses.items()]
         total_loss = torch.stack(losses_weighted).sum()
 
+        # --- L1 gate sparsity penalty (soft/ste gating only, training only) ---
+        # A constant per-slot "rent" (amc_gate_l1) pushes redundant slots' gates toward 0,
+        # restoring the consolidation pressure that decoder renormalization removes for
+        # lone-claimant (spatially-disjoint) fragments. Default slots are always-active and
+        # therefore exempt. Logged raw as `loss_gate_sparsity`; the weighted term is summed
+        # into the total. Skipped for hard gating (bool gate carries no gradient).
+        if (
+            self.training
+            and self.attn_mass_enabled
+            and self.amc_gate_l1 > 0.0
+            and self.amc_gate_mode in ("soft", "ste")
+            and self._active_mask is not None
+            and self._active_mask.dtype != torch.bool
+        ):
+            gate = self._active_mask.float()  # (B, T, S)
+            keep = torch.ones(gate.shape[-1], dtype=torch.bool, device=gate.device)
+            for di in self.amc_default_idx:
+                if 0 <= int(di) < keep.shape[0]:
+                    keep[int(di)] = False
+            if keep.any():
+                gate_sparsity = gate[..., keep].mean()
+                losses["loss_gate_sparsity"] = gate_sparsity
+                total_loss = total_loss + self.amc_gate_l1 * gate_sparsity
+
         return total_loss, losses
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
@@ -539,6 +596,8 @@ class ObjectCentricModel(pl.LightningModule):
             to_log["train/gate_p"] = float(self._gate_threshold(True))
             if self.amc_gate_mode in ("soft", "ste"):
                 to_log["train/gate_tau"] = float(self._gate_tau(True))
+            if self.amc_purity_q_end is not None:
+                to_log["train/purity_q"] = float(self._purity_q(True))
 
         if self.train_metrics:
             for key, metric in self.train_metrics.items():
