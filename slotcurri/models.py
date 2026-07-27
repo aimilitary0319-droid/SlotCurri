@@ -281,6 +281,10 @@ class ObjectCentricModel(pl.LightningModule):
         # restores the anti-over-fragmentation pressure that decoder renormalization cancels
         # for spatially-disjoint (lone-claimant) fragments in pure soft mode. 0 disables it.
         self.amc_gate_l1 = float(amc.get("gate_l1", 0.0))
+        # batch-entropy diversity loss (anti-collapse / load-balancing): encourages different
+        # slots to be used across the batch, counteracting rich-get-richer collapse to ~1 slot.
+        # 0 disables it. Opposite sign to gate_l1 (which prunes slots).
+        self.amc_gate_div = float(amc.get("gate_div", 0.0))
         # score shaping: gamma-sharpened mass (1.0 = plain attention mass, unchanged) and an
         # optional size-invariant purity rescue for small-but-cleanly-owned slots. The purity
         # threshold q anneals q_start -> q_end alongside p (q_start > 1 keeps the rescue off
@@ -290,13 +294,36 @@ class ObjectCentricModel(pl.LightningModule):
         self.amc_purity_q_end = float(pq_end) if pq_end is not None else None
         self.amc_purity_q_start = float(amc.get("purity_q_start", 1.5))
         self.amc_purity_tau = float(amc.get("purity_tau", 0.05))
+        # If True, state/predictor mix uses g / max(g) so the winner always gets a full
+        # update under soft gates. Decoder still sees the raw gate (renorm-invariant).
+        self.amc_state_max_norm = bool(amc.get("state_max_norm", False))
+        # If False, loss_ss ignores active_mask (baseline-style full-slot contrastive).
+        # Default True preserves v6/v7/v8 gated-anchor contrastive.
+        self.amc_contrastive_gate = bool(amc.get("contrastive_gate", True))
+        # p schedule shape over anneal_steps: "linear" (default, v6/v7/v8) or "log"
+        # (geometric: p = p_start * (p_end/p_start)^frac). Log drops the high early
+        # threshold faster so a large p_start does not linger into the mid jump.
+        self.amc_p_anneal = str(amc.get("p_anneal", "linear")).lower()
+        if self.amc_p_anneal not in ("linear", "log"):
+            raise ValueError(
+                f"attn_mass_curriculum.p_anneal must be 'linear' or 'log', got {self.amc_p_anneal!r}"
+            )
+        # tau schedule shape over anneal_steps: "linear" (default) or "log"
+        # (geometric: tau = tau_start * (tau_end/tau_start)^frac). Defaults to linear so
+        # v6–v10 configs are unchanged; v11 uses log for a faster early soft->sharp drop.
+        self.amc_tau_anneal = str(amc.get("tau_anneal", "linear")).lower()
+        if self.amc_tau_anneal not in ("linear", "log"):
+            raise ValueError(
+                f"attn_mass_curriculum.tau_anneal must be 'linear' or 'log', got {self.amc_tau_anneal!r}"
+            )
         self._active_mask = None  # stashed per forward for loss/logging
 
     def _gate_threshold(self, train: bool) -> Optional[float]:
         """Attention-mass threshold p for the current step.
 
-        Training linearly anneals p_start -> p_end over `amc_anneal_steps` (strict->loose,
-        i.e. coarse-to-fine). Evaluation always uses the final (loosest) threshold p_end.
+        Training anneals p_start -> p_end over `amc_anneal_steps` (strict->loose,
+        i.e. coarse-to-fine). Shape is controlled by `p_anneal` (linear or log).
+        Evaluation always uses the final (loosest) threshold p_end.
         """
         if not self.attn_mass_enabled:
             return None
@@ -304,14 +331,20 @@ class ObjectCentricModel(pl.LightningModule):
             return self.amc_p_end
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
+        if self.amc_p_anneal == "log":
+            # Geometric interpolation: leaves high p_start quickly, slows near p_end.
+            # Requires positive endpoints (always true for mass thresholds).
+            if self.amc_p_start <= 0.0 or self.amc_p_end <= 0.0:
+                raise ValueError("p_anneal='log' requires positive p_start and p_end")
+            return self.amc_p_start * ((self.amc_p_end / self.amc_p_start) ** frac)
         return self.amc_p_start + (self.amc_p_end - self.amc_p_start) * frac
 
     def _gate_tau(self, train: bool) -> Optional[float]:
         """Sigmoid gate temperature for soft gating at the current step.
 
-        Training linearly anneals tau_start -> tau_end over `amc_anneal_steps` (soft->sharp,
-        i.e. soft-to-hard). Evaluation always uses the final (sharpest) tau_end.
-        Returns None when soft gating is disabled.
+        Training anneals tau_start -> tau_end over `amc_anneal_steps` (soft->sharp).
+        Shape is controlled by `tau_anneal` (linear or log). Evaluation always uses
+        the final (sharpest) tau_end. Returns None when soft gating is disabled.
         """
         if not self.attn_mass_enabled or self.amc_gate_mode not in ("soft", "ste"):
             return None
@@ -319,6 +352,10 @@ class ObjectCentricModel(pl.LightningModule):
             return self.amc_tau_end
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
+        if self.amc_tau_anneal == "log":
+            if self.amc_tau_start <= 0.0 or self.amc_tau_end <= 0.0:
+                raise ValueError("tau_anneal='log' requires positive tau_start and tau_end")
+            return self.amc_tau_start * ((self.amc_tau_end / self.amc_tau_start) ** frac)
         return self.amc_tau_start + (self.amc_tau_end - self.amc_tau_start) * frac
 
     def _purity_q(self, train: bool) -> Optional[float]:
@@ -422,6 +459,7 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_mode=self.amc_gate_mode, gate_tau=gate_tau,
                 mass_gamma=self.amc_mass_gamma,
                 purity_q=purity_q, purity_tau=self.amc_purity_tau,
+                state_max_norm=self.amc_state_max_norm,
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
@@ -541,7 +579,12 @@ class ObjectCentricModel(pl.LightningModule):
 
                     self.slot_loss_scale[:len(slot_loss_per_slot)] = slot_loss_per_slot.detach() # 2
 
-            if name == 'loss_ss' and self.attn_mass_enabled and self._active_mask is not None:
+            if (
+                name == 'loss_ss'
+                and self.attn_mass_enabled
+                and self.amc_contrastive_gate
+                and self._active_mask is not None
+            ):
                 # restrict the slot-slot contrastive loss to active slots
                 losses[name] = loss_fn(prediction, target, active_mask=self._active_mask)
             else:
@@ -574,6 +617,28 @@ class ObjectCentricModel(pl.LightningModule):
                 losses["loss_gate_sparsity"] = gate_sparsity
                 total_loss = total_loss + self.amc_gate_l1 * gate_sparsity
 
+        # --- batch-entropy diversity loss (soft/ste, training only) ---
+        # Maximize the entropy of the batch-mean per-slot usage distribution so different
+        # slots get used across the batch (load balancing), counteracting the rich-get-richer
+        # collapse to a single slot. Logged term is (log S - H) >= 0 (0 = uniform usage,
+        # log S = fully collapsed); its gradient pushes usage toward uniform.
+        if (
+            self.training
+            and self.attn_mass_enabled
+            and self.amc_gate_div > 0.0
+            and self.amc_gate_mode in ("soft", "ste")
+            and self._active_mask is not None
+            and self._active_mask.dtype != torch.bool
+        ):
+            gate = self._active_mask.float()  # (B, T, S)
+            gbar = gate.mean(dim=tuple(range(gate.dim() - 1)))  # (S,) mean usage per slot
+            q = gbar / gbar.sum().clamp_min(1e-8)               # distribution over slots
+            neg_entropy = (q * q.clamp_min(1e-8).log()).sum()   # = -H(q)
+            log_s = float(np.log(gate.shape[-1]))
+            div_term = neg_entropy + log_s                       # log S - H(q) >= 0
+            losses["loss_gate_div"] = div_term
+            total_loss = total_loss + self.amc_gate_div * div_term
+
         return total_loss, losses
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
@@ -592,10 +657,24 @@ class ObjectCentricModel(pl.LightningModule):
 
         if self.attn_mass_enabled and self._active_mask is not None:
             # for soft gating this is the effective (summed-gate) active slot count
-            to_log["train/active_slots"] = self._active_mask.float().sum(-1).mean()
+            gate = self._active_mask.float()  # (B, T, S) or (B, S)
+            to_log["train/active_slots"] = gate.sum(-1).mean()
             to_log["train/gate_p"] = float(self._gate_threshold(True))
             if self.amc_gate_mode in ("soft", "ste"):
                 to_log["train/gate_tau"] = float(self._gate_tau(True))
+                # Distinguish "one strong winner" vs "all slots weakly on":
+                # sum(g) alone cannot tell these apart.
+                g_max = gate.amax(dim=-1)  # (...,)
+                g_sorted = gate.sort(dim=-1, descending=True).values
+                g_top2 = g_sorted[..., : min(2, g_sorted.shape[-1])].sum(-1)
+                # entropy of per-example gate distribution (normalized over slots)
+                q = gate / gate.sum(-1, keepdim=True).clamp_min(1e-8)
+                ent = -(q * q.clamp_min(1e-8).log()).sum(-1)  # (...,)
+                to_log["train/gate_max"] = g_max.mean()
+                to_log["train/gate_top2"] = g_top2.mean()
+                to_log["train/gate_entropy"] = ent.mean()
+                # hard-ish fraction: slots with g > 0.5
+                to_log["train/gate_n_half"] = (gate > 0.5).float().sum(-1).mean()
             if self.amc_purity_q_end is not None:
                 to_log["train/purity_q"] = float(self._purity_q(True))
 

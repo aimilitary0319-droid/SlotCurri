@@ -1,10 +1,7 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v3
+experiment_name: ytvis_attnmass_v11
 
 globals:
-  # attention-mass curriculum: slot pool matched to the SlotCurri ytvis baseline
-  # (max 7 slots) for a fair comparison. The curriculum gates how many of these 7
-  # are active per frame rather than growing the pool over training.
   NUM_SLOTS: 7
   SLOT_DIM: 64
   DINO_MODEL: vit_base_patch14_dinov2
@@ -37,41 +34,26 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum (soft gating + L1) ---
-  # Slots whose per-slot attention mass (fraction of patches claimed in the last
-  # cross-attention iteration) exceeds `p` are "active"; only active slots (plus the
-  # always-active default slots) are decoded and contribute to the loss. Non-active
-  # slots freeze their state and carry it unchanged to the next frame.
-    # v3 variant: keeps the 2 default slots, but moderate p_start (2/n_slots), gamma
-    # sharpening, no L1, and a lower p_end. Contrast against v2 (no defaults, uniform
-    # p_start) to see whether keeping defaults + a moderate threshold helps.
+  # --- attention-mass curriculum v11 = v10 package + log tau anneal ---
+  # Keep v10 stabilizers (state_max_norm, contrastive_gate off, gamma=2, soft).
+  #   p:   1.0 -> 0.2   linear (milder start than v10's 1.5, looser end than v10's 0.3)
+  #   tau: 0.3 -> 0.1   log    (start at v10 fixed softness, end sharper than v10)
   attn_mass_curriculum:
     enabled: true
-    n_default: 2        # slots 0,1 are always active (exempt from the threshold)
-    p_start_mult: 2     # p_start = 2 / n_slots ~= 0.286
-    p_end_mult: 0.2     # p_end   = 0.2 / n_slots ~= 0.029; also used at eval
-    anneal_steps: 66000 # linear anneal over ~2/3 of max_steps; final 1/3 trains at p_end
-    # gating mode:
-    #   hard = binary active/dormant (bool); dormant slots fully removed.
-    #   soft = differentiable sigmoid gate g = sigmoid((mass - p) / tau) in [0,1], with tau
-    #          annealed wide -> sharp (soft-to-hard curriculum); no true dormancy until tau->0.
-    #   ste  = straight-through: forward = hard 0/1 (true dormancy every step, like hard),
-    #          backward = sigmoid surrogate gradient (differentiable, like soft).
-    # tau_* apply to both soft and ste (ste uses them only for the backward surrogate).
+    n_default: 0
+    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
+    p_end_mult: 0.2     # p_end   = 0.2/7 ~= 0.0286
+    p_anneal: linear
+    anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.5  # tau_start = 0.5 / n_slots (soft, wide transition band)
-    gate_tau_end_mult: 0.05   # tau_end   = 0.05 / n_slots (very sharp, near-hard); also used at eval
-    # L1 DISABLED (0.0) for this variant: it was suppressing marginal small-object slots.
+    gate_tau_start_mult: 0.3   # tau_start = 0.3/7 ~= 0.0429
+    gate_tau_end_mult: 0.1     # tau_end   = 0.1/7 ~= 0.0143
+    tau_anneal: log            # geometric tau (requires code support in models.py)
     gate_l1: 0.0
-    # gamma-sharpened mass (2 -> toward per-patch argmax winner share; suppresses ghosts).
     mass_gamma: 2.0
-    # purity rescue (DISABLED for the first run, same rationale as movi_e: it also
-    # protects small fragments and makes them immune to the L1 rent). If validation
-    # shows small objects being absorbed, first try lowering p_end_mult (e.g. 0.3),
-    # then re-enable by uncommenting purity_q_end below.
-    # purity_q_start: 1.5
-    # purity_q_end: 0.5   # "owns its claimed patches by majority on average"
-    # purity_tau: 0.05    # sigmoid temperature for the purity gate (soft/ste backward)
+    gate_div: 0.0
+    state_max_norm: true
+    contrastive_gate: false
 
   losses:
     loss_featrec:
@@ -93,7 +75,7 @@ model:
       batch_contrast: true
       patch_inputs: false
       keep_input_dim: true
-      gate_negatives: true   # weight dormant/partially-gated slots as negatives by their gate
+      gate_negatives: false
 
   loss_weights:
     loss_featrec: 1.0
@@ -101,9 +83,6 @@ model:
     loss_ss: 0.5
 
   initializer:
-    # aligned with the SlotCurri/SlotContrast baseline (learnable prototypes) so the only
-    # change vs. baseline is the attention-mass gating, not the slot initialization.
-    # (FixedOrthogonalInit remains available as an ablation.)
     name: FixedLearnedInit
     n_slots: ${globals.NUM_SLOTS}
     dim: ${globals.SLOT_DIM}

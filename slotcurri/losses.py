@@ -265,12 +265,18 @@ class Slot_Slot_Contrastive_Loss(Loss):
         target_key: str,
         temperature: float = 0.1,
         batch_contrast: bool = True,
+        gate_negatives: bool = False,
         **kwargs,
     ):
         super().__init__(pred_key, target_key, **kwargs)
         self.criterion = nn.CrossEntropyLoss()
         self.temperature = temperature
         self.batch_contrast = batch_contrast
+        # If True, weight each candidate (negative) in the softmax denominator by its gate,
+        # so dormant/partially-gated slots contribute proportionally as negatives instead of
+        # at full strength. Only affects the active-mask path; default False keeps the
+        # original (baseline-aligned) behavior where all slots are full-strength negatives.
+        self.gate_negatives = gate_negatives
 
     def forward(self, slots, _, active_mask=None):
         # slots: (B, T, S, D); active_mask (optional): (B, T, S) bool.
@@ -296,7 +302,21 @@ class Slot_Slot_Contrastive_Loss(Loss):
         # per-anchor weight, so partially-gated slots contribute proportionally.
         a1 = active_mask[:, :-1].float()
         a2 = active_mask[:, 1:].float()
-        pair = (a1 * a2).reshape(B * T, S)  # (B*T, S)
+        # Detach the gate weights so the contrastive loss uses them ONLY as fixed per-anchor
+        # importance masks, never as a learnable lever. Without detach, loss = -sum(diag*pair)/
+        # sum(pair) is a gate-weighted average of alignment quality, which is minimized by
+        # concentrating gate weight on already-well-aligned (high-mass) slots and driving the
+        # gates of poorly-aligned (small-object, low-mass) slots toward 0 -> mass concentration
+        # / slot collapse. Detaching removes that pro-collapse gradient: gates are then shaped
+        # only by featrec (anti-collapse) + gate_div, and loss_ss trains representations only.
+        pair = (a1.detach() * a2.detach()).reshape(B * T, S)  # (B*T, S)
+        if self.gate_negatives:
+            # Weight each candidate (frame-t slot i, the softmax axis dim=1) by its gate:
+            # adding log(gate_i) to the logits makes logsumexp weight negatives by their
+            # gate. Hard/STE gates in {0, 1} -> log(1)=0 keep, log(0)=-inf drop (mask dormant
+            # negatives); soft gates in (0, 1) -> continuous down-weighting. Unifies all modes.
+            log_a1 = torch.log(a1.reshape(B * T, S).clamp_min(1e-8))  # (B*T, S)
+            ss = ss + log_a1.unsqueeze(-1)  # broadcast over the frame-(t+1) axis (dim=2)
         # CrossEntropy with identity target == -log_softmax over candidate rows at the diagonal.
         logp = torch.log_softmax(ss, dim=1)
         diag = torch.diagonal(logp, dim1=1, dim2=2)  # (B*T, S)

@@ -100,6 +100,7 @@ model:
       batch_contrast: true
       patch_inputs: false
       keep_input_dim: true
+      gate_negatives: true   # weight dormant/partially-gated slots as negatives by their gate
 
   loss_weights:
     loss_featrec: 1.0

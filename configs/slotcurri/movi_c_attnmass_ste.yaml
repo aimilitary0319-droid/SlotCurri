@@ -102,6 +102,7 @@ model:
       batch_contrast: true
       patch_inputs: false
       keep_input_dim: true
+      gate_negatives: true   # weight dormant/partially-gated slots as negatives by their gate
 
   loss_weights:
     loss_featrec: 1.0
@@ -109,13 +110,10 @@ model:
     loss_ss: 0.5
 
   initializer:
-    # STE uses forward-hard gating, so dormant slots receive NO reconstruction gradient
-    # (only a weak counterfactual gate-path gradient). Learnable prototypes can therefore
-    # under-train / collapse under this regime, so we use a FIXED orthonormal init:
-    # it guarantees diverse, well-separated starting directions for every slot for free,
-    # without relying on the (weak) dormant gradient. (FixedLearnedInit -- the baseline --
-    # remains available as an ablation if you want a pure "gating-only" comparison.)
-    name: FixedOrthogonalInit
+    # Learnable prototypes, aligned with the SlotCurri/SlotContrast baseline and the soft
+    # configs, so the only variable across all experiments is the gating (not the init).
+    # (FixedOrthogonalInit remains available as an ablation.)
+    name: FixedLearnedInit
     n_slots: ${globals.NUM_SLOTS}
     dim: ${globals.SLOT_DIM}
 

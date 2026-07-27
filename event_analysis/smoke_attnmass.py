@@ -226,4 +226,33 @@ assert mass3[0, 3] < mass[0, 3], "always-second ghost must lose mass under sharp
 assert mass3[0, 0] > mass[0, 0], "per-patch winner must gain mass under sharpening"
 assert abs(mass3[0].sum().item() - 1.0 / Fp * Fp) < 1e-5, "sharpened mass must stay normalized"
 
+# ------------------------------------------------------------------
+# CONTRASTIVE: gate_negatives option (weight/mask dormant slots as negatives)
+# ------------------------------------------------------------------
+loss_fn_gn = Slot_Slot_Contrastive_Loss(
+    pred_key="processor.state", target_key="processor.state",
+    temperature=0.1, batch_contrast=True, patch_inputs=False, keep_input_dim=True,
+    gate_negatives=True,
+)
+# hard mask: with gate_negatives the dormant slots drop out of the denominator, so the
+# loss generally differs from the default (full-negative) formulation but stays finite.
+l_gn_hard = loss_fn_gn(state, None, active_mask=active)
+assert torch.isfinite(l_gn_hard), "gate_negatives loss must be finite (hard mask)"
+# when ALL slots are active, gate_negatives must be a no-op (log(1)=0 added everywhere)
+l_gn_allA = loss_fn_gn(state, None, active_mask=torch.ones_like(active))
+assert abs(l_gn_allA.item() - l_allA.item()) < 1e-4, \
+    "gate_negatives with all-active must match the ungated loss (log(1)=0)"
+# soft gate: finite and differentiable into the corrector (fresh forward: earlier soft
+# section already consumed out_s's autograd graph)
+out_s2 = scan(slots0, feats, cycle=False, gate_p=0.2, default_idx=[0, 1],
+              gate_mode="soft", gate_tau=0.02)
+corrector.zero_grad()
+l_gn_soft = loss_fn_gn(out_s2["state"], None, active_mask=out_s2["active_mask"])
+assert torch.isfinite(l_gn_soft), "gate_negatives loss must be finite (soft gate)"
+l_gn_soft.backward()
+gn_grad = sum(p.grad.abs().sum().item() for p in corrector.parameters() if p.grad is not None)
+print("\n[gate_neg] hard=%.4f  all-active=%.4f (== %.4f)  soft=%.4f  grad=%.3e"
+      % (l_gn_hard.item(), l_gn_allA.item(), l_allA.item(), l_gn_soft.item(), gn_grad))
+assert gn_grad > 0, "gate_negatives soft path must be differentiable"
+
 print("\nALL SMOKE CHECKS PASSED")

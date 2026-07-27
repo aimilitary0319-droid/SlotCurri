@@ -36,6 +36,7 @@ class LatentProcessor(nn.Module):
         gate_mode: str = "hard", gate_tau: Optional[float] = None,
         mass_gamma: float = 1.0, purity_q: Optional[float] = None,
         purity_tau: Optional[float] = None,
+        state_max_norm: bool = False,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -121,7 +122,19 @@ class LatentProcessor(nn.Module):
                     if 0 <= int(di) < active.shape[1]:
                         active[:, int(di)] = True
                 active_mask = active  # bool
-            a = active_mask.unsqueeze(-1).to(updated_state.dtype)  # (B, S, 1)
+            # State / predictor mix can optionally use max-normalized gates so the winner
+            # always gets a full update (g_state = g / max(g)). Decoder and returned
+            # active_mask keep the raw gate (decoder is scale-invariant after renorm;
+            # logging / contrastive keep absolute mass semantics).
+            a_state = active_mask
+            if (
+                state_max_norm
+                and active_mask is not None
+                and active_mask.dtype != torch.bool
+            ):
+                gmax = active_mask.amax(dim=-1, keepdim=True).clamp_min(1e-8)
+                a_state = active_mask / gmax
+            a = a_state.unsqueeze(-1).to(updated_state.dtype)  # (B, S, 1)
             # non-active (or partially gated) slots retain the incoming (previous-frame) state
             updated_state = a * updated_state + (1.0 - a) * state
 
@@ -132,7 +145,11 @@ class LatentProcessor(nn.Module):
             predicted_state = updated_state
 
         if active_mask is not None:
-            a = active_mask.unsqueeze(-1).to(predicted_state.dtype)
+            a_state = active_mask
+            if state_max_norm and active_mask.dtype != torch.bool:
+                gmax = active_mask.amax(dim=-1, keepdim=True).clamp_min(1e-8)
+                a_state = active_mask / gmax
+            a = a_state.unsqueeze(-1).to(predicted_state.dtype)
             # non-active slots carry their incoming state unchanged to the next frame
             predicted_state = a * predicted_state + (1.0 - a) * state
 
@@ -218,6 +235,7 @@ class ScanOverTime(nn.Module):
         mass_gamma: float = 1.0,
         purity_q: Optional[float] = None,
         purity_tau: Optional[float] = None,
+        state_max_norm: bool = False,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -226,6 +244,7 @@ class ScanOverTime(nn.Module):
         gate_kwargs = dict(
             gate_p=gate_p, default_idx=default_idx, gate_mode=gate_mode, gate_tau=gate_tau,
             mass_gamma=mass_gamma, purity_q=purity_q, purity_tau=purity_tau,
+            state_max_norm=state_max_norm,
         )
 
         state = initial_state

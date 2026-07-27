@@ -1,10 +1,10 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_ste
+experiment_name: ytvis_attnmass_v2
 
 globals:
-  # attention-mass curriculum: slot pool matched to the SlotCurri ytvis baseline
-  # (max 7 slots) for a fair comparison. The curriculum gates how many of these 7
-  # are active per frame rather than growing the pool over training.
+  # attention-mass curriculum v2: no default slots, uniform-anchored thresholds,
+  # gamma-sharpened mass, stronger L1. Slot pool matched to the SlotCurri ytvis
+  # baseline (max 7 slots) for a fair comparison.
   NUM_SLOTS: 7
   SLOT_DIM: 64
   DINO_MODEL: vit_base_patch14_dinov2
@@ -37,53 +37,47 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum (STE gating) ---
-  # Slots whose per-slot attention mass (fraction of patches claimed in the last
-  # cross-attention iteration) exceeds `p` are "active"; only active slots (plus the
-  # always-active default slots) are decoded and contribute to the loss. Non-active
-  # slots freeze their state and carry it unchanged to the next frame.
-    # p_start is an ABSOLUTE mass threshold (not a uniform-mass multiplier): with only 7
-    # slots, 5/n_slots ~= 0.71 is unreachable (no slot claims 71% of patches), so early
-    # training would be stuck at the 2 default slots for ~half the run. 0.35 matches the
-    # reachable movi_e start (0.333) and transfers cleanly across slot pools. p_end stays a
-    # multiplier since it scales naturally with the slot count.
+  # --- attention-mass curriculum v2 (soft gating, no defaults) ---
+  # v2 design rationale (from the v1 failure analysis + mass calibration on ytvis val):
+  #  * v1 absolute p_start (0.35) was unreachable for single objects (median object =
+  #    1.7% of frame) -> only the 2 default slots ever activated ("2-slot lock-in"),
+  #    and frozen non-default slots were squeezed to mass ~0.006 by the trained
+  #    defaults (rich-get-richer deadlock: frozen -> can't grow mass -> stays frozen).
+  #  * v2 anchors p_start AT the uniform mass (1/n_slots): reachable by construction
+  #    (at init attention is ~uniform, every gate starts at ~0.5, all slots keep
+  #    updating at half rate -> no deadlock), and since masses sum to 1, at least one
+  #    slot always has mass >= 1/n_slots -> the active set can never be empty ->
+  #    default slots are unnecessary (n_default: 0).
+  #  * mass_gamma 2 sharpens per-patch attention toward the argmax winner share:
+  #    small-but-cleanly-owned object slots keep their mass while diffuse
+  #    "always-second" ghost slots collapse -> separates real small objects (~0.03)
+  #    from squeezed noise (~0.006) at the p_end boundary.
+  #  * gate_l1 0.05 (was 0.02): with no exempt defaults the L1 "rent" is the main
+  #    consolidation pressure; ~0.007 per extra slot vs featrec ~1.9.
   attn_mass_curriculum:
     enabled: true
-    n_default: 2        # slots 0,1 are always active (exempt from the threshold)
-    p_start: 0.35       # absolute; a non-default slot is active early only if it claims >=35% of patches
-    p_end_mult: 0.5     # p_end   = 0.5 / n_slots ~= 0.071; also used at eval
+    n_default: 0        # no always-active slots; pigeonhole (sum of masses = 1) keeps
+                        # the active set non-empty for any p <= 1/n_slots
+    p_start_mult: 1     # p_start = 1/7 ~= 0.143 (= uniform mass; every gate ~0.5 at init)
+    p_end_mult: 0.2     # p_end   = 0.2/7 ~= 0.029; also used at eval
     anneal_steps: 66000 # linear anneal over ~2/3 of max_steps; final 1/3 trains at p_end
-    # gating mode:
-    #   hard = binary active/dormant (bool); dormant slots fully removed.
-    #   soft = differentiable sigmoid gate g = sigmoid((mass - p) / tau) in [0,1], with tau
-    #          annealed wide -> sharp (soft-to-hard curriculum); no true dormancy until tau->0.
-    #   ste  = straight-through: forward = hard 0/1 (true dormancy every step, like hard),
-    #          backward = sigmoid surrogate gradient (differentiable, like soft).
-    # STE gets hard's crisp forward removal (no decoder-renorm loophole -> real
-    # over-fragmentation suppression) AND a differentiable boundary, with no extra
-    # sparsity knob. tau here shapes ONLY the backward surrogate; the forward decision
-    # is a plain threshold at `p`, so at eval STE == pure hard thresholding at p_end
-    # (tau is irrelevant at inference).
-    gate_mode: ste
-    gate_tau_start_mult: 0.5  # tau_start = 0.5 / n_slots (wide backward surrogate early)
-    gate_tau_end_mult: 0.05   # tau_end   = 0.05 / n_slots (sharp surrogate late; reduces STE bias)
-    # gate_l1: not needed for STE. Forward-hard removal already forces consolidation
-    # (removed fragments -> reconstruction penalty), unlike pure soft. Left at 0; a small
-    # value (e.g. 0.01) may be added as an ablation for extra slot-count control.
+    gate_mode: soft
+    gate_tau_start_mult: 0.5  # tau_start = 0.5/7 ~= 0.071 (wide band: nothing hard-frozen early)
+    gate_tau_end_mult: 0.05   # tau_end   = 0.05/7 ~= 0.0071 (sharp, near-hard); also used at eval
+    # L1 sparsity penalty DISABLED (0.0): with YTVIS's tiny objects (median 1.7%) even
+    # marginal object slots have small reconstruction benefit, so the L1 "rent" was
+    # suppressing their activation (active fell to ~1.7). Removed to test whether the
+    # gating mechanism alone (uniform-anchored p, gamma-sharpened mass) lets more slots
+    # activate. Anti-fragmentation is then left to the mass threshold + gate_negatives.
     gate_l1: 0.0
-    # --- slot score shaping ---
-    # mass_gamma: per-patch attention raised to gamma and renormalized before the mass
-    # average. 1.0 = plain attention mass (existing score, unchanged); >1 sharpens toward
-    # the per-patch argmax winner share (suppresses "always-second" ghost slots). Kept at
-    # 1.0 here; available as an ablation.
-    mass_gamma: 1.0
-    # purity rescue (DISABLED for the first run, same rationale as movi_e: it also
-    # protects small fragments, weakening the forward-hard consolidation pressure).
-    # If validation shows small objects being absorbed, first try lowering p_end_mult
-    # (e.g. 0.3), then re-enable by uncommenting purity_q_end below.
+    # gamma-sharpened mass: per-patch attention raised to gamma and renormalized before
+    # the mass average (2 -> toward per-patch argmax winner share; suppresses ghosts).
+    mass_gamma: 2.0
+    # purity rescue stays disabled (ablation card); revisit if small objects are
+    # still absorbed at p_end.
     # purity_q_start: 1.5
-    # purity_q_end: 0.5   # "owns its claimed patches by majority on average"
-    # purity_tau: 0.05    # sigmoid temperature for the purity gate (ste backward surrogate)
+    # purity_q_end: 0.5
+    # purity_tau: 0.05
 
   losses:
     loss_featrec:
@@ -113,9 +107,7 @@ model:
     loss_ss: 0.5
 
   initializer:
-    # Learnable prototypes, aligned with the SlotCurri/SlotContrast baseline and the soft
-    # configs, so the only variable across all experiments is the gating (not the init).
-    # (FixedOrthogonalInit remains available as an ablation.)
+    # aligned with the SlotCurri/SlotContrast baseline (learnable prototypes)
     name: FixedLearnedInit
     n_slots: ${globals.NUM_SLOTS}
     dim: ${globals.SLOT_DIM}
