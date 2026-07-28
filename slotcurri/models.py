@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import pytorch_lightning as pl
@@ -9,6 +9,7 @@ from torchvision.utils import make_grid
 
 from slotcurri import configuration, losses, modules, optimizers, utils, visualizations
 from slotcurri.data.transforms import Denormalize
+from slotcurri.modules.gate_p_residual import GatePResidualNet
 import torch.nn.functional as F
 import os
 import re
@@ -256,13 +257,38 @@ class ObjectCentricModel(pl.LightningModule):
         # thresholds: prefer multipliers of the uniform mass (1/n_slots), else absolute values
         uniform = 1.0 / max(self.n_slots, 1)
         if amc.get("p_start_mult", None) is not None:
-            self.amc_p_start = float(amc.get("p_start_mult")) * uniform
+            self.amc_p_start_mult = float(amc.get("p_start_mult"))
+            self.amc_p_start = self.amc_p_start_mult * uniform
         else:
             self.amc_p_start = float(amc.get("p_start", 0.05))
+            self.amc_p_start_mult = self.amc_p_start / uniform
         if amc.get("p_end_mult", None) is not None:
-            self.amc_p_end = float(amc.get("p_end_mult")) * uniform
+            self.amc_p_end_mult = float(amc.get("p_end_mult"))
+            self.amc_p_end = self.amc_p_end_mult * uniform
         else:
             self.amc_p_end = float(amc.get("p_end", 0.005))
+            self.amc_p_end_mult = self.amc_p_end / uniform
+        # p_mode:
+        #   "absolute" (default): p = annealed absolute mass threshold (v10 and earlier)
+        #   "median_ema": p = sg(EMA[median(m)]) * annealed p_mult  (scene-adaptive)
+        #   "learnable_residual": p = p_sched * (1 + alpha * tanh(f(sg[m])))
+        self.amc_p_mode = str(amc.get("p_mode", "absolute")).lower()
+        if self.amc_p_mode not in ("absolute", "median_ema", "learnable_residual"):
+            raise ValueError(
+                f"attn_mass_curriculum.p_mode must be 'absolute', 'median_ema', or "
+                f"'learnable_residual', got {self.amc_p_mode!r}"
+            )
+        self.amc_median_ema_momentum = float(amc.get("median_ema_momentum", 0.9))
+        self.amc_p_residual_alpha = float(amc.get("p_residual_alpha", 0.5))
+        self.amc_p_residual_l2 = float(amc.get("p_residual_l2", 0.01))
+        self.amc_p_residual_warmup_steps = int(amc.get("p_residual_warmup_steps", 25000))
+        p_residual_hidden = int(amc.get("p_residual_hidden", 32))
+        if self.attn_mass_enabled and self.amc_p_mode == "learnable_residual":
+            self.amc_p_residual_net = GatePResidualNet(
+                n_slots=self.n_slots, hidden=p_residual_hidden
+            )
+        else:
+            self.amc_p_residual_net = None
         self.amc_anneal_steps = int(amc.get("anneal_steps", self.max_steps // 4))
         # gating mode: "hard" (binary active/dormant) or "soft" (sigmoid gate in [0, 1]).
         # For soft gating, tau anneals from tau_start (soft) -> tau_end (sharp) so the gate
@@ -285,6 +311,13 @@ class ObjectCentricModel(pl.LightningModule):
         # slots to be used across the batch, counteracting rich-get-richer collapse to ~1 slot.
         # 0 disables it. Opposite sign to gate_l1 (which prunes slots).
         self.amc_gate_div = float(amc.get("gate_div", 0.0))
+        # Error-weighted coverage: push gated attention onto high featrec-residual patches.
+        # L = E[ w_f * (1 - c_f) ] with c_f = sum_s g_s A_s,f (or max_s), w_f ∝ detach(error).
+        # 0 disables. Keep small; enable mid/late via gate_cov_start_step to protect coarse phase.
+        self.amc_gate_cov = float(amc.get("gate_cov", 0.0))
+        self.amc_gate_cov_top_frac = float(amc.get("gate_cov_top_frac", 0.1))
+        self.amc_gate_cov_start_step = int(amc.get("gate_cov_start_step", 0))
+        self.amc_gate_cov_use_max = bool(amc.get("gate_cov_use_max", True))
         # score shaping: gamma-sharpened mass (1.0 = plain attention mass, unchanged) and an
         # optional size-invariant purity rescue for small-but-cleanly-owned slots. The purity
         # threshold q anneals q_start -> q_end alongside p (q_start > 1 keeps the rescue off
@@ -317,27 +350,46 @@ class ObjectCentricModel(pl.LightningModule):
                 f"attn_mass_curriculum.tau_anneal must be 'linear' or 'log', got {self.amc_tau_anneal!r}"
             )
         self._active_mask = None  # stashed per forward for loss/logging
+        self._gate_p_eff_mean = None
+        self._gate_delta = None  # stashed for residual L2 (may be graph-connected)
 
-    def _gate_threshold(self, train: bool) -> Optional[float]:
-        """Attention-mass threshold p for the current step.
+    def _p_residual_alpha_eff(self, train: bool) -> float:
+        """Warm up residual strength so early coarse curriculum stays near v10."""
+        alpha = self.amc_p_residual_alpha
+        if not train or self.amc_p_residual_warmup_steps <= 0:
+            return alpha
+        step = self.trainer.global_step
+        return alpha * min(1.0, float(step) / float(self.amc_p_residual_warmup_steps))
 
-        Training anneals p_start -> p_end over `amc_anneal_steps` (strict->loose,
-        i.e. coarse-to-fine). Shape is controlled by `p_anneal` (linear or log).
-        Evaluation always uses the final (loosest) threshold p_end.
-        """
-        if not self.attn_mass_enabled:
-            return None
+    def _annealed_p_mult(self, train: bool) -> float:
+        """Annealed p multiplier (p_start_mult -> p_end_mult)."""
         if not train:
-            return self.amc_p_end
+            return self.amc_p_end_mult
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
         if self.amc_p_anneal == "log":
-            # Geometric interpolation: leaves high p_start quickly, slows near p_end.
-            # Requires positive endpoints (always true for mass thresholds).
-            if self.amc_p_start <= 0.0 or self.amc_p_end <= 0.0:
-                raise ValueError("p_anneal='log' requires positive p_start and p_end")
-            return self.amc_p_start * ((self.amc_p_end / self.amc_p_start) ** frac)
-        return self.amc_p_start + (self.amc_p_end - self.amc_p_start) * frac
+            if self.amc_p_start_mult <= 0.0 or self.amc_p_end_mult <= 0.0:
+                raise ValueError("p_anneal='log' requires positive p_start_mult and p_end_mult")
+            return self.amc_p_start_mult * (
+                (self.amc_p_end_mult / self.amc_p_start_mult) ** frac
+            )
+        return self.amc_p_start_mult + (self.amc_p_end_mult - self.amc_p_start_mult) * frac
+
+    def _gate_threshold(self, train: bool) -> Optional[float]:
+        """Value passed as `gate_p` into the processor for the current step.
+
+        absolute / learnable_residual: annealed absolute mass threshold (= p_mult / n_slots).
+        median_ema: annealed p_mult (processor sets p = sg(EMA[median])*p_mult).
+
+        Training anneals over `amc_anneal_steps` (strict->loose). Evaluation uses end value.
+        """
+        if not self.attn_mass_enabled:
+            return None
+        p_mult = self._annealed_p_mult(train)
+        if self.amc_p_mode == "median_ema":
+            return p_mult
+        # absolute and learnable_residual both receive p_sched as absolute threshold
+        return p_mult / max(self.n_slots, 1)
 
     def _gate_tau(self, train: bool) -> Optional[float]:
         """Sigmoid gate temperature for soft gating at the current step.
@@ -460,13 +512,27 @@ class ObjectCentricModel(pl.LightningModule):
                 mass_gamma=self.amc_mass_gamma,
                 purity_q=purity_q, purity_tau=self.amc_purity_tau,
                 state_max_norm=self.amc_state_max_norm,
+                p_mode=self.amc_p_mode,
+                median_ema_momentum=self.amc_median_ema_momentum,
+                p_residual_net=self.amc_p_residual_net,
+                p_residual_alpha=self._p_residual_alpha_eff(train),
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
             self._active_mask = active_mask
+            p_eff = processor_output.get("gate_p_eff")
+            if p_eff is not None and torch.is_tensor(p_eff):
+                self._gate_p_eff_mean = float(p_eff.float().mean().detach())
+            else:
+                self._gate_p_eff_mean = None
+            gate_delta = processor_output.get("gate_delta")
+            # keep tensor for residual L2 (needs grad); logging uses detach mean
+            self._gate_delta = gate_delta if (gate_delta is not None and torch.is_tensor(gate_delta)) else None
             decoder_output = self.decoder(slots, active_mask)
         else:
             self._active_mask = None
+            self._gate_p_eff_mean = None
+            self._gate_delta = None
             processor_output = self.processor(slots_initial, features, cycle=cycle)
             slots = processor_output["state"]
             decoder_output = self.decoder(slots)
@@ -639,7 +705,103 @@ class ObjectCentricModel(pl.LightningModule):
             losses["loss_gate_div"] = div_term
             total_loss = total_loss + self.amc_gate_div * div_term
 
+        # --- error-weighted coverage (soft/ste, training only) ---
+        # Encourage gated attention to cover high-residual patches (small/ignored regions).
+        # Error weights are detached so the model cannot game the loss by inflating residuals.
+        if (
+            self.training
+            and self.attn_mass_enabled
+            and self.amc_gate_cov > 0.0
+            and self.amc_gate_mode in ("soft", "ste")
+            and self._active_mask is not None
+            and self._active_mask.dtype != torch.bool
+            and self.trainer.global_step >= self.amc_gate_cov_start_step
+        ):
+            cov_term = self._error_weighted_coverage(outputs, self._active_mask.float())
+            if cov_term is not None:
+                losses["loss_gate_cov"] = cov_term
+                total_loss = total_loss + self.amc_gate_cov * cov_term
+
+        # --- learnable p residual L2 (keep corrections near zero / v10 default) ---
+        if (
+            self.training
+            and self.attn_mass_enabled
+            and self.amc_p_mode == "learnable_residual"
+            and self.amc_p_residual_l2 > 0.0
+            and self._gate_delta is not None
+        ):
+            delta_term = self._gate_delta.float().pow(2).mean()
+            losses["loss_p_residual"] = delta_term
+            total_loss = total_loss + self.amc_p_residual_l2 * delta_term
+
         return total_loss, losses
+
+    def _error_weighted_coverage(
+        self, outputs: Dict[str, Any], gate: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Error-weighted uncovered mass under gated attention.
+
+        c_f = max_s (g_s A_s,f)  [or sum_s],  w_f ∝ detach(||recon-target||^2) on top residual
+        patches,  L = sum_f w_f (1 - c_f) averaged over batch/time.
+        """
+        proc = outputs.get("processor") or {}
+        att = proc.get("state_attn_mask")
+        if att is None:
+            corrector = proc.get("corrector") or {}
+            att = corrector.get("masks") if isinstance(corrector, Mapping) else None
+        if att is None:
+            return None
+
+        # att: (B, S, F) or (B, T, S, F); gate: (B, S) or (B, T, S)
+        if att.ndim == 3:
+            att = att.unsqueeze(1)
+        if gate.ndim == 2:
+            gate = gate.unsqueeze(1)
+        if att.ndim != 4 or gate.ndim != 3:
+            return None
+        if att.shape[:3] != gate.shape:
+            # allow (B, T, F, S) -> (B, T, S, F)
+            if att.shape[0] == gate.shape[0] and att.shape[1] == gate.shape[1] and att.shape[-1] == gate.shape[-1]:
+                att = att.transpose(-1, -2)
+            else:
+                return None
+
+        recon = outputs.get("decoder", {}).get("reconstruction")
+        target = outputs.get("encoder", {}).get("backbone_features")
+        if recon is None or target is None:
+            return None
+        # recon/target: (B, T, F, D) for video features
+        if recon.ndim != 4 or target.ndim != 4:
+            return None
+        if recon.shape[:3] != att.shape[:2] + (att.shape[-1],):
+            return None
+
+        # per-patch MSE, detached weights
+        err = (recon - target.detach()).pow(2).mean(dim=-1)  # (B, T, F)
+        err = err.detach()
+
+        top_frac = self.amc_gate_cov_top_frac
+        if 0.0 < top_frac < 1.0:
+            # keep only top residual patches per (B, T)
+            f = err.shape[-1]
+            k = max(1, int(round(top_frac * f)))
+            # threshold = k-th largest
+            topk_vals = torch.topk(err, k=k, dim=-1, largest=True).values
+            thresh = topk_vals[..., -1:].detach()
+            w = err * (err >= thresh).to(err.dtype)
+        else:
+            w = err
+        w_sum = w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        w = w / w_sum
+
+        g = gate.unsqueeze(-1)  # (B, T, S, 1)
+        owned = g * att  # (B, T, S, F)
+        if self.amc_gate_cov_use_max:
+            c = owned.amax(dim=2)  # (B, T, F) — prefer a single owner
+        else:
+            c = owned.sum(dim=2).clamp(max=1.0)
+        cov = (w * (1.0 - c)).sum(dim=-1).mean()
+        return cov
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         outputs = self.forward(batch)
@@ -660,6 +822,14 @@ class ObjectCentricModel(pl.LightningModule):
             gate = self._active_mask.float()  # (B, T, S) or (B, S)
             to_log["train/active_slots"] = gate.sum(-1).mean()
             to_log["train/gate_p"] = float(self._gate_threshold(True))
+            to_log["train/gate_p_mult"] = float(self._annealed_p_mult(True))
+            if getattr(self, "_gate_p_eff_mean", None) is not None:
+                to_log["train/gate_p_eff"] = self._gate_p_eff_mean
+            if self.amc_p_mode == "learnable_residual":
+                to_log["train/gate_p_sched"] = float(self._gate_threshold(True))
+                to_log["train/gate_p_alpha"] = float(self._p_residual_alpha_eff(True))
+                if self._gate_delta is not None:
+                    to_log["train/gate_delta"] = self._gate_delta.float().detach().mean()
             if self.amc_gate_mode in ("soft", "ste"):
                 to_log["train/gate_tau"] = float(self._gate_tau(True))
                 # Distinguish "one strong winner" vs "all slots weakly on":

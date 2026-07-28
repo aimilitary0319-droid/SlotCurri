@@ -1,7 +1,9 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_ste_v4
 
 globals:
+  # STE v4 = ste_v3 with no defaults + uniform-anchored p_start.
+  # Forward stays hard 0/1 (true dormancy); tau only shapes the STE backward surrogate.
   NUM_SLOTS: 7
   SLOT_DIM: 64
   DINO_MODEL: vit_base_patch14_dinov2
@@ -34,26 +36,26 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.2, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # --- attention-mass curriculum STE v4 ---
+  # Diff vs ste_v3:
+  #  * n_default: 2 -> 0               (no always-on slots)
+  #  * p_start: 0.30 abs -> p_start_mult: 1  (p_start = 1/7 ~= 0.143)
+  # Unchanged from v3: STE, p_end_mult=0.2, p_anneal=log, tau=0.2 fixed,
+  # gamma=2, ungated contrastive, FixedLearnedInit, gate_l1=0.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
+    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143 (uniform mass)
     p_end_mult: 0.2     # p_end   = 0.2/7 ~= 0.0286
-    p_anneal: linear
+    p_anneal: log
     anneal_steps: 66000
-    gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_mode: ste
+    # FIXED tau. Forward STE ignores tau; only surrogate grad uses it.
+    # Actual tau = 0.2/7 ~= 0.0286
+    gate_tau_start_mult: 0.2
+    gate_tau_end_mult: 0.2
     gate_l1: 0.0
     mass_gamma: 2.0
-    gate_div: 0.0
-    state_max_norm: true
     contrastive_gate: false
 
   losses:

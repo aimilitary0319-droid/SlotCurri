@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v15
 
 globals:
   NUM_SLOTS: 7
@@ -34,22 +34,24 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.2, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # --- attention-mass curriculum v15 = v10 + median-EMA adaptive p ---
+  # Same soft package as v10, but threshold is scene-adaptive:
+  #   p = stopgrad(EMA[median(mass)]) * p_mult(t)
+  # with p_mult annealed 1.5 -> 0.3 (log), same as v10's mult schedule.
+  # When masses ~ uniform, median≈1/S so p≈p_mult/S (recovers v10).
+  # Existing absolute mode remains the default elsewhere (p_mode: absolute).
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.2     # p_end   = 0.2/7 ~= 0.0286
-    p_anneal: linear
+    p_start_mult: 1.5
+    p_end_mult: 0.3
+    p_anneal: log
     anneal_steps: 66000
+    p_mode: median_ema
+    median_ema_momentum: 0.9
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
@@ -76,6 +78,7 @@ model:
       batch_contrast: true
       patch_inputs: false
       keep_input_dim: true
+      # negatives already ungated; with contrastive_gate:false anchors are ungated too
       gate_negatives: false
 
   loss_weights:

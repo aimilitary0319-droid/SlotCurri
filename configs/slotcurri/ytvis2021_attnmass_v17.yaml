@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v17
 
 globals:
   NUM_SLOTS: 7
@@ -34,27 +34,35 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.2, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # --- attention-mass curriculum v17 = v10 + STRICT purity rescue ---
+  # Single change vs v10: OR-rescue for small-but-cleanly-owned slots.
+  #   g = max( sigmoid((mass-p)/τ), sigmoid((purity-q)/τ_p) )
+  # with purity = Σ A² / Σ A (size-invariant ownership quality on raw attention).
+  #
+  # Strict settings (ghost-resistant):
+  #   q_start=1.5  -> rescue off early (purity<=1), coarse curriculum intact
+  #   q_end=0.75   -> only high-purity slots get rescued (stricter than old 0.5)
+  #   purity_tau=0.03 -> sharper soft boundary than default 0.05
+  # q anneals with the same anneal_steps as p (66k).
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.2     # p_end   = 0.2/7 ~= 0.0286
-    p_anneal: linear
+    p_start_mult: 1.5
+    p_end_mult: 0.3
+    p_anneal: log
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
     state_max_norm: true
     contrastive_gate: false
+    # --- strict purity rescue (only diff vs v10) ---
+    purity_q_start: 1.5
+    purity_q_end: 0.75
+    purity_tau: 0.03
 
   losses:
     loss_featrec:

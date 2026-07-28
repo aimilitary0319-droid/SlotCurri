@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v13
 
 globals:
   NUM_SLOTS: 7
@@ -34,22 +34,25 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.2, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # --- attention-mass curriculum v13 (ex-v12) ---
+  # Soft gate + v10/v11 stabilizers, with two always-on default slots and a stricter
+  # absolute early threshold. Curriculum is p-only (log); tau is fixed sharp.
+  #
+  #   n_default: 2
+  #   p:   0.30 (absolute) -> 0.2/7 ~= 0.0286   log
+  #   tau: 0.1/7 ~= 0.0143 fixed
+  #   state_max_norm / contrastive_gate off / gamma=2  (same as v10/v11)
+  #   note: with defaults, state_max_norm is effectively a no-op (max g = 1).
   attn_mass_curriculum:
     enabled: true
-    n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.2     # p_end   = 0.2/7 ~= 0.0286
-    p_anneal: linear
+    n_default: 2
+    p_start: 0.30          # absolute mass threshold (not /n_slots)
+    p_end_mult: 0.2        # p_end = 0.2/7 ~= 0.0286
+    p_anneal: log
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.1
+    gate_tau_end_mult: 0.1
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0

@@ -38,24 +38,27 @@ model:
 
   # --- attention-mass curriculum STE v3 ---
   # Diff vs ste.yaml (v1):
-  #  * p_end_mult: 0.5 -> 0.1          (looser late / eval threshold)
+  #  * p_start: 0.35 -> 0.30           (absolute; slightly less strict early)
+  #  * p_end_mult: 0.5 -> 0.2          (looser late / eval threshold)
   #  * p_anneal: log                   (like v10; leave high p_start faster)
-  #  * gate_tau_*_mult: 0.3 / 0.3      (fixed tau; STE backward surrogate only)
+  #  * gate_tau_*_mult: 0.2 / 0.2      (fixed tau; STE backward surrogate only)
   #  * mass_gamma: 1.0 -> 2.0
   #  * gate_negatives: false           (baseline-style contrastive negatives)
   #  * contrastive_gate: false         (loss_ss on full pool, like v10)
-  # Kept from v1: n_default=2, absolute p_start=0.35, gate_mode=ste, gate_l1=0.
+  # Kept from v1: n_default=2, gate_mode=ste, gate_l1=0.
+  # p_start lowered 0.35 -> 0.30 (absolute).
   attn_mass_curriculum:
     enabled: true
     n_default: 2        # slots 0,1 always active
-    p_start: 0.35       # absolute early threshold (non-defaults need mass >= 35%)
-    p_end_mult: 0.1     # p_end = 0.1/7 ~= 0.0143
-    p_anneal: log       # geometric p: 0.35 -> p_end over anneal_steps
+    p_start: 0.30       # absolute early threshold (non-defaults need mass >= 30%)
+    p_end_mult: 0.2     # p_end = 0.2/7 ~= 0.0286
+    p_anneal: log       # geometric p: 0.30 -> p_end over anneal_steps
     anneal_steps: 66000
     gate_mode: ste
-    # FIXED tau (v10-style). Forward STE ignores tau; only surrogate grad uses it.
-    gate_tau_start_mult: 0.3
-    gate_tau_end_mult: 0.3
+    # FIXED tau. Forward STE ignores tau; only surrogate grad uses it.
+    # Actual tau = 0.2/7 ~= 0.0286
+    gate_tau_start_mult: 0.2
+    gate_tau_end_mult: 0.2
     gate_l1: 0.0
     mass_gamma: 2.0
     contrastive_gate: false

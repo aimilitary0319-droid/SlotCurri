@@ -37,6 +37,11 @@ class LatentProcessor(nn.Module):
         mass_gamma: float = 1.0, purity_q: Optional[float] = None,
         purity_tau: Optional[float] = None,
         state_max_norm: bool = False,
+        p_mode: str = "absolute",
+        median_ema_prev: Optional[torch.Tensor] = None,
+        median_ema_momentum: float = 0.9,
+        p_residual_net: Optional[nn.Module] = None,
+        p_residual_alpha: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -70,6 +75,9 @@ class LatentProcessor(nn.Module):
         #   "ste"  -> straight-through: forward uses the hard 0/1 gate (true dormancy) while
         #            the backward pass uses the sigmoid surrogate gradient (differentiable).
         active_mask = None
+        mass_median_ema = None
+        gate_p_eff = None
+        gate_delta = None
         if gate_p is not None and state_attn_mask is not None:
             att = state_attn_mask  # (B, S, F), per-patch softmax over slots
             if mass_gamma is not None and float(mass_gamma) != 1.0:
@@ -83,6 +91,35 @@ class LatentProcessor(nn.Module):
                 mass_frac = att_g.sum(dim=-1) / att_g.shape[-1]  # (B, S)
             else:
                 mass_frac = att.sum(dim=-1) / att.shape[-1]  # (B, S)
+
+            # Threshold p:
+            #   absolute (default): gate_p is the annealed absolute mass threshold
+            #   median_ema: gate_p is annealed p_mult; p = sg(EMA[median(m)]) * p_mult
+            #               (recovers absolute p≈p_mult/S when masses are near-uniform)
+            #   learnable_residual: gate_p is absolute p_sched;
+            #               p = p_sched * (1 + alpha * tanh(f(sg[m])))
+            p_mode_l = str(p_mode).lower()
+            if p_mode_l == "median_ema":
+                med = mass_frac.median(dim=-1).values.detach()  # (B,)
+                mom = float(median_ema_momentum)
+                mom = min(max(mom, 0.0), 1.0)
+                if median_ema_prev is None:
+                    mass_median_ema = med
+                else:
+                    mass_median_ema = mom * median_ema_prev.detach() + (1.0 - mom) * med
+                # (B, 1) so it broadcasts over slots; detached scene statistic
+                p_use = (mass_median_ema * float(gate_p)).unsqueeze(-1)
+            elif p_mode_l == "learnable_residual" and p_residual_net is not None:
+                p_sched = float(gate_p)
+                # features detached; delta still receives loss grad via L_delta and via g(m-p)
+                gate_delta = p_residual_net(mass_frac.detach())  # (B, 1), in (-1, 1)
+                alpha = float(p_residual_alpha)
+                p_use = p_sched * (1.0 + alpha * gate_delta)
+                p_use = p_use.clamp(min=1e-6, max=0.999)
+            else:
+                p_use = gate_p  # scalar absolute threshold
+            gate_p_eff = p_use
+
             purity = None
             if purity_q is not None:
                 # size-invariant "ownership quality": attention-weighted mean of the slot's own
@@ -93,7 +130,7 @@ class LatentProcessor(nn.Module):
             default_list = [default_idx] if isinstance(default_idx, int) else list(default_idx)
             if gate_mode in ("soft", "ste"):
                 tau = gate_tau if (gate_tau is not None and gate_tau > 0) else 1e-2
-                soft = torch.sigmoid((mass_frac - gate_p) / tau)  # (B, S) in (0, 1), differentiable
+                soft = torch.sigmoid((mass_frac - p_use) / tau)  # (B, S) in (0, 1), differentiable
                 if purity is not None:
                     ptau = purity_tau if (purity_tau is not None and purity_tau > 0) else 5e-2
                     # OR-combination: active if big enough (mass) OR cleanly owned (purity)
@@ -106,7 +143,7 @@ class LatentProcessor(nn.Module):
                 soft = torch.maximum(soft, default_vec)
                 if gate_mode == "ste":
                     # forward = hard 0/1 (defaults forced on); backward = soft (sigmoid) gradient
-                    hard_bool = mass_frac >= gate_p
+                    hard_bool = mass_frac >= p_use
                     if purity is not None:
                         hard_bool = hard_bool | (purity >= purity_q)
                     hard = torch.maximum(hard_bool.float(), default_vec)
@@ -114,7 +151,7 @@ class LatentProcessor(nn.Module):
                 else:
                     active_mask = soft  # float gate weights in [0, 1]
             else:
-                active = mass_frac >= gate_p  # (B, S)
+                active = mass_frac >= p_use  # (B, S)
                 if purity is not None:
                     active = active | (purity >= purity_q)
                 # default slots are always active (exempt from the threshold)
@@ -159,13 +196,20 @@ class LatentProcessor(nn.Module):
                 updated_state.shape[:2], dtype=torch.bool, device=updated_state.device
             )
 
-        return {
+        out = {
             "state": updated_state,
             "state_predicted": predicted_state,
             "corrector": corrector_output,
             "state_attn_mask": state_attn_mask,
             "active_mask": active_mask,
         }
+        if mass_median_ema is not None:
+            out["mass_median_ema"] = mass_median_ema
+        if gate_p_eff is not None and torch.is_tensor(gate_p_eff):
+            out["gate_p_eff"] = gate_p_eff.squeeze(-1)  # (B,)
+        if gate_delta is not None and torch.is_tensor(gate_delta):
+            out["gate_delta"] = gate_delta.squeeze(-1)  # (B,)
+        return out
 
 
 class MapOverTime(nn.Module):
@@ -236,6 +280,10 @@ class ScanOverTime(nn.Module):
         purity_q: Optional[float] = None,
         purity_tau: Optional[float] = None,
         state_max_norm: bool = False,
+        p_mode: str = "absolute",
+        median_ema_momentum: float = 0.9,
+        p_residual_net: Optional[nn.Module] = None,
+        p_residual_alpha: float = 0.0,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -245,17 +293,24 @@ class ScanOverTime(nn.Module):
             gate_p=gate_p, default_idx=default_idx, gate_mode=gate_mode, gate_tau=gate_tau,
             mass_gamma=mass_gamma, purity_q=purity_q, purity_tau=purity_tau,
             state_max_norm=state_max_norm,
+            p_mode=p_mode, median_ema_momentum=median_ema_momentum,
+            p_residual_net=p_residual_net, p_residual_alpha=p_residual_alpha,
         )
 
         state = initial_state
+        median_ema = None
         outputs = []
         for t in range(seq_len):
+            kwargs = dict(gate_kwargs)
+            kwargs["median_ema_prev"] = median_ema
             if self.pass_step:
-                output = self.module(state, inputs[:, t], t, **gate_kwargs)
+                output = self.module(state, inputs[:, t], t, **kwargs)
             else:
-                output = self.module(state, inputs[:, t], **gate_kwargs)
+                output = self.module(state, inputs[:, t], **kwargs)
             outputs.append(output)
             state = output[self.next_state_key]
+            if "mass_median_ema" in output:
+                median_ema = output["mass_median_ema"]
 
         if cycle:
             # backward pass
@@ -263,11 +318,16 @@ class ScanOverTime(nn.Module):
             new_outputs = []
             new_outputs.append(outputs[-1])
             state = outputs[-1][self.next_state_key]
+            # continue EMA through the backward sweep (same clip statistics)
             for t in range(seq_len - 1):
                 back_t = seq_len - t - 2
-                out = self.module(state, inputs[:, back_t], **gate_kwargs)
+                kwargs = dict(gate_kwargs)
+                kwargs["median_ema_prev"] = median_ema
+                out = self.module(state, inputs[:, back_t], **kwargs)
                 new_outputs.append(out)
                 state = out[self.next_state_key]
+                if "mass_median_ema" in out:
+                    median_ema = out["mass_median_ema"]
             new_outputs = new_outputs[::-1]  # reverse the order of outputs
             return merge_dict_trees(new_outputs, axis=1)
 
