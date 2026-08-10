@@ -1,0 +1,39 @@
+# Training output. `logs/_<experiment_name>/` holds the CSV metrics, TensorBoard events and
+# checkpoints for every run, and the launch scripts tee stdout to `logs/<name>_run.out`.
+/logs/
+/eval_runs/
+/test_logs/
+*_run.out
+
+# Released and downloaded checkpoints (hundreds of MB each).
+/checkpoints/
+*.ckpt
+
+# Set by docker/docker-compose.yml as HF_HOME and TORCH_HOME, so the frozen DINOv2 weights
+# land inside the repo rather than in the container's ephemeral home.
+/.cache/
+/wandb/
+
+# Figures and dumps written by the event_analysis scripts. The two images the README embeds
+# are tracked explicitly; a new figure meant for the repo needs `git add -f` or its own
+# negation line here.
+/assets/*
+!/assets/movic.png
+!/assets/ytvis.png
+/event_analysis/*.png
+/event_analysis/*.npy
+/event_analysis/*.npz
+/event_analysis/*.json
+
+# Local machine configuration: UID/GID and host port bindings. docker/.env.example is the
+# tracked template.
+/docker/.env
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+
+.DS_Store
