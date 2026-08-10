@@ -543,6 +543,8 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
         batch_first: bool = False,
         norm_first: bool = False,
         initial_residual_scale: Optional[float] = None,
+        vel_dim: Optional[int] = None,
+        vel_gain_init: float = 0.1,
         device=None,
         dtype=None,
     ):
@@ -576,6 +578,21 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
             self.scale1 = nn.Identity()
             self.scale2 = nn.Identity()
 
+        if vel_dim is not None:
+            if dim_kv is not None:
+                raise ValueError("vel_dim needs keys of width d_model, so dim_kv must be None")
+            self.vel_proj = nn.Linear(vel_dim, d_model, bias=False)
+            # Per-dimension gain in the style of LayerScale. The gradient of vel_proj is
+            # proportional to this gain, so a zero init stalls it -- but only briefly: the
+            # gain's own gradient does not vanish at zero, so it escapes on the first step
+            # and releases vel_proj on the second (measured in probe_vel_gain_init.py, where
+            # Adam then leaves the 0.0 and 0.1 inits within a few percent of each other).
+            # 0.1 is a mild default, not a correctness requirement; 0.0 also trains.
+            self.vel_gain = nn.Parameter(vel_gain_init * torch.ones(d_model))
+        else:
+            self.vel_proj = None
+            self.vel_gain = None
+
     def _sa_block(
         self,
         x: torch.Tensor,
@@ -602,26 +619,44 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
         else:
             return x
 
+    def _keys_values(
+        self, base: torch.Tensor, memory: Optional[torch.Tensor], vel: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Build the key/value set, optionally carrying a velocity term.
+
+        `base` is whatever the queries are read from, so with no memory and no velocity this
+        reproduces plain self-attention exactly. Velocity enters the keys and values only:
+        the queries stay pure position, which keeps the residual x + attn(...) from leaking
+        velocity straight into the output. It has to pass through the learned value
+        projection to reach it, so the block can use as much or as little of it as helps.
+        """
+        kv = memory if memory is not None else base
+        if vel is not None and self.vel_proj is not None:
+            kv = kv + self.vel_gain * self.vel_proj(vel)
+        return kv
+
     def forward(
         self,
         src: torch.Tensor,
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None,
         memory: Optional[torch.Tensor] = None,
+        vel: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = src
         if self.norm_first:
+            h = self.norm1(x)
+            kv = self._keys_values(h, memory, vel)
             x = x + self.scale1(
-                self._sa_block(
-                    self.norm1(x), src_mask, src_key_padding_mask, keys=memory, values=memory
-                )
+                self._sa_block(h, src_mask, src_key_padding_mask, keys=kv, values=kv)
             )
             x = x + self.scale2(self._ff_block(self.norm2(x)))
         else:
+            kv = self._keys_values(x, memory, vel)
             x = self.norm1(
                 x
                 + self.scale1(
-                    self._sa_block(x, src_mask, src_key_padding_mask, keys=memory, values=memory)
+                    self._sa_block(x, src_mask, src_key_padding_mask, keys=kv, values=kv)
                 )
             )
             x = self.norm2(x + self.scale2(self._ff_block(x)))
@@ -642,12 +677,15 @@ class TransformerEncoder(nn.Module):
         activation: Union[str, Callable[[torch.Tensor], torch.Tensor]] = "relu",
         hidden_dim: Optional[int] = None,
         initial_residual_scale: Optional[float] = None,
+        vel_dim: Optional[int] = None,
+        vel_gain_init: float = 0.1,
     ):
         super().__init__()
 
         if hidden_dim is None:
             hidden_dim = 4 * dim
 
+        self.vel_dim = vel_dim
         self.blocks = nn.ModuleList(
             [
                 TransformerEncoderLayer(
@@ -663,6 +701,8 @@ class TransformerEncoder(nn.Module):
                     batch_first=True,
                     norm_first=True,
                     initial_residual_scale=initial_residual_scale,
+                    vel_dim=vel_dim,
+                    vel_gain_init=vel_gain_init,
                 )
                 for _ in range(n_blocks)
             ]
@@ -674,11 +714,12 @@ class TransformerEncoder(nn.Module):
         mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         memory: Optional[torch.Tensor] = None,
+        vel: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = inp
 
         for block in self.blocks:
-            x = block(x, mask, key_padding_mask, memory)
+            x = block(x, mask, key_padding_mask, memory, vel)
 
         return x
 

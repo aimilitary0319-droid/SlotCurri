@@ -1,0 +1,77 @@
+# =============================================================================
+# SlotCurri - docker compose
+#
+# Usage:
+#   cd /mnt/ssd2/hmlee/SlotCurri/docker
+#   docker compose build
+#   docker compose up -d
+#   docker compose exec slotcurri bash
+#
+# 환경 변수는 ./.env 파일을 만들거나 쉘에서 export 하여 덮어쓸 수 있습니다.
+# =============================================================================
+
+services:
+  slotcurri:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        USER_NAME: ${USER_NAME:-slotcurri}
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    image: slotcurri:cuda11.6-torch1.13
+    container_name: slotcurri
+    hostname: slotcurri
+
+    # ── GPU ────────────────────────────────────────────────────────────────
+    # NVIDIA Container Toolkit / CDI 둘 다 지원되도록 deploy.resources 사용.
+    # 특정 GPU 만 쓰려면 NVIDIA_VISIBLE_DEVICES=0,1 처럼 지정.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - PYTHONPATH=/workspace/SlotCurri
+      - TZ=Asia/Seoul
+      # 데이터로더가 메모리 부족 안 나도록 워커 수는 학습 스크립트에서 제어
+      - OMP_NUM_THREADS=8
+      - WANDB_DIR=/workspace/SlotCurri/wandb
+      - HF_HOME=/workspace/SlotCurri/.cache/huggingface
+      - TORCH_HOME=/workspace/SlotCurri/.cache/torch
+
+    # ── Mounts ─────────────────────────────────────────────────────────────
+    volumes:
+      # 소스코드는 bind mount → 호스트에서 수정 즉시 반영
+      - ../:/workspace/SlotCurri
+      # 데이터셋 (README 의 ../dataset 구조와 일치)
+      - /mnt/ssd2/hmlee/dataset:/workspace/dataset
+      # bash history / pip / huggingface 캐시 등 영속 유지
+      - slotcurri-home:/home/slotcurri
+
+    # ── Runtime ────────────────────────────────────────────────────────────
+    init: true                # PID 1 시그널 처리 (Ctrl+C 정상 동작)
+    shm_size: "32gb"          # PyTorch DataLoader (num_workers>0) 에 필수
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host                 # NCCL multi-GPU 학습 시 권장
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+    # ── Ports (필요한 것만 노출) ────────────────────────────────────────────
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"   # jupyter notebook
+      - "${TB_PORT:-6006}:6006"        # tensorboard
+
+    working_dir: /workspace/SlotCurri
+    command: ["sleep", "infinity"]
+
+volumes:
+  slotcurri-home:
+    driver: local

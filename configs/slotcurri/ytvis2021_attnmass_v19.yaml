@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v19
 
 globals:
   NUM_SLOTS: 7
@@ -34,27 +34,31 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # --- attention-mass curriculum v19 = v10 + attention centroid repulsion ---
+  # Single change vs v10: weak spatial repulsion between gated slots
+  #   L_rep = mean_{i<j} g_i g_j * max(0, m - ||c_i - c_j||)^2
+  # where c_s is the soft-attention centroid on the patch grid (coords in [0,1]^2).
+  # Targets same-class nearby merges (hikers / cubs) that purity/coverage do not split.
+  # Starts at 25k so early coarse mass curriculum stays intact.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: linear
+    p_start_mult: 1.5
+    p_end_mult: 0.3
+    p_anneal: log
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
     state_max_norm: true
     contrastive_gate: false
+    # --- spatial repulsion (only diff vs v10) ---
+    gate_rep: 0.05
+    gate_rep_margin: 0.2
+    gate_rep_start_step: 25000
 
   losses:
     loss_featrec:

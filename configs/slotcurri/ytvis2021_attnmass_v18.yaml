@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v18
 
 globals:
   NUM_SLOTS: 7
@@ -34,27 +34,31 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # --- attention-mass curriculum v18 = v10 + predictor_ungated ---
+  # Single change vs v10: the predictor output is not re-gated, so every slot's next prior
+  # is Pred(u) instead of g*Pred(u) + (1-g)*prior. Low-g slots keep evolving through the
+  # temporal predictor instead of freezing — a better dynamics prior / surprise signal.
+  #
+  # NOTE (post-refactor): this was written when the corrector output was gated too, so
+  # dropping the re-gate left one gated mix. The corrector mix is gone now, so under this
+  # flag the mass gate no longer touches the temporal path at all and only reweights
+  # decoder masks. Re-running v18 tests something different from what it tested before.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: linear
+    p_start_mult: 1.5
+    p_end_mult: 0.3
+    p_anneal: log
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
     state_max_norm: true
     contrastive_gate: false
+    predictor_ungated: true   # only diff vs v10
 
   losses:
     loss_featrec:

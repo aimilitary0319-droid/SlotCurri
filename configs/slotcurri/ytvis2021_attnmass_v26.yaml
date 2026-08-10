@@ -1,0 +1,224 @@
+experiment_group: slotcurri
+experiment_name: ytvis_attnmass_v26
+
+globals:
+  NUM_SLOTS: 7
+  SLOT_DIM: 64
+  DINO_MODEL: vit_base_patch14_dinov2
+  FEAT_DIM: 768
+  NUM_PATCHES: 1369
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
+  cyclic_inference: false
+
+  # --- v26: Evidence-Aware Slot Gating with Coupled Activity Curriculum (final method) ---
+  #
+  # Activity is no longer coverage(mass)-only. Per slot, from the SAME gamma-sharpened
+  # last-iteration attention:
+  #   m_s = mean_f A~_{s,f}                      coverage  (how much evidence)
+  #   c_s = 1 - H(A~_s / sum_f A~_s) / log F     confidence (how reliable), stop-gradient
+  # combined in log domain and gated against the threshold as a RATIO:
+  #   log r_s = beta_t log(m_s + eps) + (1 - beta_t) log(sg(c_s) + eps)
+  #   g_s     = sigmoid((log r_s - log(p_t + eps)) / tau_g)
+  # so r = p gives g = 0.5 and only threshold-relative evidence matters -- (0.02, 0.01)
+  # and (0.2, 0.1) gate identically. This replaces the linear gate sigmoid((m - p)/tau),
+  # whose one tau cannot stay discriminative both when p sits above the mass distribution
+  # (early) and below it (late) -- the flat-tail problem v24s21 patched with state_p_mult.
+  #
+  # One cosine coefficient lambda_t = (1 - cos(pi t/T)) / 2 couples the two schedules:
+  #   p_t    = ((1 - lambda) p_start_mult + lambda p_end_mult) / S    (1.5/7 -> 0.1/7)
+  #   beta_t = 1 - lambda (1 - beta_final)                            (1.0  -> 0.7)
+  # As the threshold is relaxed to admit smaller objects (p down), confidence weight
+  # (1 - beta: 0 -> 0.3) rises in lockstep to suppress the diffuse inactive slots the
+  # lower threshold would otherwise admit. Small active objects are m-low / c-high, so
+  # they pass; diffuse ghosts are m-low / c-low, so they do not.
+  #
+  # c is detached (sg) so the model cannot open its gate by artificially sharpening
+  # attention; the mass branch keeps its gradient (featrec's legitimate lever).
+  #
+  # Unchanged from the v2x family (per the method): ungated corrector, decoder mask
+  # reweight M' = Mg / sum(Mg), temporal relative gate alpha = g / max_j(g) via
+  # state_max_norm, no new losses (loss = featrec + 0.5 * loss_ss, baseline-style).
+  # No state_p_mult: the single g is shared by the decoder and the temporal mix; the
+  # log-ratio form keeps the late-schedule gate discriminative, which is what the floor
+  # was compensating for.
+  #
+  # anneal_steps = 75000 = 3/4 of the run: the curriculum (q = t/T) finishes at 75k and
+  # the last 25k steps train at the final gate regime (lambda = 1, the setting used at
+  # eval). T = max_steps would leave zero consolidation time at lambda = 1; the cosine
+  # shape already puts steps ~60k..75k at lambda > 0.9, so the whole last 40% of the run
+  # is near-final or final. v20/v21 used a 66k window (34k consolidation) for reference.
+  #
+  # New hyperparameters (doc sec. 16): mass_gamma (2.0), p_start/p_end (1.5/0.1),
+  # beta_final (0.7), gate_tau_log. p_start/p_end multipliers kept from v21 as the doc's
+  # initial candidates.
+  #
+  # gate_tau_log = 0.25 was calibrated empirically on the v20 @ 100k checkpoint
+  # (event_analysis/calibrate_tau_g.py, 200 val clips): at the end-of-curriculum
+  # threshold p = 0.1/7 with beta = 0.7, median gates are ghost 0.16 / small 0.998 /
+  # large 1.000 (6.2x small-vs-ghost suppression vs 3.2x at tau 0.5, 2.1x at 1.0),
+  # while the small-object loss (r < p) is 0.6% regardless of tau -- tau only sets the
+  # sigmoid sharpness, not the ranking. Transition dynamics stay smooth: the cosine
+  # p-schedule needs ~17k steps (T = 75k) to sweep a slot across the +-2-logit band
+  # even at 0.25.
+  # Fallback to 0.5 if the gate flickers for threshold-straddling slots
+  # (watch train/gate_n_half and the VideoARI-ImageARI gap).
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
+    p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
+    p_anneal: cosine        # coupled curriculum: p driven by lambda_t
+    anneal_steps: 75000     # curriculum over 3/4 of the run, last 25k = consolidation
+    gate_mode: soft
+    gate_form: logratio     # evidence-ratio gate (replaces linear (m - p)/tau)
+    gate_tau_log: 0.25      # tau_g, calibrated on v20 stats (see comment above)
+    beta_final: 0.7         # confidence contribution ramps 0 -> 0.3 with lambda_t
+    mass_gamma: 2.0         # sharpening, used for activity estimation only
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true    # temporal gate alpha = g / max_j(g)
+    contrastive_gate: false # loss_ss ignores the gate (no new/changed losses)
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
+  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 1
+  val_size: 200
+  num_workers: 4
+  num_val_workers: 1
+  train_pipeline:
+    chunk_size: 4
+    keys: [video]
+    sample_one_chunk_per_video: true
+    transforms:
+      name: ytvis_train
+      type: video
+      crop_type: short_side_resize_random
+      input_size: 518
+      num_classes: 10
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: ytvis_val
+      type: video
+      crop_type: central
+      input_size: 518
+      num_classes: 25

@@ -143,6 +143,9 @@ def build(
         experiment_name=model_config.get("experiment_name", "default_experiment"),
         experiment_group=model_config.get("experiment_group", "default_group"),
         attn_mass_curriculum=model_config.get("attn_mass_curriculum", None),
+        predictor_dynamics=model_config.get("predictor_dynamics", None),
+        cyclic_inference=model_config.get("cyclic_inference", True),
+        slot_expansion=model_config.get("slot_expansion", True),
     )
 
     if model_config.load_weights:
@@ -176,8 +179,13 @@ class ObjectCentricModel(pl.LightningModule):
         experiment_name: str = "default_experiment",
         experiment_group: str = "default_group",
         attn_mass_curriculum: Optional[Dict[str, Any]] = None,
+        predictor_dynamics: Optional[Dict[str, Any]] = None,
+        cyclic_inference: bool = True,
+        slot_expansion: bool = True,
     ):
         super().__init__()
+        self.cyclic_inference = bool(cyclic_inference)
+        self.slot_expansion = bool(slot_expansion)
         self.experiment_name = experiment_name
         self.experiment_group = experiment_group
         self.optimizer_builder = optimizer_builder
@@ -244,9 +252,26 @@ class ObjectCentricModel(pl.LightningModule):
         self.slot_loss_scale.requires_grad_(False)
         # self.noise_scale = self.initializer.initial_std * noise_scale
 
+        # --- direction-only supervision for the predictor ---
+        # Nothing else in the loss tree reads `state_predicted`; it is only consumed as the
+        # next frame's prior. This term is what actually asks the predictor to model motion,
+        # and the velocity input configured on the predictor is its precondition.
+        pdyn = predictor_dynamics or {}
+        self.dyn_weight = float(pdyn.get("weight", 0.0))
+        # Direction is meaningless for a slot that barely moved, so drop the low-displacement
+        # tail; the threshold is a quantile of the observed ||d|| rather than an absolute.
+        self.dyn_min_disp_q = float(pdyn.get("min_disp_quantile", 0.5))
+        # A slot whose gate jumps between frames moves because it started or stopped
+        # accepting the observation, which is not motion. Those pairs are excluded.
+        self.dyn_gate_jump_max = float(pdyn.get("gate_jump_max", 0.3))
+        self.dyn_start_step = int(pdyn.get("start_step", 0))
+
         # --- attention-mass curriculum (dynamic slot gating) ---
         amc = attn_mass_curriculum or {}
         self.attn_mass_enabled = bool(amc.get("enabled", False))
+        # The two curricula are mutually exclusive: attention-mass gating owns the slot
+        # budget when enabled, so expansion only runs as the standalone SlotCurri schedule.
+        self._expansion_active = self.slot_expansion and not self.attn_mass_enabled
         # default (always-active) slots: `n_default` leading slots, or explicit `default_slot_idx`
         n_default = amc.get("n_default", None)
         if n_default is not None:
@@ -318,6 +343,13 @@ class ObjectCentricModel(pl.LightningModule):
         self.amc_gate_cov_top_frac = float(amc.get("gate_cov_top_frac", 0.1))
         self.amc_gate_cov_start_step = int(amc.get("gate_cov_start_step", 0))
         self.amc_gate_cov_use_max = bool(amc.get("gate_cov_use_max", True))
+        # Attention-centroid repulsion: push gated slots' spatial centers apart so
+        # same-appearance nearby instances are less likely to merge into one slot.
+        # L = mean_{i<j} g_i g_j * max(0, m - ||c_i - c_j||)^2 on normalized patch coords.
+        # 0 disables. Enable mid/late via gate_rep_start_step to protect coarse phase.
+        self.amc_gate_rep = float(amc.get("gate_rep", 0.0))
+        self.amc_gate_rep_margin = float(amc.get("gate_rep_margin", 0.2))
+        self.amc_gate_rep_start_step = int(amc.get("gate_rep_start_step", 0))
         # score shaping: gamma-sharpened mass (1.0 = plain attention mass, unchanged) and an
         # optional size-invariant purity rescue for small-but-cleanly-owned slots. The purity
         # threshold q anneals q_start -> q_end alongside p (q_start > 1 keeps the rescue off
@@ -327,20 +359,85 @@ class ObjectCentricModel(pl.LightningModule):
         self.amc_purity_q_end = float(pq_end) if pq_end is not None else None
         self.amc_purity_q_start = float(amc.get("purity_q_start", 1.5))
         self.amc_purity_tau = float(amc.get("purity_tau", 0.05))
-        # If True, state/predictor mix uses g / max(g) so the winner always gets a full
-        # update under soft gates. Decoder still sees the raw gate (renorm-invariant).
+        # Floor on the threshold used by the predictor re-gate only, as a multiple of the
+        # uniform mass 1/n_slots (None = share the annealed p with the decoder, the
+        # historical behaviour). See _state_gate_threshold for why this is a floor under the
+        # schedule rather than a constant.
+        #
+        # The decoder's p has to anneal below the smallest object's mass or small objects
+        # are never representable: at p = 1.5/7 a slot holding 2% of the patches gets
+        # g = 0.011 and stays pinned to its init. But once p sits under the whole mass
+        # distribution the sigmoid saturates and g goes flat across slots, and a flat gate
+        # is an identity operation in the temporal mix -- the selectivity the curriculum is
+        # supposed to provide disappears exactly when p reaches its end value. One scalar
+        # cannot be both below the smallest object and inside the distribution.
+        #
+        # So the decoder keeps the annealed p (small objects admitted; the anti-fragmentation
+        # effect by then lives in the weights, not in the live gate) and the temporal mix gets
+        # a fixed threshold. Interpreted as an absolute mass threshold regardless of p_mode,
+        # since a curriculum-free gate has no reason to track scene statistics.
+        state_p_mult = amc.get("state_p_mult", None)
+        self.amc_state_p_mult = float(state_p_mult) if state_p_mult is not None else None
+        # If True, the predictor re-gate uses g / max(g) so the winning slot always advances
+        # fully. Decoder still sees the raw gate (renorm-invariant).
         self.amc_state_max_norm = bool(amc.get("state_max_norm", False))
+        # If True, skip the predictor re-gate, so the next prior is always Pred(u). Since the
+        # corrector output is not gated either, this takes the gate out of the temporal path
+        # entirely and leaves it only reweighting decoder masks. Default False keeps
+        #   hat{x}_{t+1} = g*Pred(u) + (1-g)*prior
+        # so low-gate slots advance slowly and dormant ones carry an unchanged prior.
+        self.amc_predictor_ungated = bool(amc.get("predictor_ungated", False))
         # If False, loss_ss ignores active_mask (baseline-style full-slot contrastive).
         # Default True preserves v6/v7/v8 gated-anchor contrastive.
         self.amc_contrastive_gate = bool(amc.get("contrastive_gate", True))
-        # p schedule shape over anneal_steps: "linear" (default, v6/v7/v8) or "log"
-        # (geometric: p = p_start * (p_end/p_start)^frac). Log drops the high early
-        # threshold faster so a large p_start does not linger into the mid jump.
+        # p schedule shape over anneal_steps: "linear" (default, v6/v7/v8), "log"
+        # (geometric: p = p_start * (p_end/p_start)^frac), or "cosine" (coupled activity
+        # curriculum: p = (1-lambda) p_start + lambda p_end with lambda = (1-cos(pi q))/2,
+        # the same lambda that drives the confidence weight beta below).
         self.amc_p_anneal = str(amc.get("p_anneal", "linear")).lower()
-        if self.amc_p_anneal not in ("linear", "log"):
+        if self.amc_p_anneal not in ("linear", "log", "cosine"):
             raise ValueError(
-                f"attn_mass_curriculum.p_anneal must be 'linear' or 'log', got {self.amc_p_anneal!r}"
+                f"attn_mass_curriculum.p_anneal must be 'linear', 'log' or 'cosine', "
+                f"got {self.amc_p_anneal!r}"
             )
+        # --- evidence-aware gate (final method) ---
+        # gate_form:
+        #   "linear"   (default): g = sigmoid((m - p) / tau)             -- v6..v25
+        #   "logratio": g = sigmoid((log r - log p) / tau_g) with
+        #               log r = beta*log(m + eps) + (1-beta)*log(sg(c) + eps),
+        #               c the per-slot assignment confidence (1 - H/log F) computed from the
+        #               same gamma-sharpened attention as m. Relative (threshold-ratio)
+        #               evidence, so the gate stays discriminative across the whole p
+        #               schedule instead of saturating once p leaves the mass distribution.
+        self.amc_gate_form = str(amc.get("gate_form", "linear")).lower()
+        if self.amc_gate_form not in ("linear", "logratio"):
+            raise ValueError(
+                f"attn_mass_curriculum.gate_form must be 'linear' or 'logratio', "
+                f"got {self.amc_gate_form!r}"
+            )
+        # Coupled confidence weight: beta_t = 1 - lambda_t (1 - beta_final), i.e. the
+        # confidence contribution 1-beta_t ramps 0 -> 1-beta_final with the SAME lambda that
+        # relaxes the threshold. As the activity criterion is relaxed to accommodate smaller
+        # objects, assignment confidence is simultaneously introduced to suppress the diffuse
+        # inactive slots that the lower threshold would otherwise admit. beta_final=1.0
+        # keeps the gate mass-only (confidence path never engages).
+        self.amc_beta_final = float(amc.get("beta_final", 1.0))
+        if not (0.0 <= self.amc_beta_final <= 1.0):
+            raise ValueError(
+                f"attn_mass_curriculum.beta_final must be in [0, 1], got {self.amc_beta_final}"
+            )
+        # beta_start decouples the confidence ramp from the curriculum for ablations:
+        # beta_t = beta_start - lambda_t (beta_start - beta_final). Default 1.0 recovers the
+        # coupled schedule above; beta_start == beta_final holds beta fixed from step 0
+        # (uncoupled ablation, e.g. v26f).
+        self.amc_beta_start = float(amc.get("beta_start", 1.0))
+        if not (0.0 <= self.amc_beta_start <= 1.0):
+            raise ValueError(
+                f"attn_mass_curriculum.beta_start must be in [0, 1], got {self.amc_beta_start}"
+            )
+        # Log-domain gate temperature tau_g (dimensionless, units of log evidence-ratio):
+        # g = 0.5 at r = p, and e.g. r = 2p gives sigmoid(log 2 / tau_g) ~= 0.80 at 0.5.
+        self.amc_gate_tau_log = float(amc.get("gate_tau_log", 0.5))
         # tau schedule shape over anneal_steps: "linear" (default) or "log"
         # (geometric: tau = tau_start * (tau_end/tau_start)^frac). Defaults to linear so
         # v6–v10 configs are unchanged; v11 uses log for a faster early soft->sharp drop.
@@ -351,7 +448,9 @@ class ObjectCentricModel(pl.LightningModule):
             )
         self._active_mask = None  # stashed per forward for loss/logging
         self._gate_p_eff_mean = None
+        self._state_gate_mean = None
         self._gate_delta = None  # stashed for residual L2 (may be graph-connected)
+        self._gate_conf_mean = None  # mean assignment confidence (logratio gate, logging)
 
     def _p_residual_alpha_eff(self, train: bool) -> float:
         """Warm up residual strength so early coarse curriculum stays near v10."""
@@ -360,6 +459,30 @@ class ObjectCentricModel(pl.LightningModule):
             return alpha
         step = self.trainer.global_step
         return alpha * min(1.0, float(step) / float(self.amc_p_residual_warmup_steps))
+
+    def _curriculum_lambda(self, train: bool) -> float:
+        """Coupled curriculum coefficient lambda_t = (1 - cos(pi q)) / 2, q = step/anneal.
+
+        One coefficient drives both the threshold relaxation (p_anneal='cosine') and the
+        confidence weight beta_t, so the two cannot drift apart. Evaluation uses the end
+        of the curriculum (lambda = 1), consistent with the p/tau eval convention.
+        """
+        if not train:
+            return 1.0
+        step = self.trainer.global_step
+        frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
+        return 0.5 * (1.0 - float(np.cos(np.pi * frac)))
+
+    def _gate_beta(self, train: bool) -> Optional[float]:
+        """Coverage weight beta_t = beta_start - lambda_t (beta_start - beta_final).
+
+        beta_start defaults to 1.0 (coupled ramp of the confidence weight). None when the
+        gate is the legacy linear form (no confidence branch).
+        """
+        if not self.attn_mass_enabled or self.amc_gate_form != "logratio":
+            return None
+        lam = self._curriculum_lambda(train)
+        return self.amc_beta_start - lam * (self.amc_beta_start - self.amc_beta_final)
 
     def _annealed_p_mult(self, train: bool) -> float:
         """Annealed p multiplier (p_start_mult -> p_end_mult)."""
@@ -373,6 +496,9 @@ class ObjectCentricModel(pl.LightningModule):
             return self.amc_p_start_mult * (
                 (self.amc_p_end_mult / self.amc_p_start_mult) ** frac
             )
+        if self.amc_p_anneal == "cosine":
+            lam = self._curriculum_lambda(train)
+            return self.amc_p_start_mult + (self.amc_p_end_mult - self.amc_p_start_mult) * lam
         return self.amc_p_start_mult + (self.amc_p_end_mult - self.amc_p_start_mult) * frac
 
     def _gate_threshold(self, train: bool) -> Optional[float]:
@@ -390,6 +516,27 @@ class ObjectCentricModel(pl.LightningModule):
             return p_mult
         # absolute and learnable_residual both receive p_sched as absolute threshold
         return p_mult / max(self.n_slots, 1)
+
+    def _state_gate_threshold(self, train: bool) -> Optional[float]:
+        """Mass threshold for the predictor re-gate, or None to share the decoder's.
+
+        A floor under the annealed schedule, `max(p_sched, state_p_mult / n_slots)`, not a
+        constant. A constant would be *looser* than the schedule for most of the traverse
+        -- 0.5 only crosses 1.5 -> 0.1 linear at step 47k of 66k -- and would therefore
+        delete the early capacity restriction, which is the curriculum's actual mechanism
+        and acts precisely here in the temporal mix. As a floor the state gate tracks the
+        decoder gate until the schedule drops past it and then holds, so the coarse-to-fine
+        traverse is untouched and only the flat tail changes.
+
+        Read off `_annealed_p_mult` rather than `_gate_threshold` so this stays an absolute
+        mass threshold under every p_mode: a curriculum-free gate has no reason to track
+        scene statistics. Evaluation uses p_end_mult, so it returns the floor.
+        """
+        if not self.attn_mass_enabled or self.amc_state_p_mult is None:
+            return None
+        floor = self.amc_state_p_mult / max(self.n_slots, 1)
+        scheduled = self._annealed_p_mult(train) / max(self.n_slots, 1)
+        return max(scheduled, floor)
 
     def _gate_tau(self, train: bool) -> Optional[float]:
         """Sigmoid gate temperature for soft gating at the current step.
@@ -446,7 +593,7 @@ class ObjectCentricModel(pl.LightningModule):
         H = W = int(HW**0.5) if HW > 0 else 1
 
         ### --- slot expansion schedule --- ###
-        if train and not self.attn_mass_enabled:
+        if train and self._expansion_active:
             for hi in range(len(self.hier_steps)):
                 if self.trainer.global_step == self.hier_steps[hi]: #
                     half = self.hier_n_slots[hi+1] # Next slot num
@@ -495,7 +642,7 @@ class ObjectCentricModel(pl.LightningModule):
                                 prev += cnt
 
         slots_initial = self.initializer(batch_size=batch_size) # batch x n_slots x slot_dim
-        if train and not self.attn_mass_enabled:
+        if train and self._expansion_active:
             for hi in range(len(self.hier_steps)):
                 if self.trainer.global_step <= self.hier_steps[hi]:
                     slots_initial = slots_initial[:, :self.hier_n_slots[hi], :]
@@ -511,15 +658,29 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_mode=self.amc_gate_mode, gate_tau=gate_tau,
                 mass_gamma=self.amc_mass_gamma,
                 purity_q=purity_q, purity_tau=self.amc_purity_tau,
+                gate_p_state=self._state_gate_threshold(train),
                 state_max_norm=self.amc_state_max_norm,
+                predictor_ungated=self.amc_predictor_ungated,
                 p_mode=self.amc_p_mode,
                 median_ema_momentum=self.amc_median_ema_momentum,
                 p_residual_net=self.amc_p_residual_net,
                 p_residual_alpha=self._p_residual_alpha_eff(train),
+                gate_form=self.amc_gate_form,
+                gate_beta=self._gate_beta(train),
+                gate_tau_log=self.amc_gate_tau_log,
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
             self._active_mask = active_mask
+            gate_conf = processor_output.get("gate_conf")
+            self._gate_conf_mean = (
+                float(gate_conf.float().mean().detach()) if gate_conf is not None else None
+            )
+            state_gate = processor_output.get("state_gate")
+            if state_gate is not None and state_gate.dtype != torch.bool:
+                self._state_gate_mean = float(state_gate.float().mean().detach())
+            else:
+                self._state_gate_mean = None
             p_eff = processor_output.get("gate_p_eff")
             if p_eff is not None and torch.is_tensor(p_eff):
                 self._gate_p_eff_mean = float(p_eff.float().mean().detach())
@@ -533,6 +694,8 @@ class ObjectCentricModel(pl.LightningModule):
             self._active_mask = None
             self._gate_p_eff_mean = None
             self._gate_delta = None
+            self._state_gate_mean = None
+            self._gate_conf_mean = None
             processor_output = self.processor(slots_initial, features, cycle=cycle)
             slots = processor_output["state"]
             decoder_output = self.decoder(slots)
@@ -636,7 +799,7 @@ class ObjectCentricModel(pl.LightningModule):
         for name, loss_fn in self.loss_fns.items():
             prediction = loss_fn.get_prediction(outputs)
             target = outputs["targets"][name]
-            if name == 'loss_featrec' and not self.attn_mass_enabled:
+            if name == 'loss_featrec' and self._expansion_active:
                 if self.trainer.global_step + 1 == self.hier_steps[0] or self.trainer.global_step + 1 == self.hier_steps[1]:
                     loss_all = loss_fn(prediction, target, True).mean(-1, keepdim=True) # 64 2304 384 -> 64 2304 1
                     decoding_masks = outputs["decoder"]["masks"].permute(0, 1, 3, 2).flatten(1, 2) # 64 2304 2
@@ -722,6 +885,34 @@ class ObjectCentricModel(pl.LightningModule):
                 losses["loss_gate_cov"] = cov_term
                 total_loss = total_loss + self.amc_gate_cov * cov_term
 
+        # --- attention centroid repulsion (soft/ste, training only) ---
+        # Penalize gated slots whose attention centroids fall inside a spatial margin.
+        # Targets same-class nearby merges (hikers/cubs) without requiring residual gaps.
+        if (
+            self.training
+            and self.attn_mass_enabled
+            and self.amc_gate_rep > 0.0
+            and self.amc_gate_mode in ("soft", "ste")
+            and self._active_mask is not None
+            and self._active_mask.dtype != torch.bool
+            and self.trainer.global_step >= self.amc_gate_rep_start_step
+        ):
+            rep_term = self._attention_centroid_repulsion(outputs, self._active_mask.float())
+            if rep_term is not None:
+                losses["loss_gate_rep"] = rep_term
+                total_loss = total_loss + self.amc_gate_rep * rep_term
+
+        # --- direction-only dynamics supervision for the predictor (training only) ---
+        if (
+            self.training
+            and self.dyn_weight > 0.0
+            and self.trainer.global_step >= self.dyn_start_step
+        ):
+            dyn_term = self._dynamics_direction(outputs)
+            if dyn_term is not None:
+                losses["loss_dyn"] = dyn_term
+                total_loss = total_loss + self.dyn_weight * dyn_term
+
         # --- learnable p residual L2 (keep corrections near zero / v10 default) ---
         if (
             self.training
@@ -735,6 +926,50 @@ class ObjectCentricModel(pl.LightningModule):
             total_loss = total_loss + self.amc_p_residual_l2 * delta_term
 
         return total_loss, losses
+
+    def _dynamics_direction(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """Cosine alignment between the predictor's step and the next-frame displacement.
+
+        With x_t the corrector output the predictor is fed, Delta_t = Pred(x_t) - x_t is the
+        predictor's residual step and d_t = x_{t+1} - x_t is the displacement it should have
+        produced -- the same quantity the predictor receives as velocity one step earlier,
+
+            L = sum_{t,s} w_{t,s} (1 - cos(Delta_{t,s}, d_{t,s})) / sum_{t,s} w_{t,s}
+
+        Direction only, for two reasons. Cosine is scale free, so the predictor cannot lower
+        the loss by shrinking Delta toward zero, which is exactly what an MSE against the
+        small d_t would reward. And the target is detached, so the corrector cannot lower it
+        by moving x_{t+1} toward whatever was predicted, which would collapse the
+        representation into whichever states are easiest to predict rather than teach motion.
+        """
+        proc = outputs.get("processor") or {}
+        x = proc.get("state")
+        pre = proc.get("state_predicted_pregate")
+        if x is None or pre is None:
+            return None
+        if x.ndim != 4 or x.shape[1] < 2 or pre.shape != x.shape:
+            return None
+
+        delta = (pre - x)[:, :-1]                       # (B, T-1, S, D)
+        d = (x[:, 1:] - x[:, :-1]).detach()             # (B, T-1, S, D)
+        cos = torch.nn.functional.cosine_similarity(delta, d, dim=-1, eps=1e-8)  # (B, T-1, S)
+
+        w = torch.ones_like(cos)
+        gate = self._active_mask
+        if gate is not None and gate.dtype != torch.bool and gate.shape == x.shape[:3]:
+            g = gate.float().detach()
+            w = w * g[:, :-1]
+            w = w * ((g[:, 1:] - g[:, :-1]).abs() < self.dyn_gate_jump_max).to(w.dtype)
+
+        if 0.0 < self.dyn_min_disp_q < 1.0:
+            nd = d.norm(dim=-1)
+            thresh = torch.quantile(nd.flatten().float(), self.dyn_min_disp_q)
+            w = w * (nd > thresh).to(w.dtype)
+
+        denom = w.sum()
+        if float(denom) <= 0.0:
+            return None
+        return ((1.0 - cos) * w).sum() / denom.clamp_min(1e-8)
 
     def _error_weighted_coverage(
         self, outputs: Dict[str, Any], gate: torch.Tensor
@@ -803,6 +1038,76 @@ class ObjectCentricModel(pl.LightningModule):
         cov = (w * (1.0 - c)).sum(dim=-1).mean()
         return cov
 
+    def _attention_centroid_repulsion(
+        self, outputs: Dict[str, Any], gate: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Gated attention-centroid hinge repulsion.
+
+        For each frame, build per-slot centroids c_s from soft attention over the patch
+        grid (coords in [0, 1]^2), then
+          L = mean_{i<j} [ g_i g_j * max(0, m - ||c_i-c_j||_2)^2 ]
+        normalized by the sum of pair weights g_i g_j so scale stays gate-invariant.
+        """
+        proc = outputs.get("processor") or {}
+        att = proc.get("state_attn_mask")
+        if att is None:
+            corrector = proc.get("corrector") or {}
+            att = corrector.get("masks") if isinstance(corrector, Mapping) else None
+        if att is None:
+            return None
+
+        # att: (B, S, F) or (B, T, S, F); gate: (B, S) or (B, T, S)
+        if att.ndim == 3:
+            att = att.unsqueeze(1)
+        if gate.ndim == 2:
+            gate = gate.unsqueeze(1)
+        if att.ndim != 4 or gate.ndim != 3:
+            return None
+        if att.shape[:3] != gate.shape:
+            if (
+                att.shape[0] == gate.shape[0]
+                and att.shape[1] == gate.shape[1]
+                and att.shape[-1] == gate.shape[-1]
+            ):
+                att = att.transpose(-1, -2)
+            else:
+                return None
+
+        b, t, s, f = att.shape
+        h = int(f**0.5)
+        w = h
+        if h * w == f:
+            # square patch grid -> (y, x) in [0, 1]
+            ys = torch.linspace(0.0, 1.0, h, device=att.device, dtype=att.dtype)
+            xs = torch.linspace(0.0, 1.0, w, device=att.device, dtype=att.dtype)
+            try:
+                gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+            except TypeError:
+                gy, gx = torch.meshgrid(ys, xs)
+            pos = torch.stack([gy.reshape(-1), gx.reshape(-1)], dim=-1)  # (F, 2)
+        else:
+            # fallback: 1D index as a single spatial axis, pad second coord with 0.5
+            idx = torch.linspace(0.0, 1.0, f, device=att.device, dtype=att.dtype)
+            pos = torch.stack([idx, torch.full_like(idx, 0.5)], dim=-1)
+
+        mass = att.sum(dim=-1).clamp_min(1e-8)  # (B, T, S)
+        centroids = torch.einsum("btsf,fd->btsd", att, pos) / mass.unsqueeze(-1)
+
+        # pairwise distances (B, T, S, S)
+        diff = centroids.unsqueeze(3) - centroids.unsqueeze(2)
+        dist = diff.pow(2).sum(dim=-1).clamp_min(0.0).sqrt()
+        margin = float(self.amc_gate_rep_margin)
+        hinge = (margin - dist).clamp_min(0.0).pow(2)
+
+        pair_gate = gate.unsqueeze(3) * gate.unsqueeze(2)  # (B, T, S, S)
+        tri = torch.triu(
+            torch.ones(s, s, device=att.device, dtype=att.dtype), diagonal=1
+        )  # i < j
+        weighted = pair_gate * hinge * tri
+        denom = (pair_gate * tri).sum(dim=(-1, -2)).clamp_min(1e-8)
+        per_bt = weighted.sum(dim=(-1, -2)) / denom
+        return per_bt.mean()
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         outputs = self.forward(batch)
         if self.train_metrics or (
@@ -830,8 +1135,16 @@ class ObjectCentricModel(pl.LightningModule):
                 to_log["train/gate_p_alpha"] = float(self._p_residual_alpha_eff(True))
                 if self._gate_delta is not None:
                     to_log["train/gate_delta"] = self._gate_delta.float().detach().mean()
+            if self.amc_gate_form == "logratio":
+                to_log["train/gate_lambda"] = float(self._curriculum_lambda(True))
+                to_log["train/gate_beta"] = float(self._gate_beta(True))
+                to_log["train/gate_tau_log"] = float(self.amc_gate_tau_log)
+                if getattr(self, "_gate_conf_mean", None) is not None:
+                    to_log["train/gate_conf"] = self._gate_conf_mean
             if self.amc_gate_mode in ("soft", "ste"):
-                to_log["train/gate_tau"] = float(self._gate_tau(True))
+                if self.amc_gate_form == "linear":
+                    # tau in mass units only parameterizes the linear gate
+                    to_log["train/gate_tau"] = float(self._gate_tau(True))
                 # Distinguish "one strong winner" vs "all slots weakly on":
                 # sum(g) alone cannot tell these apart.
                 g_max = gate.amax(dim=-1)  # (...,)
@@ -847,6 +1160,13 @@ class ObjectCentricModel(pl.LightningModule):
                 to_log["train/gate_n_half"] = (gate > 0.5).float().sum(-1).mean()
             if self.amc_purity_q_end is not None:
                 to_log["train/purity_q"] = float(self._purity_q(True))
+            state_p = self._state_gate_threshold(True)
+            if state_p is not None:
+                # gate_state_slots vs active_slots is the whole point of the split: the
+                # first should stay well below the second once p has annealed.
+                to_log["train/gate_state_p"] = float(state_p)
+                if getattr(self, "_state_gate_mean", None) is not None:
+                    to_log["train/gate_state_slots"] = self._state_gate_mean * self.n_slots
 
         if self.train_metrics:
             for key, metric in self.train_metrics.items():
@@ -877,7 +1197,7 @@ class ObjectCentricModel(pl.LightningModule):
             if batch is None:
                 return
 
-        cycle=True
+        cycle = self.cyclic_inference
 
         outputs = self.forward(batch, train=False, cycle=cycle)
         aux_outputs = self.aux_forward(batch, outputs)

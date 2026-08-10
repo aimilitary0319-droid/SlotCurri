@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v25
 
 globals:
   NUM_SLOTS: 7
@@ -34,22 +34,38 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # Single-pass inference: no extra backward sweep over the clip at validation/eval.
+  # Training was always single-pass, so this removes the train/eval mismatch where the
+  # gate saw every frame twice (once with a future-informed prior) only at eval.
+  cyclic_inference: false
+
+  # --- v25 = v21 + velocity conditioning only (no loss_dyn) ---
+  # Diff vs v21: predictor.vel_dim (previous displacement into K/V). Diff vs v23: no
+  # predictor_dynamics / loss_dyn. Gate schedule is byte-identical to v21.
+  #
+  # Motivation: the stopped v23 run (~30k) did not support forced dynamics supervision --
+  # VideoARI lagged v21, the Video-Image gap was worse, and train/loss_dyn did not fall.
+  # v25 asks a narrower question: if velocity is available as an optional input, can
+  # featrec learn to use it when helpful (or drive vel_gain ~ 0 and ignore it)? That is
+  # the free-conditioning ablation; v23 was conditioning + cosine force.
+  #
+  # vel_gain_init=0.1 is a mild start (same as v23). 0.0 is also fine and begins exactly
+  # at the v21 predictor residual; either way Adam can grow or shrink the gain.
+  # Setting vel_dim null recovers v21 exactly.
+
+  # --- attention-mass curriculum: byte-identical to v21 ---
+  # p: 1.5 -> 0.1 linear over 66k, tau 0.3 fixed, mass_gamma 2.0, state_max_norm.
+  # Predictor vel_dim below is the only variable vs v21.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
+    p_start_mult: 1.5   # p_start = 1.5/7 ~= 0.214 (same as v21)
     p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
     p_anneal: linear
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3   # tau = 0.3/7 ~= 0.0429, fixed (no anneal)
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
@@ -59,13 +75,6 @@ model:
   losses:
     loss_featrec:
       name: MSELoss
-      pred_dims:
-        - 0
-        - ${globals.FEAT_DIM}
-    loss_ssim:
-      name: SSIMLoss
-      pred_key: encoder.SSIM_recon
-      target_key: encoder.SSIM_orig
       pred_dims:
         - 0
         - ${globals.FEAT_DIM}
@@ -80,7 +89,6 @@ model:
 
   loss_weights:
     loss_featrec: 1.0
-    loss_ssim: 0.05
     loss_ss: 0.5
 
   initializer:
@@ -125,6 +133,22 @@ model:
     dim: ${globals.SLOT_DIM}
     n_blocks: 1
     n_heads: 4
+    # Velocity enters the keys and values, never the query. The query stays pure position so
+    # the block's residual x + attn(...) cannot pass velocity to the output directly; it has
+    # to go through the learned value projection, which lets the block use only as much as
+    # helps. Token count stays at 7 -- velocity rides inside slot s's own key rather than
+    # occupying a token of its own, which keeps the pairing structural instead of something
+    # attention has to learn, and keeps the slot-axis softmax from spending probability mass
+    # on a second set of tokens.
+    vel_dim: ${globals.SLOT_DIM}
+    # vel_proj's gradient is proportional to this gain, so a zero init stalls it -- but only
+    # for two steps, since the gain's own gradient is nonzero at zero and it escapes
+    # immediately (measured in probe_vel_gain_init.py; with Adam the 0.0 and 0.1 inits land
+    # within a few percent of each other). So this is a mild default, not a requirement: 0.0
+    # is equally defensible and starts exactly at v21 instead of perturbing the keys by ~5%
+    # with a random projection. Adds 64*64 + 64 = 4,160 params to the predictor's ~50k, and
+    # leaves the attention shape at 7 queries x 7 keys, so compute is unchanged.
+    vel_gain_init: 0.1
 
 val_metrics:
   ari:

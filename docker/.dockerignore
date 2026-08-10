@@ -1,0 +1,44 @@
+# 빌드 컨텍스트에서 제외 (poetry 의존성 캐시 효율 + 이미지 크기 절감)
+.git
+.gitignore
+.github
+.idea
+.vscode
+.ruff_cache
+.pytest_cache
+.mypy_cache
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+*.log
+
+# 학습/실험 산출물
+outputs
+runs
+logs
+wandb
+checkpoints
+*.ckpt
+*.pth
+
+# 무거운 데이터 (호스트에서 볼륨 마운트로 주입)
+data/raw
+data/processed
+dataset
+**/*.tar
+**/*.zip
+**/*.tar.gz
+
+# 노트북
+.ipynb_checkpoints
+**/*.ipynb_checkpoints
+
+# 사용자 환경 파일
+.env
+.env.*
+
+# Docker 자기 자신
+docker

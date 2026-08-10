@@ -28,7 +28,17 @@ class ModelConfig:
     visualize_every_n_steps: Optional[int] = 25000
     max_steps: int = 100000
     noise_scale: float = 0.1
+    # Run the extra backward sweep over each clip at validation/eval time. Training is
+    # always single-pass; this only affects inference.
+    cyclic_inference: bool = True
+    # Reconstruction-guided slot expansion (start with 2 slots, split into the full budget
+    # at max_steps//10 and max_steps//4). Only applies when attn_mass_curriculum is off;
+    # set False to train with the full slot budget from step 0 (SlotContrast baseline).
+    slot_expansion: bool = True
     attn_mass_curriculum: Optional[Dict[str, Any]] = None
+    # Direction-only supervision on the predictor's residual step. Requires the predictor to
+    # be built with vel_dim, since without the velocity input there is little for it to fit.
+    predictor_dynamics: Optional[Dict[str, Any]] = None
     masks_to_visualize: Optional[List[str]] = None
     load_weights: Optional[str] = None
     modules_to_load: Optional[Dict[str, str]] = None

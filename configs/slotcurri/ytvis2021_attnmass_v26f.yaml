@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v26f
 
 globals:
   NUM_SLOTS: 7
@@ -30,28 +30,42 @@ model:
   experiment_name: ${experiment_name}
   experiment_group: ${experiment_group}
   input_type: video
-  max_steps: 100000
+  max_steps: ${trainer.max_steps}
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  cyclic_inference: false
+
+  # --- v26f: ABLATION of v26 -- confidence weight NOT coupled to the curriculum ---
+  #
+  # Identical to ytvis2021_attnmass_v26.yaml except beta is held FIXED at 0.7 from
+  # step 0 (beta_start = beta_final = 0.7) instead of ramping 1.0 -> 0.7 with the
+  # same lambda that lowers the threshold p. The p schedule itself is unchanged
+  # (cosine, 1.5/7 -> 0.1/7), so the v26 - v26f gap isolates the coupling claim:
+  #
+  #   Early in training every slot's attention is diffuse, so c ~= 0 across the
+  #   board; with 1 - beta = 0.3 already engaged, all slots pay a log(c + eps)
+  #   penalty on their evidence and the gate should misbehave (unstable early
+  #   gates / premature slot death). The coupled schedule avoids this by keeping
+  #   the gate mass-only exactly while attention is still undifferentiated.
+  #
+  # If v26f trains as well as v26, the coupling is unnecessary and a fixed beta
+  # (one fewer schedule) is the simpler method. Watch the early train/gate_conf,
+  # train/active_slots and loss curves vs v26.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: linear
-    anneal_steps: 66000
+    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
+    p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
+    p_anneal: cosine        # p schedule unchanged vs v26
+    anneal_steps: 75000     # same as v26: curriculum over 3/4, last 25k consolidation
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
-    gate_l1: 0.0
+    gate_form: logratio
+    gate_tau_log: 0.25
+    beta_start: 0.7         # <-- ONLY change vs v26: confidence engaged from step 0
+    beta_final: 0.7         #     (beta constant; lambda no longer drives it)
     mass_gamma: 2.0
+    gate_l1: 0.0
     gate_div: 0.0
     state_max_norm: true
     contrastive_gate: false
@@ -59,13 +73,6 @@ model:
   losses:
     loss_featrec:
       name: MSELoss
-      pred_dims:
-        - 0
-        - ${globals.FEAT_DIM}
-    loss_ssim:
-      name: SSIMLoss
-      pred_key: encoder.SSIM_recon
-      target_key: encoder.SSIM_orig
       pred_dims:
         - 0
         - ${globals.FEAT_DIM}
@@ -80,7 +87,6 @@ model:
 
   loss_weights:
     loss_featrec: 1.0
-    loss_ssim: 0.05
     loss_ss: 0.5
 
   initializer:

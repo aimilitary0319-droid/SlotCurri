@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v20
 
 globals:
   NUM_SLOTS: 7
@@ -34,38 +34,35 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # Single-pass inference: no extra backward sweep over the clip at validation/eval.
+  # Training was always single-pass, so this removes the train/eval mismatch where the
+  # gate saw every frame twice (once with a future-informed prior) only at eval.
+  cyclic_inference: false
+
+  # --- attention-mass curriculum: identical to v10 ---
+  # v20 = v10 minus loss_ssim minus cyclic inference. The curriculum itself is untouched
+  # so v20 vs v10 isolates the two removals.
+  #   p:   1.5 -> 0.3   log
+  #   tau: 0.3          fixed
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: linear
+    p_start_mult: 1.5   # p_start = 1.5/7 ~= 0.214
+    p_end_mult: 0.3     # p_end   = 0.3/7 ~= 0.043
+    p_anneal: log
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3   # tau = 0.3/7 ~= 0.0429, fixed (no anneal)
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
-    state_max_norm: true
-    contrastive_gate: false
+    state_max_norm: true       # winner always full state update under soft gates
+    contrastive_gate: false    # loss_ss ignores active_mask (baseline-style)
 
   losses:
     loss_featrec:
       name: MSELoss
-      pred_dims:
-        - 0
-        - ${globals.FEAT_DIM}
-    loss_ssim:
-      name: SSIMLoss
-      pred_key: encoder.SSIM_recon
-      target_key: encoder.SSIM_orig
       pred_dims:
         - 0
         - ${globals.FEAT_DIM}
@@ -80,7 +77,6 @@ model:
 
   loss_weights:
     loss_featrec: 1.0
-    loss_ssim: 0.05
     loss_ss: 0.5
 
   initializer:

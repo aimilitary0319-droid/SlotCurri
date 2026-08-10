@@ -19,7 +19,9 @@ def test_map_over_time():
 
 def test_scan_over_time():
     class RecurrentCell(torch.nn.Module):
-        def forward(self, state, inputs):
+        # ScanOverTime always forwards its gate kwargs; a wrapped module that does not
+        # gate simply ignores them (mirrors LatentProcessor's signature).
+        def forward(self, state, inputs, **kwargs):
             assert state.ndim == 2
             assert inputs.ndim == 2
             state_next = state + inputs

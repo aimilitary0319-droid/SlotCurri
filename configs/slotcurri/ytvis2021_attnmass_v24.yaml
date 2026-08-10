@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_attnmass_v24
 
 globals:
   NUM_SLOTS: 7
@@ -34,38 +34,73 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
+  # Single-pass inference: no extra backward sweep over the clip at validation/eval.
+  # Training was always single-pass, so this removes the train/eval mismatch where the
+  # gate saw every frame twice (once with a future-informed prior) only at eval.
+  cyclic_inference: false
+
+  # --- v24 = v21 + a separate floor on the gate used by the temporal mix ---
+  # One diff vs v21: state_p_mult below. Schedule is identical to v21 (linear 1.5 -> 0.1).
+  # The decoder keeps the annealed p; the predictor re-gate -- the one place the gate now
+  # enters the temporal path -- uses max(p_sched, 0.3/7), i.e. it follows the same schedule
+  # until it drops past 0.3/7 ~= 0.0429 and then holds there.
+  #
+  # The problem is that one threshold is being asked to satisfy two incompatible
+  # requirements. p must anneal below the smallest object's mass or small objects are
+  # structurally unrepresentable -- at p = 1.5/7 a slot holding 2% of the patches gets
+  # g = 0.011 and never leaves its init, so it cannot encode anything. But once p sits
+  # under the whole mass distribution the sigmoid saturates and g goes flat across slots,
+  # and a flat gate is an identity operation in the temporal mix. Measured as the gate that
+  # actually enters the mix (g/max g, tau = 0.3/7 fixed):
+  #                     m=0.50   m=0.143   m=0.05   m=0.02   m=0.01
+  #   p = 1.5/7          1.000    0.159     0.021    0.014    0.008
+  #   p = 0.3/7 (here)   1.000    0.953     0.697    0.533    0.475
+  #   p = 0.1/7 (v21)    1.000    0.953     0.697    0.533    0.475
+  # (At tau=0.3/7 the soft gates for p=0.3/7 and p=0.1/7 are already nearly saturated on
+  # mid/large masses; the floor mainly prevents the temporal mix from following decoder p
+  # all the way into the flattest tail. Earlier v24 used 0.5; 0.3 matches v10/v20's p_end
+  # and only engages later in the linear traverse.)
+  #
+  # Splitting the two is what makes both achievable. The decoder needs p low (small objects
+  # admitted, and by late training the anti-fragmentation effect lives in the weights rather
+  # than in the live gate, so a flat decoder gate costs little). The temporal mix has no such
+  # requirement and keeps a higher floor, where it can still tell slots apart.
+  #
+  # A floor and not a constant, which matters more than it looks. A constant 0.3 is looser
+  # than the schedule early on. Linear p_mult goes 1.5 -> 0.1 over 66k, so it crosses 0.3 at
+  # step ~56.6k. As a floor the state gate is identical to v21 until then and only the flat
+  # tail after that differs.
+  #
+  # Watch train/gate_state_slots against train/active_slots -- before ~56.6k they must
+  # coincide exactly, and if they still coincide after that the split is doing nothing.
+  #
+  # Risk to watch: a low gate slows a slot's prior rather than removing the slot, so a
+  # throttled slot corrects from an out-of-date query and its attention can lag the object it
+  # was tracking. VideoARI is where a lagging prior would show, so compare it against
+  # ImageARI rather than reading either alone.
+  #
+  # Note: a prior log-anneal v24 (p_anneal=log, state_p_mult=0.5) collapsed early; this
+  # config returns to v21's linear schedule and isolates the floor at 0.3.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
+    p_start_mult: 1.5   # p_start = 1.5/7 ~= 0.214 (same as v21)
     p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
     p_anneal: linear
     anneal_steps: 66000
     gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
+    gate_tau_start_mult: 0.3   # tau = 0.3/7 ~= 0.0429, fixed (no anneal)
+    gate_tau_end_mult: 0.3
     gate_l1: 0.0
     mass_gamma: 2.0
     gate_div: 0.0
     state_max_norm: true
     contrastive_gate: false
+    state_p_mult: 0.3   # only diff vs v21; floor on the predictor re-gate's threshold
 
   losses:
     loss_featrec:
       name: MSELoss
-      pred_dims:
-        - 0
-        - ${globals.FEAT_DIM}
-    loss_ssim:
-      name: SSIMLoss
-      pred_key: encoder.SSIM_recon
-      target_key: encoder.SSIM_orig
       pred_dims:
         - 0
         - ${globals.FEAT_DIM}
@@ -80,7 +115,6 @@ model:
 
   loss_weights:
     loss_featrec: 1.0
-    loss_ssim: 0.05
     loss_ss: 0.5
 
   initializer:

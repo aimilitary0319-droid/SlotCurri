@@ -1,5 +1,14 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v12
+experiment_name: ytvis_slotcontrast
+
+# SlotContrast baseline: ytvis2021.yaml with all three SlotCurri components removed.
+#   1. slot_expansion: false   -> full slot budget from step 0 (no 2 -> 3 -> 7 schedule)
+#   2. loss_ssim removed       -> plain MSE feature reconstruction, no structure-aware term
+#   3. cyclic_inference: false -> single forward pass at eval, no backward sweep
+# Everything else (optimizer, encoder, grouper, decoder, predictor, data pipeline) is
+# byte-identical to ytvis2021.yaml, so this is a controlled ablation of the three
+# contributions rather than a re-tuned baseline. With the curriculum off, loss_ss receives
+# no active_mask and reduces to the standard SlotContrast slot-slot contrastive loss.
 
 globals:
   NUM_SLOTS: 7
@@ -34,27 +43,8 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
-  # --- attention-mass curriculum v12 = v11 with reversed tau ---
-  # Same as v11 (p linear 1.0->0.1, state_max_norm, ungated contrastive, gamma=2),
-  # only tau direction flipped:
-  #   v11: tau 0.3 -> 0.1  log  (soft -> sharp)
-  #   v12: tau 0.1 -> 0.3  log  (sharp -> soft)
-  attn_mass_curriculum:
-    enabled: true
-    n_default: 0
-    p_start_mult: 1.0   # p_start = 1/7 ~= 0.143
-    p_end_mult: 0.1     # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: linear
-    anneal_steps: 66000
-    gate_mode: soft
-    gate_tau_start_mult: 0.1   # tau_start = 0.1/7 ~= 0.0143 (sharp early)
-    gate_tau_end_mult: 0.3     # tau_end   = 0.3/7 ~= 0.0429 (softer late)
-    tau_anneal: log
-    gate_l1: 0.0
-    mass_gamma: 2.0
-    gate_div: 0.0
-    state_max_norm: true
-    contrastive_gate: false
+  slot_expansion: false     # (1) no reconstruction-guided slot curriculum
+  cyclic_inference: false   # (3) no forward+backward roll at inference
 
   losses:
     loss_featrec:
@@ -62,13 +52,7 @@ model:
       pred_dims:
         - 0
         - ${globals.FEAT_DIM}
-    loss_ssim:
-      name: SSIMLoss
-      pred_key: encoder.SSIM_recon
-      target_key: encoder.SSIM_orig
-      pred_dims:
-        - 0
-        - ${globals.FEAT_DIM}
+    # (2) loss_ssim intentionally absent
     loss_ss:
       name: Slot_Slot_Contrastive_Loss
       pred_key: processor.state
@@ -76,11 +60,9 @@ model:
       batch_contrast: true
       patch_inputs: false
       keep_input_dim: true
-      gate_negatives: false
 
   loss_weights:
     loss_featrec: 1.0
-    loss_ssim: 0.05
     loss_ss: 0.5
 
   initializer:
