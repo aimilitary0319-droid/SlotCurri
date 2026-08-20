@@ -29,8 +29,10 @@ class ModelConfig:
     max_steps: int = 100000
     noise_scale: float = 0.1
     # Run the extra backward sweep over each clip at validation/eval time. Training is
-    # always single-pass; this only affects inference.
-    cyclic_inference: bool = True
+    # always single-pass; this only affects inference. bool = legacy on/off (backward
+    # sweep anchored at the last frame); the strings "evidence" / "evidence_mass" /
+    # "random" select the anchored EABI variants (see ScanOverTime).
+    cyclic_inference: Any = True
     # Reconstruction-guided slot expansion (start with 2 slots, split into the full budget
     # at max_steps//10 and max_steps//4). Only applies when attn_mass_curriculum is off;
     # set False to train with the full slot budget from step 0 (SlotContrast baseline).
@@ -39,6 +41,20 @@ class ModelConfig:
     # Direction-only supervision on the predictor's residual step. Requires the predictor to
     # be built with vel_dim, since without the velocity input there is little for it to fit.
     predictor_dynamics: Optional[Dict[str, Any]] = None
+    # Predictive feature reconstruction (v27): decode Pred(x_t) and reconstruct F_{t+1}.
+    # Dense, feature-space supervision of motion; the only training signal that penalizes
+    # holding two independently-moving instances in one slot.
+    pred_recon: Optional[Dict[str, Any]] = None
+    # Counterfactual slot-utility rent (v27): drop one gated slot (no_grad re-decode) and
+    # charge its gate if reconstruction on its territory barely degrades (marginal-utility
+    # pricing; replaces the constant gate_l1 rent that suppressed small-object slots).
+    slot_utility: Optional[Dict[str, Any]] = None
+    # Feature curriculum (v33): anneal the backbone tokens from affinity-smoothed
+    # (object-level; within-object variance removed, boundaries preserved) to raw patch
+    # features. Task-level coarse-to-fine: early part-splits earn no reconstruction
+    # advantage and cannot hold clean ownership, so they land in the mixed-ownership
+    # regime the purity gate already suppresses. Train-time only; eval sees raw features.
+    feature_curriculum: Optional[Dict[str, Any]] = None
     masks_to_visualize: Optional[List[str]] = None
     load_weights: Optional[str] = None
     modules_to_load: Optional[Dict[str, str]] = None

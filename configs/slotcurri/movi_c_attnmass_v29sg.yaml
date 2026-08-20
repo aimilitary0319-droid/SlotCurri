@@ -1,14 +1,16 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v26m
+experiment_name: movi_c_attnmass_v29sg
 
 globals:
-  NUM_SLOTS: 7
+  # SlotCurri MOVi-C backbone / pool. Gate multipliers are in units of 1/S, so
+  # p: 1.0/11 -> 0.1/11. Method is otherwise YTVIS v29 plus sg(g).
+  NUM_SLOTS: 11
   SLOT_DIM: 64
-  DINO_MODEL: vit_base_patch14_dinov2
-  FEAT_DIM: 768
-  NUM_PATCHES: 1369
+  DINO_MODEL: vit_small_patch14_dinov2
+  FEAT_DIM: 384
+  NUM_PATCHES: 576
   NUM_GPUS: 2
-  BATCH_SIZE_PER_GPU: 32
+  BATCH_SIZE_PER_GPU: 64
   TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
   BASE_LR: 0.0001
 
@@ -33,45 +35,30 @@ model:
   max_steps: ${trainer.max_steps}
   visualize: false
   visualize_every_n_steps: 10000
-
   cyclic_inference: false
 
-  # --- v26m: ABLATION of v26 -- confidence branch removed (mass-only evidence) ---
-  #
-  # Identical to ytvis2021_attnmass_v26.yaml except beta_final = 1.0, so
-  #   log r = log(m + eps)   for the whole run (the confidence path never engages)
-  #   g     = sigmoid(log(m / p) / tau_g)
-  # Log-ratio gate, cosine coupled p schedule, tau_g, gamma, and everything else are
-  # unchanged, so the v26 - v26m gap isolates the contribution of assignment
-  # confidence c = 1 - H/log F.
-  #
-  # Calibration on the v20 @ 100k checkpoint predicts the failure mode this tests:
-  # at the end threshold p = 0.1/7, mass-only misses 11.7% of small-object slot-frames
-  # (r < p) vs 0.6% with confidence at beta = 0.7, while passing fewer ghosts
-  # (3.2% vs 16.2%). If v26m matches v26 on ARI, the confidence claim must be dropped.
-  #
-  # Run history: the first v26m ran with gate_tau_log = 0.25 (the pre-fix v26 value)
-  # and lagged badly (val/ari 0.270 @ 57k vs v26's 0.410 @ 32k) -- consistent with the
-  # sharp-tau early-phase pathology that also broke v26 attempts 1-2, and confounded
-  # as an ablation once v26 settled on tau 0.5. Stopped at ~60k (archived under
-  # logs/_archive/*_tau025_*) and relaunched with tau 0.5 so the ONLY difference vs
-  # the final v26 is beta_final = 1.0.
+  # --- v29sg: v29 + sg(g) + gentler p start ---
+  # Same as movi_c_attnmass_v29.yaml except:
+  #   - p_start_mult: 1.5 -> 1.0  (p: 1.0/11 -> 0.1/11)
+  #   - gate_detach: true         (decoder / temporal mix / gated losses see sg(g))
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
-    p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: cosine        # same coupled lambda schedule as v26
-    anneal_steps: 75000     # same as v26: curriculum over 3/4, last 25k consolidation
+    p_start_mult: 1.0
+    p_end_mult: 0.1
+    p_anneal: cosine
+    anneal_steps: 75000
     gate_mode: soft
-    gate_form: logratio     # same gate form as v26
-    gate_tau_log: 0.5       # same temperature as (final) v26
-    beta_final: 1.0         # <-- ONLY change vs v26: evidence is coverage only
+    gate_form: logratio
+    conf_kind: purity_sharp
+    gate_tau_log: 0.5
+    beta_final: 0.7
     mass_gamma: 2.0
     gate_l1: 0.0
     gate_div: 0.0
     state_max_norm: true
     contrastive_gate: false
+    gate_detach: true
 
   losses:
     loss_featrec:
@@ -104,6 +91,8 @@ model:
       features: vit_block12
       frozen: true
       pretrained: true
+      model_kwargs:
+        dynamic_img_size: True
     output_transform:
       name: networks.two_layer_mlp
       inp_dim: ${globals.FEAT_DIM}
@@ -138,53 +127,53 @@ model:
 val_metrics:
   ari:
     name: VideoARI
-    ignore_background: false
+    ignore_background: true
     pred_key: decoder_masks_hard
     true_key: segmentations
   image_ari:
     name: ImageARI
+    ignore_background: true
     video_input: true
-    ignore_background: false
     pred_key: decoder_masks_hard
     true_key: segmentations
   mbo:
     name: VideoIoU
     matching: overlap
-    ignore_background: false
+    ignore_background: true
     pred_key: decoder_masks_hard
     true_key: segmentations
   image_mbo:
     name: ImageIoU
     matching: overlap
+    ignore_background: true
     video_input: true
-    ignore_background: false
     pred_key: decoder_masks_hard
     true_key: segmentations
 
 dataset:
-  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
-  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  train_shards: "movi_c/movi_c-train-{000000..000304}.tar"
+  val_shards: "movi_c/movi_c-validation-{000000..000007}.tar"
   batch_size: ${globals.BATCH_SIZE_PER_GPU}
-  val_batch_size: 1
-  val_size: 200
+  val_batch_size: 16
+  val_size: 250
   num_workers: 4
-  num_val_workers: 1
+  num_val_workers: 2
   train_pipeline:
+    video_size: 24
     chunk_size: 4
-    keys: [video]
     sample_one_chunk_per_video: true
+    keys: [video]
+    shuffle_size: 512
     transforms:
-      name: ytvis_train
+      name: movi_train
       type: video
-      crop_type: short_side_resize_random
-      input_size: 518
-      num_classes: 10
+      input_size: 336
+      h_flip_prob: 0.5
   val_pipeline:
     use_chunks: false
     keys: [video, segmentations]
     transforms:
-      name: ytvis_val
+      name: movi_val
       type: video
-      crop_type: central
-      input_size: 518
-      num_classes: 25
+      input_size: 336
+      num_classes: 11

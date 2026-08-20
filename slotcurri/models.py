@@ -1,3 +1,4 @@
+import math
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -16,6 +17,20 @@ import re
 import shutil
 
 import matplotlib.pyplot as plt
+
+
+def feature_curriculum_mix(step: int, anneal_steps: int, schedule: str = "cosine") -> float:
+    """Blend factor for the v33 feature curriculum.
+
+    0 = fully affinity-smoothed (object-level) backbone tokens, 1 = raw patch tokens.
+    Monotone in step, reaches 1 at `anneal_steps` and stays there; after the anneal the
+    encoder is byte-identical to the uncurriculumed model. Module-level so the schedule
+    is unit-testable without building a model.
+    """
+    t = min(max(float(step), 0.0) / float(max(int(anneal_steps), 1)), 1.0)
+    if str(schedule).lower() == "linear":
+        return t
+    return 0.5 * (1.0 - math.cos(math.pi * t))
 
 
 def build(
@@ -144,8 +159,11 @@ def build(
         experiment_group=model_config.get("experiment_group", "default_group"),
         attn_mass_curriculum=model_config.get("attn_mass_curriculum", None),
         predictor_dynamics=model_config.get("predictor_dynamics", None),
+        pred_recon=model_config.get("pred_recon", None),
+        slot_utility=model_config.get("slot_utility", None),
         cyclic_inference=model_config.get("cyclic_inference", True),
         slot_expansion=model_config.get("slot_expansion", True),
+        feature_curriculum=model_config.get("feature_curriculum", None),
     )
 
     if model_config.load_weights:
@@ -180,11 +198,19 @@ class ObjectCentricModel(pl.LightningModule):
         experiment_group: str = "default_group",
         attn_mass_curriculum: Optional[Dict[str, Any]] = None,
         predictor_dynamics: Optional[Dict[str, Any]] = None,
-        cyclic_inference: bool = True,
+        pred_recon: Optional[Dict[str, Any]] = None,
+        slot_utility: Optional[Dict[str, Any]] = None,
+        cyclic_inference: Union[bool, str] = True,
         slot_expansion: bool = True,
+        feature_curriculum: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
-        self.cyclic_inference = bool(cyclic_inference)
+        # bool: legacy on/off (backward sweep anchored at the last frame). A string
+        # selects the anchored re-inference variants in ScanOverTime ("evidence" = EABI,
+        # "random" = its control); eval scripts set this directly on a loaded model.
+        self.cyclic_inference = (
+            cyclic_inference if isinstance(cyclic_inference, str) else bool(cyclic_inference)
+        )
         self.slot_expansion = bool(slot_expansion)
         self.experiment_name = experiment_name
         self.experiment_group = experiment_group
@@ -265,6 +291,86 @@ class ObjectCentricModel(pl.LightningModule):
         # accepting the observation, which is not motion. Those pairs are excluded.
         self.dyn_gate_jump_max = float(pdyn.get("gate_jump_max", 0.3))
         self.dyn_start_step = int(pdyn.get("start_step", 0))
+
+        # --- predictive feature reconstruction (v27) ---
+        # L_pred = MSE(Dec(Pred(x_t)), F_{t+1}): the slots at t, pushed through the
+        # predictor, must reconstruct the NEXT frame's (frozen) features. Static featrec
+        # has ~zero gradient against holding two same-appearance instances in one slot;
+        # predicting their two independent motions with one latent leaves an irreducible
+        # error, so this is the term that pays for splitting them. Unlike v23's loss_dyn
+        # (cosine on slot latents, failed) this supervises through the decoder in feature
+        # space -- it prescribes what the prediction must explain, not how latents move.
+        pr = pred_recon or {}
+        self.pred_weight = float(pr.get("weight", 0.0))
+        # Number of random (t -> t+1) transitions decoded per step. The extra decoder pass
+        # needs activations for backward, so this bounds the memory overhead (1 of T-1
+        # transitions ~= +1/T decoder memory instead of doubling it).
+        self.pred_n_transitions = int(pr.get("n_transitions", 1))
+        # "lambda" scales the weight by the coupled-curriculum coefficient lambda_t, so the
+        # term is silent during the coarse phase (untrained predictor, intentional merging)
+        # and fully on for the consolidation stretch. "none" applies the raw weight.
+        self.pred_ramp = str(pr.get("ramp", "lambda")).lower()
+        self.pred_start_step = int(pr.get("start_step", 0))
+        if self.pred_ramp not in ("lambda", "none"):
+            raise ValueError(f"pred_recon.ramp must be 'lambda' or 'none', got {self.pred_ramp!r}")
+
+        # --- counterfactual slot-utility rent (v27) ---
+        # Re-decode with one randomly chosen gated slot dropped (no_grad) and measure the
+        # per-patch error increase on that slot's own territory, relative to the sample's
+        # mean error: rel_delta = E_mask[err_drop - err_full] / E[err_full]. Rent
+        # relu(1 - rel_delta/margin) is charged against the slot's (live) gate. A duplicate
+        # slot's territory is covered by its twin after the decoder renorm (rel_delta ~ 0,
+        # full rent); a slot holding unique content is irreplaceable (rel_delta >> margin,
+        # exempt). This is the marginal-utility fix for gate_l1's documented failure: the
+        # constant rent taxed every slot equally and evicted small-object slots first
+        # (v2: active fell to ~1.7); pricing by counterfactual utility exempts them by
+        # construction. Delta is detached; the gradient reaches only the gate.
+        su = slot_utility or {}
+        self.util_weight = float(su.get("weight", 0.0))
+        # rel_delta below which rent starts (1.0 = dropping the slot must raise error on
+        # its territory by at least the sample-mean per-patch error to live rent-free)
+        self.util_margin = float(su.get("margin", 1.0))
+        # candidates: slots the gate actually admits and with enough decoder-mask territory
+        # for delta to be measurable
+        self.util_gate_min = float(su.get("gate_min", 0.5))
+        self.util_min_mask = float(su.get("min_mask", 0.01))
+        self.util_ramp = str(su.get("ramp", "lambda")).lower()
+        self.util_start_step = int(su.get("start_step", 0))
+        if self.util_ramp not in ("lambda", "none"):
+            raise ValueError(f"slot_utility.ramp must be 'lambda' or 'none', got {self.util_ramp!r}")
+
+        # --- feature curriculum (v33): task-level coarse-to-fine ---
+        # The backbone tokens are annealed from affinity-smoothed (object-level: within-
+        # object feature variance removed by one step of non-parametric self-attention,
+        # see modules.FeatureSmoothing) to raw patch features over `anneal_steps`. Early
+        # on a part-split of one object earns no reconstruction advantage (no variance
+        # left to divide) and cannot hold clean ownership (identical features give every
+        # competing slot the same q.k on the whole blob), which converts the purity
+        # gate's one blind spot -- clean part-splits -- into the mixed-ownership states
+        # it already suppresses. This is a schedule on the TASK, not on the gate: a
+        # mistimed clock degrades smoothly instead of gating real objects away (the v24
+        # failure class). Validation/eval always run on raw features (train()-only), so
+        # after the anneal the model is byte-identical to the uncurriculumed one.
+        fc = feature_curriculum or {}
+        self.featcur_enabled = bool(fc.get("enabled", False))
+        self.featcur_anneal_steps = int(fc.get("anneal_steps", 30000))
+        self.featcur_schedule = str(fc.get("schedule", "cosine")).lower()
+        if self.featcur_schedule not in ("cosine", "linear"):
+            raise ValueError(
+                "feature_curriculum.schedule must be 'cosine' or 'linear', "
+                f"got {self.featcur_schedule!r}"
+            )
+        if self.featcur_enabled and self.featcur_anneal_steps <= 0:
+            raise ValueError("feature_curriculum.anneal_steps must be positive")
+        if self.featcur_enabled:
+            smoothing = modules.FeatureSmoothing(
+                tau=float(fc.get("tau", 0.1)),
+                window=fc.get("window", None),
+                chunk_size=int(fc.get("chunk_size", 16)),
+            )
+            inner = self._frame_encoder()
+            inner.feature_smoothing = smoothing
+            inner.feature_smoothing_mix = 0.0  # step-0 value; training_step reschedules
 
         # --- attention-mass curriculum (dynamic slot gating) ---
         amc = attn_mass_curriculum or {}
@@ -381,6 +487,11 @@ class ObjectCentricModel(pl.LightningModule):
         # If True, the predictor re-gate uses g / max(g) so the winning slot always advances
         # fully. Decoder still sees the raw gate (renorm-invariant).
         self.amc_state_max_norm = bool(amc.get("state_max_norm", False))
+        # If True, stop-gradient the soft gate: decoder / temporal mix / gated losses see
+        # sg(g). The curriculum still computes g from (m, c, p), but featrec cannot open
+        # or close slots by backprop through g (same anti-gaming idea as sg(c)).
+        # Bool (hard) gates are unchanged. Default False keeps a differentiable gate.
+        self.amc_gate_detach = bool(amc.get("gate_detach", False))
         # If True, skip the predictor re-gate, so the next prior is always Pred(u). Since the
         # corrector output is not gated either, this takes the gate out of the temporal path
         # entirely and leaves it only reweighting decoder masks. Default False keeps
@@ -409,11 +520,46 @@ class ObjectCentricModel(pl.LightningModule):
         #               same gamma-sharpened attention as m. Relative (threshold-ratio)
         #               evidence, so the gate stays discriminative across the whole p
         #               schedule instead of saturating once p leaves the mass distribution.
+        #   "purity_weight" (v32): g = sg(c) itself, with c the ownership purity
+        #               (conf_kind purity/purity_sharp). Thresholdless: no p schedule, no
+        #               tau, no beta -- the decoder sees softmax(alpha + log c) and the
+        #               temporal mix uses c / max(c). Self-annealing (uniform untrained c
+        #               is cancelled by the renorm/max-norm), replacing the curriculum.
         self.amc_gate_form = str(amc.get("gate_form", "linear")).lower()
-        if self.amc_gate_form not in ("linear", "logratio"):
+        if self.amc_gate_form not in ("linear", "logratio", "purity_weight"):
             raise ValueError(
-                f"attn_mass_curriculum.gate_form must be 'linear' or 'logratio', "
-                f"got {self.amc_gate_form!r}"
+                f"attn_mass_curriculum.gate_form must be 'linear', 'logratio' or "
+                f"'purity_weight', got {self.amc_gate_form!r}"
+            )
+        # Confidence definition for the logratio gate's second branch (v29):
+        #   "entropy": c = 1 - H/log F over the gamma-sharpened attention (v26 default).
+        #              Spatial concentration; penalizes large objects by construction
+        #              (H grows with log(object size)).
+        #   "purity" : c = sum A^2 / sum A over the RAW attention -- the attention-weighted
+        #              mean of the slot's own per-patch share. Direct, size-invariant
+        #              ownership quality.
+        #   "purity_sharp": the same statistic on the gamma-sharpened attention the mass
+        #              branch uses (one distribution, two moments). Best ghost-vs-small
+        #              separation on v20 @ 100k (event_analysis/conf_vs_purity_probe.py).
+        # Detached in every case (anti-gaming). Not to be confused with the purity_q
+        # OR-rescue, which can only OPEN gates and bypasses the evidence score entirely;
+        # this is the multiplicative evidence branch.
+        self.amc_conf_kind = str(amc.get("conf_kind", "entropy")).lower()
+        if self.amc_conf_kind not in ("entropy", "purity", "purity_sharp"):
+            raise ValueError(
+                f"attn_mass_curriculum.conf_kind must be 'entropy', 'purity' or "
+                f"'purity_sharp', got {self.amc_conf_kind!r}"
+            )
+        # purity_weight is DEFINED as ownership weighting; the conf_kind default
+        # ("entropy") would silently weight by spatial concentration instead, so an
+        # explicit purity choice is required.
+        if self.amc_gate_form == "purity_weight" and self.amc_conf_kind not in (
+            "purity",
+            "purity_sharp",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.gate_form='purity_weight' requires conf_kind "
+                f"'purity' or 'purity_sharp', got {self.amc_conf_kind!r}"
             )
         # Coupled confidence weight: beta_t = 1 - lambda_t (1 - beta_final), i.e. the
         # confidence contribution 1-beta_t ramps 0 -> 1-beta_final with the SAME lambda that
@@ -451,6 +597,7 @@ class ObjectCentricModel(pl.LightningModule):
         self._state_gate_mean = None
         self._gate_delta = None  # stashed for residual L2 (may be graph-connected)
         self._gate_conf_mean = None  # mean assignment confidence (logratio gate, logging)
+        self._util_rel_delta = None  # mean rel_delta of sampled slots (slot_utility, logging)
 
     def _p_residual_alpha_eff(self, train: bool) -> float:
         """Warm up residual strength so early coarse curriculum stays near v10."""
@@ -472,6 +619,17 @@ class ObjectCentricModel(pl.LightningModule):
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
         return 0.5 * (1.0 - float(np.cos(np.pi * frac)))
+
+    def _aux_ramp(self, ramp: str) -> float:
+        """Weight multiplier for the v27 auxiliary losses.
+
+        'lambda' reuses the coupled-curriculum coefficient lambda_t (0 during the coarse
+        phase, 1 from the end of the curriculum on), so no new schedule is introduced;
+        'none' returns 1.0.
+        """
+        if ramp == "lambda":
+            return self._curriculum_lambda(True)
+        return 1.0
 
     def _gate_beta(self, train: bool) -> Optional[float]:
         """Coverage weight beta_t = beta_start - lambda_t (beta_start - beta_final).
@@ -506,10 +664,13 @@ class ObjectCentricModel(pl.LightningModule):
 
         absolute / learnable_residual: annealed absolute mass threshold (= p_mult / n_slots).
         median_ema: annealed p_mult (processor sets p = sg(EMA[median])*p_mult).
+        purity_weight: None -- the form is thresholdless (the statistic is the gate).
 
         Training anneals over `amc_anneal_steps` (strict->loose). Evaluation uses end value.
         """
         if not self.attn_mass_enabled:
+            return None
+        if self.amc_gate_form == "purity_weight":
             return None
         p_mult = self._annealed_p_mult(train)
         if self.amc_p_mode == "median_ema":
@@ -668,6 +829,8 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_form=self.amc_gate_form,
                 gate_beta=self._gate_beta(train),
                 gate_tau_log=self.amc_gate_tau_log,
+                conf_kind=self.amc_conf_kind,
+                gate_detach=self.amc_gate_detach,
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
@@ -925,7 +1088,129 @@ class ObjectCentricModel(pl.LightningModule):
             losses["loss_p_residual"] = delta_term
             total_loss = total_loss + self.amc_p_residual_l2 * delta_term
 
+        # --- predictive feature reconstruction (v27) ---
+        if (
+            self.training
+            and self.pred_weight > 0.0
+            and self.trainer.global_step >= self.pred_start_step
+        ):
+            pred_term = self._predictive_recon_loss(outputs)
+            if pred_term is not None:
+                losses["loss_pred"] = pred_term
+                total_loss = total_loss + (
+                    self.pred_weight * self._aux_ramp(self.pred_ramp) * pred_term
+                )
+
+        # --- counterfactual slot-utility rent (v27) ---
+        if (
+            self.training
+            and self.util_weight > 0.0
+            and self.trainer.global_step >= self.util_start_step
+        ):
+            util_term = self._slot_utility_loss(outputs)
+            if util_term is not None:
+                losses["loss_util"] = util_term
+                total_loss = total_loss + (
+                    self.util_weight * self._aux_ramp(self.util_ramp) * util_term
+                )
+
         return total_loss, losses
+
+    def _predictive_recon_loss(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """Predictive feature reconstruction: MSE(Dec(Pred(x_t)), F_{t+1}).
+
+        Uses `state_predicted_pregate` for the same reason loss_dyn does: the term must
+        supervise the predictor module itself. Going through the gated temporal mix would
+        scale the predictor's gradient by g and let the loss lean on the gate instead of
+        on motion. The gate handed to the decoder is detached likewise -- this loss trains
+        the predictor/decoder/slots, never the gate.
+
+        Only `n_transitions` random (t -> t+1) pairs are decoded per step to bound the
+        extra decoder memory; the estimate stays unbiased over training.
+        """
+        proc = outputs.get("processor") or {}
+        pred = proc.get("state_predicted_pregate")
+        target = outputs.get("encoder", {}).get("backbone_features")
+        if pred is None or target is None or pred.ndim != 4 or pred.shape[1] < 2:
+            return None
+
+        t_total = pred.shape[1]
+        n = max(1, min(self.pred_n_transitions, t_total - 1))
+        idx = torch.randperm(t_total - 1, device=pred.device)[:n]
+        pred_slice = pred[:, idx]  # predictions made at t = idx, for frames idx + 1
+
+        gate = self._active_mask
+        if gate is not None and gate.ndim == 3 and gate.shape[:2] == pred.shape[:2]:
+            decoder_output = self.decoder(pred_slice, gate[:, idx].detach())
+        else:
+            decoder_output = self.decoder(pred_slice)
+        recon = decoder_output["reconstruction"]  # (B, n, F, D)
+        tgt = target[:, idx + 1].detach()
+        return F.mse_loss(recon, tgt)
+
+    def _slot_utility_loss(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """Counterfactual slot-utility rent (marginal-utility replacement for gate_l1).
+
+        Per sample, one random gated slot is dropped and the batch is re-decoded under
+        no_grad (the counterfactual carries no activations, so this pass is cheap). The
+        error increase is measured ON THE DROPPED SLOT'S OWN TERRITORY (decoder-mask
+        weighted) and normalized by the sample's mean per-patch error, which removes the
+        size bias that made the constant rent evict small-object slots:
+
+            rel_delta = E_mask[err_drop - err_full] / E[err_full]
+            rent      = clamp(1 - rel_delta / margin, 0, 1)
+            loss      = mean_b [ gate(dropped slot) * sg(rent) ]
+
+        Only the live gate carries gradient (through the sigmoid into the mass branch),
+        matching the detach discipline of the confidence branch and gate_cov's error
+        weights. Bool (hard) gates carry no gradient, so the term is skipped then.
+        """
+        gate = self._active_mask
+        if gate is None or gate.dtype == torch.bool or gate.ndim != 3:
+            return None
+        proc = outputs.get("processor") or {}
+        dec = outputs.get("decoder") or {}
+        slots = proc.get("state")
+        masks = dec.get("masks")
+        recon = dec.get("reconstruction")
+        target = outputs.get("encoder", {}).get("backbone_features")
+        if slots is None or masks is None or recon is None or target is None:
+            return None
+        if slots.ndim != 4 or masks.ndim != 4:
+            return None
+        b, t, s, _ = slots.shape
+
+        with torch.no_grad():
+            err_full = (recon - target).pow(2).mean(-1)  # (B, T, F)
+            g_bar = gate.float().mean(dim=1)  # (B, S)
+            mask_share = masks.float().mean(dim=(1, 3))  # (B, S)
+            cand = (g_bar > self.util_gate_min) & (mask_share > self.util_min_mask)
+
+            drop_idx = torch.full((b,), -1, dtype=torch.long, device=slots.device)
+            for bi in range(b):
+                c = cand[bi].nonzero(as_tuple=False).flatten()
+                if c.numel() > 0:
+                    drop_idx[bi] = c[torch.randint(c.numel(), (1,), device=c.device)]
+            valid = drop_idx >= 0
+            if not bool(valid.any()):
+                return None
+            safe_idx = drop_idx.clamp_min(0)
+
+            g_drop = gate.float().clone()
+            g_drop[torch.arange(b, device=slots.device), :, safe_idx] = 0.0
+            recon_drop = self.decoder(slots, g_drop)["reconstruction"]
+            err_drop = (recon_drop - target).pow(2).mean(-1)  # (B, T, F)
+
+            # territory of the dropped slot = its decoder mask (soft ownership weights)
+            w = masks.float()[torch.arange(b, device=slots.device), :, safe_idx]  # (B, T, F)
+            delta = ((err_drop - err_full) * w).sum(dim=(1, 2)) / w.sum(dim=(1, 2)).clamp_min(1e-8)
+            rel_delta = delta / err_full.mean(dim=(1, 2)).clamp_min(1e-8)  # (B,)
+            rent = (1.0 - rel_delta / max(self.util_margin, 1e-8)).clamp(min=0.0, max=1.0)
+            self._util_rel_delta = float(rel_delta[valid].mean())
+
+        g_live = gate.float().mean(dim=1)  # (B, S), graph-connected to the mass branch
+        g_sel = g_live[torch.arange(b, device=slots.device), safe_idx]
+        return (g_sel * rent)[valid].mean()
 
     def _dynamics_direction(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Cosine alignment between the predictor's step and the next-frame displacement.
@@ -1108,7 +1393,16 @@ class ObjectCentricModel(pl.LightningModule):
         per_bt = weighted.sum(dim=(-1, -2)) / denom
         return per_bt.mean()
 
+    def _frame_encoder(self) -> nn.Module:
+        """The inner FrameEncoder (unwraps MapOverTime for video input)."""
+        return self.encoder.module if hasattr(self.encoder, "module") else self.encoder
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
+        if self.featcur_enabled:
+            # schedule the feature curriculum blend before the forward reads it
+            self._frame_encoder().feature_smoothing_mix = feature_curriculum_mix(
+                self.trainer.global_step, self.featcur_anneal_steps, self.featcur_schedule
+            )
         outputs = self.forward(batch)
         if self.train_metrics or (
             self.visualize and self.trainer.global_step % self.visualize_every_n_steps == 0
@@ -1122,16 +1416,23 @@ class ObjectCentricModel(pl.LightningModule):
             to_log = {f"train/{name}": loss for name, loss in losses.items()}
             to_log["train/loss"] = total_loss
 
+        if self.featcur_enabled:
+            to_log["train/featcur_mix"] = float(
+                self._frame_encoder().feature_smoothing_mix
+            )
+
         if self.attn_mass_enabled and self._active_mask is not None:
             # for soft gating this is the effective (summed-gate) active slot count
             gate = self._active_mask.float()  # (B, T, S) or (B, S)
             to_log["train/active_slots"] = gate.sum(-1).mean()
-            to_log["train/gate_p"] = float(self._gate_threshold(True))
-            to_log["train/gate_p_mult"] = float(self._annealed_p_mult(True))
+            gate_p_now = self._gate_threshold(True)
+            if gate_p_now is not None:  # purity_weight is thresholdless
+                to_log["train/gate_p"] = float(gate_p_now)
+                to_log["train/gate_p_mult"] = float(self._annealed_p_mult(True))
             if getattr(self, "_gate_p_eff_mean", None) is not None:
                 to_log["train/gate_p_eff"] = self._gate_p_eff_mean
-            if self.amc_p_mode == "learnable_residual":
-                to_log["train/gate_p_sched"] = float(self._gate_threshold(True))
+            if self.amc_p_mode == "learnable_residual" and gate_p_now is not None:
+                to_log["train/gate_p_sched"] = float(gate_p_now)
                 to_log["train/gate_p_alpha"] = float(self._p_residual_alpha_eff(True))
                 if self._gate_delta is not None:
                     to_log["train/gate_delta"] = self._gate_delta.float().detach().mean()
@@ -1139,9 +1440,10 @@ class ObjectCentricModel(pl.LightningModule):
                 to_log["train/gate_lambda"] = float(self._curriculum_lambda(True))
                 to_log["train/gate_beta"] = float(self._gate_beta(True))
                 to_log["train/gate_tau_log"] = float(self.amc_gate_tau_log)
+            if self.amc_gate_form in ("logratio", "purity_weight"):
                 if getattr(self, "_gate_conf_mean", None) is not None:
                     to_log["train/gate_conf"] = self._gate_conf_mean
-            if self.amc_gate_mode in ("soft", "ste"):
+            if self.amc_gate_mode in ("soft", "ste") or self.amc_gate_form == "purity_weight":
                 if self.amc_gate_form == "linear":
                     # tau in mass units only parameterizes the linear gate
                     to_log["train/gate_tau"] = float(self._gate_tau(True))
@@ -1167,6 +1469,13 @@ class ObjectCentricModel(pl.LightningModule):
                 to_log["train/gate_state_p"] = float(state_p)
                 if getattr(self, "_state_gate_mean", None) is not None:
                     to_log["train/gate_state_slots"] = self._state_gate_mean * self.n_slots
+
+        if self.pred_weight > 0.0:
+            to_log["train/pred_w_eff"] = self.pred_weight * self._aux_ramp(self.pred_ramp)
+        if self.util_weight > 0.0:
+            to_log["train/util_w_eff"] = self.util_weight * self._aux_ramp(self.util_ramp)
+            if self._util_rel_delta is not None:
+                to_log["train/util_rel_delta"] = self._util_rel_delta
 
         if self.train_metrics:
             for key, metric in self.train_metrics.items():

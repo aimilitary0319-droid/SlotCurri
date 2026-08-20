@@ -1,0 +1,210 @@
+experiment_group: slotcurri
+experiment_name: ytvis_attnmass_v29
+
+globals:
+  NUM_SLOTS: 7
+  SLOT_DIM: 64
+  DINO_MODEL: vit_base_patch14_dinov2
+  FEAT_DIM: 768
+  NUM_PATCHES: 1369
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
+  cyclic_inference: false
+
+  # --- v29 = v26 with the confidence branch switched to PURITY (single-variable change) ---
+  #
+  # The logratio gate's second branch answers "is this low-mass slot a small object or a
+  # ghost?". v26 answers it with spatial concentration (entropy over the gamma-sharpened
+  # attention); v29 answers it with ownership quality on the SAME sharpened attention as
+  # the mass branch (one distribution, two moments):
+  #   c_s = sum_f A~_{s,f}^2 / sum_f A~_{s,f}   (purity_sharp, detached)
+  # i.e. the attention-weighted mean of the slot's own per-patch ownership share.
+  #
+  # Why (theory): it measures the discriminator DIRECTLY -- a small object owns its few
+  # patches (share ~ 1), a ghost owns nothing anywhere (share ~ second place) -- and it is
+  # size-invariant, where the entropy form penalizes large objects by construction
+  # (H grows with log(object size); a fully-owned 700-patch object gets c ~ 0.1, ghost
+  # level, so the two branches fight for big slots). Log-domain penalties are also milder
+  # on diffuse early attention (log(purity) ~ -2 vs log(c_ent) ~ -6.6 untrained), which
+  # relaxes the early-lock death-spiral pressure v26's attempt-1 hit.
+  #
+  # Why (measured; event_analysis/conf_vs_purity_probe.py, v20 @ 100k, 200 val clips,
+  # ghost = 0 argmax wins / small = 1..5% of patches):
+  #   - conf-only AUC (small vs ghost): entropy 0.647 (near chance: ghost med 0.371 vs
+  #     small med 0.396!) | purity_raw 0.997 | purity_sharp 0.999
+  #   - at the unchanged working point (beta 0.7, tau_g 0.5, p_end 0.1/7):
+  #       ghost pass (r > p)    16.2% -> 9.3%   (nearly halved)
+  #       ghost median gate     0.304 -> 0.125  (stronger suppression than entropy even
+  #                                              at its calibrated tau 0.25: 0.160)
+  #       small miss (r < p)     0.6% -> 1.0%   | small median gate 0.959 -> 0.972
+  #   - beta sweep (purity_sharp, tau 0.5): 0.8 -> ghost 5.7% / small miss 2.4%;
+  #     0.7 -> 9.3% / 1.0%; 0.6 -> 15.8% / 0.3%. 0.7 kept: balanced, and identical to
+  #     v26 so conf_kind stays the only changed variable.
+  # conf_kind: purity (raw attention) is the untested middle option; sharp dominated it
+  # on every probe metric (its residual risk -- inflating slots that win a few
+  # uncontested junk patches -- lands in the probe's "small" group and is not separable
+  # there; the v27 slot-utility rent is the mechanism that would evict those).
+  #
+  # Distinct from the purity_q OR-rescue (which can only OPEN gates and bypasses the
+  # evidence score; stays off here): this is the multiplicative evidence branch, so it
+  # opens AND closes.
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    p_start_mult: 1.5       # above the mass distribution: throttles the early winner too
+    p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
+    p_anneal: cosine        # coupled curriculum: p driven by lambda_t
+    anneal_steps: 75000     # curriculum over 3/4 of the run, last 25k = consolidation
+    gate_mode: soft
+    gate_form: logratio     # evidence-ratio gate (unchanged)
+    conf_kind: purity_sharp # v29: ownership (sum A~^2 / sum A~) replaces entropy confidence
+    gate_tau_log: 0.5       # unchanged; probe: ghost gate 0.125 here (entropy gave 0.304)
+    beta_final: 0.7         # unchanged; probe beta sweep confirms 0.7 as the balance point
+    mass_gamma: 2.0         # sharpening, used for the mass branch only
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true    # temporal gate alpha = g / max_j(g)
+    contrastive_gate: false # loss_ss ignores the gate
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
+  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 1
+  val_size: 200
+  num_workers: 4
+  num_val_workers: 1
+  train_pipeline:
+    chunk_size: 4
+    keys: [video]
+    sample_one_chunk_per_video: true
+    transforms:
+      name: ytvis_train
+      type: video
+      crop_type: short_side_resize_random
+      input_size: 518
+      num_classes: 10
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: ytvis_val
+      type: video
+      crop_type: central
+      input_size: 518
+      num_classes: 25

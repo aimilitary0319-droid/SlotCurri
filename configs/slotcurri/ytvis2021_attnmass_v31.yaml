@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v26m
+experiment_name: ytvis_attnmass_v31
 
 globals:
   NUM_SLOTS: 7
@@ -34,44 +34,62 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
   cyclic_inference: false
 
-  # --- v26m: ABLATION of v26 -- confidence branch removed (mass-only evidence) ---
+  # --- v31 = v29 (purity gate) + counterfactual slot-utility rent (single addition) ---
   #
-  # Identical to ytvis2021_attnmass_v26.yaml except beta_final = 1.0, so
-  #   log r = log(m + eps)   for the whole run (the confidence path never engages)
-  #   g     = sigmoid(log(m / p) / tau_g)
-  # Log-ratio gate, cosine coupled p schedule, tau_g, gamma, and everything else are
-  # unchanged, so the v26 - v26m gap isolates the contribution of assignment
-  # confidence c = 1 - H/log F.
+  # Extends the single-variable grid on the v29 base: v30 adds L_pred (merge splitting),
+  # v31 adds the slot-utility rent from v27 (duplicate/ghost eviction). Everything except
+  # the slot_utility block is byte-identical to ytvis2021_attnmass_v29.yaml, so the
+  # v31 - v29 gap attributes the rent alone.
   #
-  # Calibration on the v20 @ 100k checkpoint predicts the failure mode this tests:
-  # at the end threshold p = 0.1/7, mass-only misses 11.7% of small-object slot-frames
-  # (r < p) vs 0.6% with confidence at beta = 0.7, while passing fewer ghosts
-  # (3.2% vs 16.2%). If v26m matches v26 on ARI, the confidence claim must be dropped.
+  # Rent mechanism (see slotcurri/models.py::_slot_utility_loss): per sample, one random
+  # gated slot (gate > gate_min, decoder-mask share > min_mask) is dropped and the batch
+  # re-decoded under no_grad. The error increase is measured ON THE DROPPED SLOT'S OWN
+  # decoder-mask territory, normalized by the sample's mean per-patch error:
+  #   rel_delta = E_mask[err_drop - err_full] / E[err_full]
+  #   rent      = clamp(1 - rel_delta/margin, 0, 1)
+  #   loss      = gate(dropped) * sg(rent)
+  # A duplicate's territory is covered by its twin after the decoder renorm (rel_delta ~ 0,
+  # full rent); a small-object slot is irreplaceable on its own patches (rel_delta >>
+  # margin, exempt). This is the marginal-utility fix for gate_l1's documented failure
+  # (v2: the constant rent evicted small-object slots first, active fell to ~1.7).
+  # Delta is detached; the gradient reaches only the gate's mass branch -- so the term
+  # cannot reshape slot content, only close redundant gates. lambda ramp keeps it silent
+  # during the coarse phase (intentional merging) like L_pred in v30.
   #
-  # Run history: the first v26m ran with gate_tau_log = 0.25 (the pre-fix v26 value)
-  # and lagged badly (val/ari 0.270 @ 57k vs v26's 0.410 @ 32k) -- consistent with the
-  # sharp-tau early-phase pathology that also broke v26 attempts 1-2, and confounded
-  # as an ablation once v26 settled on tau 0.5. Stopped at ~60k (archived under
-  # logs/_archive/*_tau025_*) and relaunched with tau 0.5 so the ONLY difference vs
-  # the final v26 is beta_final = 1.0.
+  # Expected effect vs v29: purity already halves ghost passes at the gate (16.2% -> 9.3%
+  # on the v20 probe); the rent targets the residual class purity cannot see -- slots that
+  # WIN patches (nonzero ownership) but add no marginal information (true duplicates, and
+  # sharp-purity's junk-patch winners flagged in the v29 header). If v31 matches v29 on
+  # ARI, the rent is dropped from the system.
+  slot_utility:
+    weight: 0.05
+    margin: 1.0             # rent-free once dropping the slot costs >= 1x mean patch error
+    gate_min: 0.5           # only gated-on slots are sampled
+    min_mask: 0.01          # ... with enough territory for delta to be measurable
+    ramp: lambda            # effective weight = weight * lambda_t (silent in coarse phase)
+    start_step: 0
+
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
+    p_start_mult: 1.5       # above the mass distribution: throttles the early winner too
     p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: cosine        # same coupled lambda schedule as v26
-    anneal_steps: 75000     # same as v26: curriculum over 3/4, last 25k consolidation
+    p_anneal: cosine        # coupled curriculum: p driven by lambda_t
+    anneal_steps: 75000     # curriculum over 3/4 of the run, last 25k = consolidation
     gate_mode: soft
-    gate_form: logratio     # same gate form as v26
-    gate_tau_log: 0.5       # same temperature as (final) v26
-    beta_final: 1.0         # <-- ONLY change vs v26: evidence is coverage only
-    mass_gamma: 2.0
+    gate_form: logratio     # evidence-ratio gate (unchanged)
+    conf_kind: purity_sharp # v29: ownership (sum A~^2 / sum A~) replaces entropy confidence
+    gate_tau_log: 0.5       # unchanged; probe: ghost gate 0.125 here (entropy gave 0.304)
+    beta_final: 0.7         # unchanged; probe beta sweep confirms 0.7 as the balance point
+    mass_gamma: 2.0         # sharpening, used for the mass branch only
     gate_l1: 0.0
     gate_div: 0.0
-    state_max_norm: true
-    contrastive_gate: false
+    state_max_norm: true    # temporal gate alpha = g / max_j(g)
+    contrastive_gate: false # loss_ss ignores the gate
 
   losses:
     loss_featrec:

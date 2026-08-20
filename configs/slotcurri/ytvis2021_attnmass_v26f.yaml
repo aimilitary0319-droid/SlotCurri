@@ -52,16 +52,23 @@ model:
   # If v26f trains as well as v26, the coupling is unnecessary and a fixed beta
   # (one fewer schedule) is the simpler method. Watch the early train/gate_conf,
   # train/active_slots and loss curves vs v26.
+  #
+  # Run history: attempt 1 (p_start 1.5, tau 0.25) collapsed completely (val/ari ->
+  # 0.002, all gates < 0.5, gate_conf stuck at 0.008 by 21k steps); attempt 2
+  # (p_start 1.0, tau 0.25) started the same way (all gates < 0.5 from step 0, the
+  # fixed 0.3*log(c ~= 0.01) penalty pushes every score ~5 logits down). Both runs
+  # also predate the v26 early-phase fix, so this rerun tracks v26's final setting
+  # (p_start 1.5, tau_g 0.5) with ONLY beta uncoupled -- the clean coupling test.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
+    p_start_mult: 1.5       # same as v26: above the distribution, throttles early winner
     p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
     p_anneal: cosine        # p schedule unchanged vs v26
     anneal_steps: 75000     # same as v26: curriculum over 3/4, last 25k consolidation
     gate_mode: soft
     gate_form: logratio
-    gate_tau_log: 0.25
+    gate_tau_log: 0.5       # same as v26
     beta_start: 0.7         # <-- ONLY change vs v26: confidence engaged from step 0
     beta_final: 0.7         #     (beta constant; lambda no longer drives it)
     mass_gamma: 2.0

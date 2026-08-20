@@ -77,29 +77,45 @@ model:
   # is near-final or final. v20/v21 used a 66k window (34k consolidation) for reference.
   #
   # New hyperparameters (doc sec. 16): mass_gamma (2.0), p_start/p_end (1.5/0.1),
-  # beta_final (0.7), gate_tau_log. p_start/p_end multipliers kept from v21 as the doc's
-  # initial candidates.
+  # beta_final (0.7), gate_tau_log (0.5).
   #
-  # gate_tau_log = 0.25 was calibrated empirically on the v20 @ 100k checkpoint
-  # (event_analysis/calibrate_tau_g.py, 200 val clips): at the end-of-curriculum
-  # threshold p = 0.1/7 with beta = 0.7, median gates are ghost 0.16 / small 0.998 /
-  # large 1.000 (6.2x small-vs-ghost suppression vs 3.2x at tau 0.5, 2.1x at 1.0),
-  # while the small-object loss (r < p) is 0.6% regardless of tau -- tau only sets the
-  # sigmoid sharpness, not the ranking. Transition dynamics stay smooth: the cosine
-  # p-schedule needs ~17k steps (T = 75k) to sweep a slot across the +-2-logit band
-  # even at 0.25.
-  # Fallback to 0.5 if the gate flickers for threshold-straddling slots
-  # (watch train/gate_n_half and the VideoARI-ImageARI gap).
+  # HARD-WON SETTINGS -- two failed attempts inform p_start and tau_g:
+  #   attempt 1 (p_start 1.5, tau_g 0.25): every slot's score starts in the sigmoid's
+  #     exponential tail (log(1/1.5)/0.25 ~= -1.6), where tiny mass differences explode;
+  #     the run locked into 1 active slot for 23k steps with val/ari decaying and
+  #     gate_conf stuck at 0.01 (diffuse attention keeps c low, low c keeps gates shut).
+  #     NB v26m trained through the same setting -- with tau 0.25 the early phase is
+  #     BISTABLE (open vs lock decided by run-to-run luck), which is itself unacceptable.
+  #   attempt 2 (p_start 1.0, tau_g 0.25): all slots start at the decision boundary
+  #     (score ~= 0), but the winner immediately clears the "fair share" threshold and
+  #     saturates (g = 0.998 by step 600), monopolizing the decoder and re-locking.
+  #     Lesson: p_start ABOVE the distribution is what keeps the WINNER throttled early
+  #     (v26m's max gate stays ~0.86 for 25k steps); the restriction restrains the top,
+  #     not just the tail.
+  # So: p_start 1.5 restored (winner stays near g ~= 0.5 early) and tau_g doubled to 0.5,
+  # which halves every logit -- the weak-slot gate floor rises ~4x (0.05 -> 0.18) and the
+  # early winner:weakest decoder contrast drops from ~11x to ~2.8x, gentler than v20's
+  # linear gate (~4.4x), the family's proven-trainable reference point.
+  #
+  # gate_tau_log = 0.5: the calibrated fallback from the v20 @ 100k study
+  # (event_analysis/calibrate_tau_g.py, 200 val clips). tau does not change WHO passes
+  # (r > p ranking is tau-independent; ghost pass 16.2%, small loss 0.6% either way),
+  # only how hard the failers are suppressed: at the end threshold, median gates are
+  # ghost 0.30 / small 0.96 (3.2x suppression) vs ghost 0.16 / small 0.998 (6.2x) at
+  # the 0.25 optimum. That late-stage headroom is traded for the early-phase stability
+  # described above (0.25 made early training bistable). If the trained run shows ghost
+  # leakage in visualizations, tightening tau is a candidate refinement -- but only with
+  # an early-phase guard (e.g. tau annealed 1.0 -> 0.25 by the same lambda).
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
+    p_start_mult: 1.5       # above the mass distribution: throttles the early winner too
     p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
     p_anneal: cosine        # coupled curriculum: p driven by lambda_t
     anneal_steps: 75000     # curriculum over 3/4 of the run, last 25k = consolidation
     gate_mode: soft
     gate_form: logratio     # evidence-ratio gate (replaces linear (m - p)/tau)
-    gate_tau_log: 0.25      # tau_g, calibrated on v20 stats (see comment above)
+    gate_tau_log: 0.5       # calibrated fallback: early-phase stability over max late sharpness
     beta_final: 0.7         # confidence contribution ramps 0 -> 0.3 with lambda_t
     mass_gamma: 2.0         # sharpening, used for activity estimation only
     gate_l1: 0.0

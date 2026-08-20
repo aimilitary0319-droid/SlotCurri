@@ -30,6 +30,90 @@ def build(config, name: str):
         return None
 
 
+class FeatureSmoothing(nn.Module):
+    """Affinity-based within-object feature homogenization (v33 task curriculum).
+
+    Given backbone tokens x (B, F, D), one step of non-parametric self-attention
+
+        P = softmax_j( cos(x_i, x_j) / tau ),   x_tilde = P x
+
+    averages every token with its feature-space neighbours. Because DINO affinities are
+    block-structured by object, this shrinks WITHIN-object feature variance toward zero
+    while approximately preserving object boundaries (cross-object affinities are small)
+    -- unlike a spatial blur, which mixes across boundaries. The returned tensor is the
+    scheduled blend
+
+        x_used = (1 - mix) * x_tilde + mix * x
+
+    with mix = 0 fully smoothed (object-level features, a part-split earns nothing and
+    cannot hold clean ownership) and mix = 1 raw (exact no-op, the module returns x
+    itself). `window` optionally restricts the affinity to a local square neighbourhood
+    (Chebyshev radius on the patch grid) so that distant same-appearance regions -- two
+    instances of one class -- do not exchange features.
+
+    P is computed under no_grad and x_tilde is detached: the smoothing is a pure data
+    transform of the (frozen) backbone tokens, introducing no new gradient paths. The
+    module holds no parameters, so checkpoints stay byte-compatible either way.
+    """
+
+    def __init__(
+        self,
+        tau: float = 0.1,
+        window: Optional[int] = None,
+        chunk_size: int = 16,
+    ):
+        super().__init__()
+        self.tau = float(tau)
+        self.window = int(window) if window is not None else None
+        self.chunk_size = max(int(chunk_size), 1)
+        self._mask_cache: Dict[Any, Optional[torch.Tensor]] = {}
+
+    def _window_mask(self, n_tokens: int, device: torch.device) -> Optional[torch.Tensor]:
+        """True where the affinity is masked out (grid Chebyshev distance > window)."""
+        if self.window is None:
+            return None
+        key = (n_tokens, str(device))
+        if key in self._mask_cache:
+            return self._mask_cache[key]
+        side = int(round(n_tokens**0.5))
+        if side * side != n_tokens:
+            # non-square token grid: cannot localize, fall back to global affinity
+            self._mask_cache[key] = None
+            return None
+        idx = torch.arange(n_tokens, device=device)
+        ys, xs = idx // side, idx % side
+        cheb = torch.maximum(
+            (ys[:, None] - ys[None, :]).abs(), (xs[:, None] - xs[None, :]).abs()
+        )
+        mask = cheb > self.window
+        self._mask_cache[key] = mask
+        return mask
+
+    @torch.no_grad()
+    def _smooth(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, F, D). Chunked over the batch so the (F, F) affinity is transient.
+        mask = self._window_mask(x.shape[1], x.device)
+        out = torch.empty_like(x)
+        for i in range(0, x.shape[0], self.chunk_size):
+            xc = x[i : i + self.chunk_size].float()
+            xn = torch.nn.functional.normalize(xc, dim=-1)
+            logits = torch.bmm(xn, xn.transpose(1, 2)) / self.tau
+            if mask is not None:
+                logits = logits.masked_fill(mask, float("-inf"))
+            p = logits.softmax(dim=-1)
+            out[i : i + self.chunk_size] = torch.bmm(p, xc).to(x.dtype)
+        return out
+
+    def forward(self, x: torch.Tensor, mix: float) -> torch.Tensor:
+        mix = float(mix)
+        if mix >= 1.0:
+            return x
+        smoothed = self._smooth(x.detach())
+        if mix <= 0.0:
+            return smoothed
+        return (1.0 - mix) * smoothed + mix * x
+
+
 class FrameEncoder(nn.Module):
     """Module reducing image to set of features."""
 
@@ -47,10 +131,33 @@ class FrameEncoder(nn.Module):
         self.output_transform = output_transform
         self.spatial_flatten = spatial_flatten
         self.main_features_key = main_features_key
+        # v33 feature curriculum: optional affinity smoothing of the backbone tokens,
+        # attached post-build by the model. It runs BEFORE the features/backbone_features
+        # split, so the grouper input and the reconstruction target both derive from the
+        # smoothed tensor. `feature_smoothing_mix` follows the model's schedule
+        # (0 = fully smoothed, 1 = raw); only active in train() mode, so validation and
+        # eval always see raw features.
+        self.feature_smoothing: Optional[nn.Module] = None
+        self.feature_smoothing_mix: float = 1.0
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         # images: batch x n_channels x height x width
         backbone_features = self.backbone(images)
+        if (
+            self.feature_smoothing is not None
+            and self.training
+            and self.feature_smoothing_mix < 1.0
+        ):
+            if isinstance(backbone_features, dict):
+                main = backbone_features[self.main_features_key]
+                if main.ndim == 3:
+                    backbone_features[self.main_features_key] = self.feature_smoothing(
+                        main, self.feature_smoothing_mix
+                    )
+            elif backbone_features.ndim == 3:
+                backbone_features = self.feature_smoothing(
+                    backbone_features, self.feature_smoothing_mix
+                )
         if isinstance(backbone_features, dict):
             features = backbone_features[self.main_features_key].clone()
         else:

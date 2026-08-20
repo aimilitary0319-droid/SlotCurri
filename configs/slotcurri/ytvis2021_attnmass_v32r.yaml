@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v26m
+experiment_name: ytvis_attnmass_v32r
 
 globals:
   NUM_SLOTS: 7
@@ -34,44 +34,42 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
   cyclic_inference: false
 
-  # --- v26m: ABLATION of v26 -- confidence branch removed (mass-only evidence) ---
+  # --- v32r = v32 (purity gating) with the RAW-attention purity (single-variable) ---
   #
-  # Identical to ytvis2021_attnmass_v26.yaml except beta_final = 1.0, so
-  #   log r = log(m + eps)   for the whole run (the confidence path never engages)
-  #   g     = sigmoid(log(m / p) / tau_g)
-  # Log-ratio gate, cosine coupled p schedule, tau_g, gamma, and everything else are
-  # unchanged, so the v26 - v26m gap isolates the contribution of assignment
-  # confidence c = 1 - H/log F.
+  # Same method as ytvis2021_attnmass_v32.yaml (which see for the full rationale):
+  # the threshold curriculum is replaced by the detached ownership statistic used
+  # directly as the gate, decoder softmax(alpha + log c), temporal alpha = c / max(c).
+  # The ONLY change is the tensor the statistic is computed on:
+  #   v32  (purity_sharp): c on the gamma^2-sharpened attention
+  #   v32r (purity)      : c = sg( sum_f A^2 / sum_f A ) on the RAW attention
   #
-  # Calibration on the v20 @ 100k checkpoint predicts the failure mode this tests:
-  # at the end threshold p = 0.1/7, mass-only misses 11.7% of small-object slot-frames
-  # (r < p) vs 0.6% with confidence at beta = 0.7, while passing fewer ghosts
-  # (3.2% vs 16.2%). If v26m matches v26 on ARI, the confidence claim must be dropped.
+  # Why test raw against sharp:
+  #   - the probe separation is a near-tie (conf-only ghost-vs-small AUC 0.997 raw vs
+  #     0.999 sharp on v20 @ 100k), so the probe cannot pick between them;
+  #   - they sit on opposite sides of the method's two known risks. Sharpening pushes a
+  #     junk-patch winner's share toward 1 (inflating the main leak) but also pushes a
+  #     ghost's share toward 0 (stronger suppression); the raw statistic is milder on
+  #     both. Which side matters more is a training-dynamics question the v32 - v32r
+  #     pair answers directly.
   #
-  # Run history: the first v26m ran with gate_tau_log = 0.25 (the pre-fix v26 value)
-  # and lagged badly (val/ari 0.270 @ 57k vs v26's 0.410 @ 32k) -- consistent with the
-  # sharp-tau early-phase pathology that also broke v26 attempts 1-2, and confounded
-  # as an ablation once v26 settled on tau 0.5. Stopped at ~60k (archived under
-  # logs/_archive/*_tau025_*) and relaunched with tau 0.5 so the ONLY difference vs
-  # the final v26 is beta_final = 1.0.
+  # mass_gamma is kept at 2.0 for a byte-identical diff, but it is INERT here: the
+  # sharpened tensor feeds only purity_sharp (and the unused mass branch), while
+  # conf_kind=purity reads the raw attention.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
-    p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: cosine        # same coupled lambda schedule as v26
-    anneal_steps: 75000     # same as v26: curriculum over 3/4, last 25k consolidation
-    gate_mode: soft
-    gate_form: logratio     # same gate form as v26
-    gate_tau_log: 0.5       # same temperature as (final) v26
-    beta_final: 1.0         # <-- ONLY change vs v26: evidence is coverage only
-    mass_gamma: 2.0
+    gate_mode: soft         # inert for purity_weight (kept for the gate stats logging)
+    gate_form: purity_weight
+    conf_kind: purity       # v32r: ownership purity on the RAW attention
+    mass_gamma: 2.0         # inert under conf_kind=purity (kept for a minimal diff)
     gate_l1: 0.0
     gate_div: 0.0
-    state_max_norm: true
-    contrastive_gate: false
+    state_max_norm: true    # temporal gate alpha = c / max_j(c)
+    contrastive_gate: false # loss_ss ignores the gate (baseline-style)
 
   losses:
     loss_featrec:

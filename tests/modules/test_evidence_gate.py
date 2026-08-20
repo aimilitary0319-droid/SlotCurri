@@ -163,6 +163,100 @@ def test_logratio_hard_and_ste_modes():
     assert (ste[:, 0] == 1.0).all()  # default slot forced on
 
 
+def _expected_purity(att):
+    return ((att * att).sum(-1) / att.sum(-1).clamp_min(1e-8)).clamp(0.0, 1.0)
+
+
+def test_purity_weight_gate_is_the_statistic():
+    """gate_form='purity_weight': the detached ownership purity IS the gate (v32).
+
+    No threshold, no temperature: active_mask == sg(purity_sharp), shared with the
+    temporal path.
+    """
+    _, att = _make_attention()
+    out = _run_processor(
+        att, gate_p=None, default_idx=[], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity_sharp",
+    )
+    g = out["active_mask"]
+    expected = _expected_purity(_sharpen(att, 2.0))
+    assert g.dtype != torch.bool
+    assert torch.allclose(g, expected, atol=1e-6)
+    assert torch.equal(out["state_gate"], g)
+    assert not g.requires_grad  # sg(c): pure forward modulation, no gate gradient
+    # ownership ordering: every real claimant out-gates the diffuse ghost, and the
+    # small object is not penalized for its size (the entropy form's defect)
+    for obj in (0, 1, 3):
+        assert (g[:, obj] > g[:, 2]).all()
+    assert (g[:, 1] > 0.9).all() and (g[:, 0] > 0.9).all()
+
+
+def test_purity_weight_uniform_attention_is_noop():
+    """Untrained-like uniform attention: near-uniform c cancels in both application
+    points (decoder renorm / temporal max-norm), so early training is the baseline."""
+    att = torch.full((BATCH, SLOTS, FEATS), 1.0 / SLOTS)
+    processor = LatentProcessor(StubCorrector(att), predictor=None)
+    state = torch.randn(BATCH, SLOTS, DIM)
+    inputs = torch.randn(BATCH, FEATS, DIM)
+    out = processor(
+        state, inputs, gate_p=None, default_idx=[], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity_sharp", state_max_norm=True,
+    )
+    g = out["active_mask"]
+    assert torch.allclose(g, torch.full_like(g, 1.0 / SLOTS), atol=1e-6)
+    # temporal mix: alpha = c / max(c) = 1 everywhere -> prediction passes through
+    assert torch.allclose(out["state_predicted"], out["state"], atol=1e-6)
+
+
+def test_purity_weight_state_mix_max_norm():
+    """Temporal mix advances by alpha = c / max(c); corrector output stays ungated."""
+    _, att = _make_attention()
+    processor = LatentProcessor(StubCorrector(att), predictor=None)
+    state = torch.randn(BATCH, SLOTS, DIM)
+    inputs = torch.randn(BATCH, FEATS, DIM)
+    out = processor(
+        state, inputs, gate_p=None, default_idx=[], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity_sharp", state_max_norm=True,
+    )
+    g = out["active_mask"]
+    assert torch.allclose(out["state"], state + 1.0)  # corrector ungated
+    alpha = (g / g.amax(dim=-1, keepdim=True).clamp_min(1e-8)).unsqueeze(-1)
+    expected = alpha * (state + 1.0) + (1.0 - alpha) * state
+    assert torch.allclose(out["state_predicted"], expected, atol=1e-6)
+
+
+def test_purity_weight_raw_variant_and_default_slot():
+    """conf_kind='purity' reads the RAW attention; default slots are forced fully on."""
+    _, att = _make_attention()
+    out = _run_processor(
+        att, gate_p=None, default_idx=[2], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity",
+    )
+    g = out["active_mask"]
+    expected = torch.maximum(
+        _expected_purity(att), torch.tensor([0.0, 0.0, 1.0, 0.0]).expand(1, SLOTS)
+    )
+    assert torch.allclose(g, expected, atol=1e-6)
+    assert (g[:, 2] == 1.0).all()  # ghost slot forced on as the default slot
+
+
+def test_purity_weight_thresholdless_schedules():
+    """The model exposes no threshold and no beta under purity_weight."""
+    from slotcurri.models import ObjectCentricModel
+
+    class Duck:
+        _gate_threshold = ObjectCentricModel._gate_threshold
+        _gate_beta = ObjectCentricModel._gate_beta
+        _curriculum_lambda = ObjectCentricModel._curriculum_lambda
+
+    duck = Duck()
+    duck.attn_mass_enabled = True
+    duck.amc_gate_form = "purity_weight"
+    assert duck._gate_threshold(True) is None
+    assert duck._gate_threshold(False) is None
+    assert duck._gate_beta(True) is None
+
+
 def test_coupled_curriculum_schedules():
     """lambda drives p (cosine) and beta jointly; eval pins the curriculum end."""
     from slotcurri.models import ObjectCentricModel

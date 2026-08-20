@@ -67,6 +67,8 @@ class LatentProcessor(nn.Module):
         gate_form: str = "linear",
         gate_beta: Optional[float] = None,
         gate_tau_log: Optional[float] = None,
+        conf_kind: str = "entropy",
+        gate_detach: bool = False,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -105,7 +107,10 @@ class LatentProcessor(nn.Module):
         gate_p_eff = None
         gate_delta = None
         gate_conf = None
-        if gate_p is not None and state_attn_mask is not None:
+        # gate_form="purity_weight" has no threshold, so it activates on the form alone
+        # (gate_p arrives as None from the model, every other form still requires it).
+        gating_on = gate_p is not None or gate_form == "purity_weight"
+        if gating_on and state_attn_mask is not None:
             att = state_attn_mask  # (B, S, F), per-patch softmax over slots
             if mass_gamma is not None and float(mass_gamma) != 1.0:
                 # gamma-sharpened mass: per-patch attention raised to gamma and renormalized.
@@ -128,11 +133,29 @@ class LatentProcessor(nn.Module):
             # small+peaked -> c high, diffuse -> c low. Detached (sg) so the model cannot
             # open its gate by artificially sharpening attention; the mass branch keeps its
             # gradient, which is the path featrec is supposed to shape.
-            if gate_form == "logratio":
-                p_feat = att_sharp / att_sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-                ent = -(p_feat * p_feat.clamp_min(1e-8).log()).sum(dim=-1)  # (B, S)
-                log_f = math.log(max(att_sharp.shape[-1], 2))
-                gate_conf = (1.0 - ent / log_f).clamp(min=0.0, max=1.0).detach()
+            ck = str(conf_kind).lower()
+            if gate_form in ("logratio", "purity_weight"):
+                if ck in ("purity", "purity_sharp"):
+                    # Ownership quality instead of spatial concentration (v29): the
+                    # attention-weighted mean of the slot's own per-patch share,
+                    #   c_s = sum_f A_{s,f}^2 / sum_f A_{s,f}  in (0, 1].
+                    # Size-invariant (a fully-owned object scores ~1 whether it covers 20
+                    # patches or 800, where the entropy form gives the large one c ~ 0.1).
+                    # "purity" computes it on the raw attention, "purity_sharp" on the same
+                    # gamma-sharpened tensor as the mass branch (one distribution, two
+                    # moments). On v20 @ 100k the sharp form separates ghosts from small
+                    # objects best (conf-only AUC 0.999 vs 0.997 raw vs 0.647 entropy; see
+                    # event_analysis/conf_vs_purity_probe.py). Detached like the entropy
+                    # form so the model cannot open its gate by sharpening.
+                    src = att if ck == "purity" else att_sharp
+                    gate_conf = (
+                        (src * src).sum(dim=-1) / src.sum(dim=-1).clamp_min(1e-8)
+                    ).clamp(min=0.0, max=1.0).detach()
+                else:
+                    p_feat = att_sharp / att_sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    ent = -(p_feat * p_feat.clamp_min(1e-8).log()).sum(dim=-1)  # (B, S)
+                    log_f = math.log(max(att_sharp.shape[-1], 2))
+                    gate_conf = (1.0 - ent / log_f).clamp(min=0.0, max=1.0).detach()
 
             # Threshold p:
             #   absolute (default): gate_p is the annealed absolute mass threshold
@@ -141,7 +164,9 @@ class LatentProcessor(nn.Module):
             #   learnable_residual: gate_p is absolute p_sched;
             #               p = p_sched * (1 + alpha * tanh(f(sg[m])))
             p_mode_l = str(p_mode).lower()
-            if p_mode_l == "median_ema":
+            if gate_form == "purity_weight":
+                p_use = None  # thresholdless form: p_mode machinery is inert
+            elif p_mode_l == "median_ema":
                 med = mass_frac.median(dim=-1).values.detach()  # (B,)
                 mom = float(median_ema_momentum)
                 mom = min(max(mom, 0.0), 1.0)
@@ -237,14 +262,46 @@ class LatentProcessor(nn.Module):
                         active[:, int(di)] = True
                 return active  # bool
 
-            active_mask = build_gate(p_use)
-            # The decoder's threshold has to anneal below the smallest object's mass or small
-            # objects are never representable, but at that p the gate saturates and goes flat
-            # across slots, which is exactly where the temporal mix loses its selectivity.
-            # `gate_p_state` decouples the two: the returned active_mask (decoder, logging,
-            # contrastive, aux losses) keeps the annealed p, while the predictor re-gate
-            # further down uses a threshold of its own.
-            state_mask = active_mask if gate_p_state is None else build_gate(float(gate_p_state))
+            if gate_form == "purity_weight":
+                # v32 (purity gating): the ownership statistic IS the gate. No threshold,
+                # no temperature, no schedule -- the whole curriculum machine (p, tau,
+                # beta, build_gate above) is bypassed and c is used directly:
+                #   decoder : masks * c, renormalized  ==  softmax_s(alpha + log c)
+                #   temporal: alpha = c / max_j(c) via state_max_norm further down
+                # Untrained attention gives near-uniform c (~1/S), and a uniform gate is
+                # cancelled exactly by both application points (decoder renorm, max-norm),
+                # so early training is the ungated baseline; the gate phases itself in as
+                # attention sharpens (self-annealing, no schedule to mistune). c stays
+                # detached (anti-gaming), so the gate is pure forward modulation.
+                # gate_p_state has no meaning here (there is no threshold to split).
+                active_mask = gate_conf
+                if default_list:
+                    default_vec = torch.zeros_like(active_mask[:1])  # (1, S)
+                    for di in default_list:
+                        if 0 <= int(di) < default_vec.shape[1]:
+                            default_vec[0, int(di)] = 1.0
+                    active_mask = torch.maximum(active_mask, default_vec)
+                state_mask = active_mask
+            else:
+                active_mask = build_gate(p_use)
+                # The decoder's threshold has to anneal below the smallest object's mass or
+                # small objects are never representable, but at that p the gate saturates and
+                # goes flat across slots, which is exactly where the temporal mix loses its
+                # selectivity. `gate_p_state` decouples the two: the returned active_mask
+                # (decoder, logging, contrastive, aux losses) keeps the annealed p, while the
+                # predictor re-gate further down uses a threshold of its own.
+                state_mask = (
+                    active_mask if gate_p_state is None else build_gate(float(gate_p_state))
+                )
+            if gate_detach:
+                # sg(g): keep the forward gate, drop the Jacobian into (m, c).
+                same = state_mask is active_mask
+                if active_mask is not None and torch.is_floating_point(active_mask):
+                    active_mask = active_mask.detach()
+                if same:
+                    state_mask = active_mask
+                elif state_mask is not None and torch.is_floating_point(state_mask):
+                    state_mask = state_mask.detach()
             # The corrector output is deliberately NOT gated here. Gating it as well as the
             # predictor output puts the gate twice on the same path, and because the predictor
             # is a residual block (Pred(x) = x + D) the observation then lands at g^2 while the
@@ -382,12 +439,15 @@ class ScanOverTime(nn.Module):
         self.module = module
         self.next_state_key = next_state_key
         self.pass_step = pass_step
+        # Anchor frame chosen per sample by the last "evidence"/"random" cycle (diagnostics
+        # for eval scripts; None when the last forward used another mode).
+        self.last_anchor_frames: Optional[torch.Tensor] = None
 
     def forward(
         self,
         initial_state: torch.Tensor,
         inputs: torch.Tensor,
-        cycle: bool = False,
+        cycle: Any = False,
         gate_p: Optional[float] = None,
         default_idx: Any = 0,
         gate_mode: str = "hard",
@@ -405,6 +465,8 @@ class ScanOverTime(nn.Module):
         gate_form: str = "linear",
         gate_beta: Optional[float] = None,
         gate_tau_log: Optional[float] = None,
+        conf_kind: str = "entropy",
+        gate_detach: bool = False,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -419,6 +481,7 @@ class ScanOverTime(nn.Module):
             p_mode=p_mode, median_ema_momentum=median_ema_momentum,
             p_residual_net=p_residual_net, p_residual_alpha=p_residual_alpha,
             gate_form=gate_form, gate_beta=gate_beta, gate_tau_log=gate_tau_log,
+            conf_kind=conf_kind, gate_detach=gate_detach,
         )
 
         state = initial_state
@@ -442,7 +505,41 @@ class ScanOverTime(nn.Module):
             if "mass_median_ema" in output:
                 median_ema = output["mass_median_ema"]
 
+        self.last_anchor_frames = None
         if cycle:
+            # `cycle` selects the re-inference protocol after the forward sweep:
+            #   True / "last": legacy cyclic inference -- backward sweep anchored at the
+            #       LAST frame's state, all frames replaced by the backward outputs.
+            #   "evidence": evidence-anchored bidirectional inference (EABI). The anchor
+            #       is the frame where the most objects are intactly bound (soft active
+            #       count weighted by ownership purity), the backward sweep runs
+            #       anchor -> 1, and only pre-anchor frames are replaced (re-running
+            #       forward from the anchor state would reproduce the forward sweep
+            #       exactly, so those frames are kept as-is).
+            #   "evidence_mass": EABI with the coverage-weighted statistic sum_s g*m
+            #       (mass share owned by trusted slots) -- kept as an A/B variant; it
+            #       ignores object COUNT, so a frame where one background slot owns
+            #       everything can outscore a frame with five cleanly-bound objects.
+            #   "random": EABI with a uniformly random anchor -- control run isolating
+            #       the value of evidence-based anchor selection.
+            mode = cycle.strip().lower() if isinstance(cycle, str) else "last"
+            if mode in ("evidence", "evidence_mass", "random"):
+                if mode == "random":
+                    anchors = torch.randint(
+                        seq_len, (inputs.shape[0],), device=inputs.device
+                    )
+                else:
+                    anchors = _evidence_anchors(
+                        outputs,
+                        gate_kwargs.get("mass_gamma") or 1.0,
+                        stat="mass" if mode == "evidence_mass" else "count",
+                    )
+                self.last_anchor_frames = anchors.detach().to("cpu")
+                return self._cycle_from_anchors(
+                    outputs, inputs, gate_kwargs, median_ema, anchors
+                )
+            if mode != "last":
+                raise ValueError(f"unknown cycle mode {cycle!r}")
             # backward pass
             ### not last frame
             new_outputs = []
@@ -465,6 +562,147 @@ class ScanOverTime(nn.Module):
             return merge_dict_trees(new_outputs, axis=1)
 
         return merge_dict_trees(outputs, axis=1)
+
+    def _cycle_from_anchors(
+        self,
+        outputs: List[Dict[str, Any]],
+        inputs: torch.Tensor,
+        gate_kwargs: Dict[str, Any],
+        median_ema: Optional[torch.Tensor],
+        anchors: torch.Tensor,
+    ):
+        """Backward sweep from a per-sample anchor frame, stitched with the forward sweep.
+
+        Semantics per sample b with anchor a_b: frames >= a_b keep the forward outputs,
+        frames < a_b come from a backward sweep warm-started at the anchor's predicted
+        state (mirroring the legacy cycle, which is the special case a_b = T-1). Both
+        sweeps share the anchor state, so slot identities stay consistent across the
+        stitch -- required for video metrics.
+
+        Batching: the sweep iterates t = max(a)-1 .. 0 for the whole batch at once; a
+        sample's rows are (re-)injected with its anchor states at its own start step
+        t = a_b - 1. Rows computed before a sample's sweep begins are finite but
+        meaningless and are discarded by the per-sample stitch, so mixed anchors in one
+        batch cost only wasted compute, never wrong outputs.
+        """
+        seq_len = len(outputs)
+        b = inputs.shape[0]
+        forward_tree = merge_dict_trees(outputs, axis=1)
+        max_anchor = int(anchors.max().item())
+        if max_anchor <= 0:
+            return forward_tree
+
+        # (B, S, D) anchor states gathered per sample. The backward step out of the
+        # anchor consumes the anchor's *predicted* state, exactly like the legacy cycle
+        # consumes outputs[-1][next_state_key]; the posterior becomes prev_state so the
+        # predictor's velocity reference stays in sweep order.
+        pred_states = torch.stack([o[self.next_state_key] for o in outputs], dim=1)
+        post_states = torch.stack([o["state"] for o in outputs], dim=1)
+        idx = anchors.view(b, 1, 1, 1).expand(-1, 1, *pred_states.shape[2:])
+        anchor_pred = pred_states.gather(1, idx).squeeze(1)
+        anchor_post = post_states.gather(1, idx).squeeze(1)
+
+        state = anchor_pred
+        prev_state = anchor_post
+        new_outputs = list(outputs)  # frames >= anchor keep the forward outputs
+        for t in range(max_anchor - 1, -1, -1):
+            starts = (anchors == t + 1).view(b, *([1] * (state.ndim - 1)))
+            state = torch.where(starts, anchor_pred, state)
+            prev_state = torch.where(starts, anchor_post, prev_state)
+            kwargs = dict(gate_kwargs)
+            kwargs["median_ema_prev"] = median_ema
+            kwargs["prev_state"] = prev_state
+            # no time_step: the first-step corrector args never apply on re-inference
+            # sweeps (matches the legacy cycle)
+            out = self.module(state, inputs[:, t], **kwargs)
+            new_outputs[t] = out
+            prev_state = out["state"]
+            state = out[self.next_state_key]
+            if "mass_median_ema" in out:
+                median_ema = out["mass_median_ema"]
+
+        backward_tree = merge_dict_trees(new_outputs, axis=1)
+        use_backward = (
+            torch.arange(seq_len, device=anchors.device).view(1, seq_len)
+            < anchors.view(b, 1)
+        )
+        return _stitch_trees(forward_tree, backward_tree, use_backward)
+
+
+def _evidence_anchors(
+    outputs: List[Dict[str, Any]], mass_gamma: float, window: int = 5, stat: str = "count"
+) -> torch.Tensor:
+    """Per-sample anchor frame: argmax of the gate's own per-frame evidence.
+
+    stat="count" (default): E_t = sum_s g_{t,s} * c_{t,s}, the soft number of active
+    slots weighted by ownership purity c = sum_f A~^2 / sum_f A~. This implements "the
+    frame where the most objects are INTACTLY present": sum_s g counts trusted slots,
+    purity discounts objects that are only partially visible / entering / occluded
+    (mixed ownership at their boundary lowers c; a fully-owned object scores ~1 at any
+    size). The anchor exists to hand the backward sweep a state that has bound as many
+    of the video's objects as possible, which is a count, not a mass share.
+
+    stat="mass": E_t = sum_s g_{t,s} * m_{t,s}, the fraction of (gamma-sharpened)
+    attention mass owned by trusted slots. Since sum_s m_s = 1 per frame this measures
+    how confidently the frame is EXPLAINED, not how many objects are held -- one
+    trusted background slot owning everything can outscore five cleanly-bound objects.
+    Kept as an A/B variant for the eval.
+
+    Both signals come from the forward sweep's outputs, so anchor selection costs no
+    extra model evaluation. E_t is mean-smoothed over a `window`-frame neighborhood
+    (replicate-padded) before the argmax so a single-frame noise spike cannot become
+    the anchor. With gating disabled active_mask is all-ones and gamma=1 purity/mass
+    are frame-independent constants only in degenerate cases; anchor quality then just
+    falls back to whatever the statistic sees.
+    """
+    gates = torch.stack([o["active_mask"].float() for o in outputs], dim=1)  # (B, T, S)
+    att = torch.stack([o["state_attn_mask"].float() for o in outputs], dim=1)  # (B,T,S,F)
+    gamma = float(mass_gamma or 1.0)
+    if gamma != 1.0:
+        att = att.pow(gamma)
+        att = att / att.sum(dim=2, keepdim=True).clamp_min(1e-8)
+    if stat == "mass":
+        per_slot = att.sum(dim=-1) / att.shape[-1]  # coverage m, (B, T, S)
+    else:
+        per_slot = (att * att).sum(dim=-1) / att.sum(dim=-1).clamp_min(1e-8)  # purity c
+    evidence = (gates * per_slot).sum(dim=-1)  # (B, T)
+
+    t_len = evidence.shape[1]
+    k = min(window, t_len)
+    if k % 2 == 0:
+        k = max(k - 1, 1)
+    if k > 1:
+        kernel = torch.ones(1, 1, k, device=evidence.device, dtype=evidence.dtype) / k
+        padded = torch.nn.functional.pad(
+            evidence.unsqueeze(1), (k // 2, k // 2), mode="replicate"
+        )
+        evidence = torch.nn.functional.conv1d(padded, kernel).squeeze(1)
+    return evidence.argmax(dim=1)  # (B,)
+
+
+def _stitch_trees(
+    forward_tree: Mapping, backward_tree: Mapping, use_backward: torch.Tensor
+):
+    """Per-(sample, frame) select between two stacked output trees.
+
+    `use_backward` is (B, T) bool; leaves shaped (B, T, ...) are selected elementwise,
+    anything else (non-tensors, oddly shaped leaves) keeps the forward version.
+    """
+    out = {}
+    for key, fwd in forward_tree.items():
+        bwd = backward_tree[key]
+        if isinstance(fwd, Mapping):
+            out[key] = _stitch_trees(fwd, bwd, use_backward)
+        elif (
+            isinstance(fwd, torch.Tensor)
+            and fwd.ndim >= 2
+            and fwd.shape[:2] == use_backward.shape
+        ):
+            mask = use_backward.view(*use_backward.shape, *([1] * (fwd.ndim - 2)))
+            out[key] = torch.where(mask, bwd, fwd)
+        else:
+            out[key] = fwd
+    return out
 
 
 def merge_dict_trees(trees: List[Mapping], axis: int = 0):

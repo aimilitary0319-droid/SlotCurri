@@ -1,5 +1,5 @@
 experiment_group: slotcurri
-experiment_name: ytvis_attnmass_v26m
+experiment_name: ytvis_attnmass_v29f
 
 globals:
   NUM_SLOTS: 7
@@ -34,39 +34,45 @@ model:
   visualize: false
   visualize_every_n_steps: 10000
 
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
   cyclic_inference: false
 
-  # --- v26m: ABLATION of v26 -- confidence branch removed (mass-only evidence) ---
+  # --- v29f: ABLATION of v29 -- purity confidence NOT coupled to the curriculum ---
   #
-  # Identical to ytvis2021_attnmass_v26.yaml except beta_final = 1.0, so
-  #   log r = log(m + eps)   for the whole run (the confidence path never engages)
-  #   g     = sigmoid(log(m / p) / tau_g)
-  # Log-ratio gate, cosine coupled p schedule, tau_g, gamma, and everything else are
-  # unchanged, so the v26 - v26m gap isolates the contribution of assignment
-  # confidence c = 1 - H/log F.
+  # Identical to ytvis2021_attnmass_v29.yaml except beta is held FIXED at 0.7 from
+  # step 0 (beta_start = beta_final = 0.7) instead of ramping 1.0 -> 0.7 with the
+  # same lambda that lowers the threshold p. The p schedule itself is unchanged
+  # (cosine, 1.5/7 -> 0.1/7). This is the purity counterpart of v26f, which tested
+  # the same uncoupling with the ENTROPY confidence and collapsed twice (all gates
+  # < 0.5 from step 0: on untrained diffuse attention c_ent ~= 0.001, so the fixed
+  # 0.3 * log(c_ent) ~= -2 log-evidence penalty at tau_g 0.5 sank every score).
   #
-  # Calibration on the v20 @ 100k checkpoint predicts the failure mode this tests:
-  # at the end threshold p = 0.1/7, mass-only misses 11.7% of small-object slot-frames
-  # (r < p) vs 0.6% with confidence at beta = 0.7, while passing fewer ghosts
-  # (3.2% vs 16.2%). If v26m matches v26 on ARI, the confidence claim must be dropped.
+  # Why purity might survive where entropy could not: on the same untrained
+  # attention, purity_sharp sits near the per-patch chance share rather than near
+  # zero -- log(purity) ~= -2 vs log(c_ent) ~= -6.6 measured on random-init
+  # attention -- so the fixed early penalty is ~3x milder and roughly uniform
+  # across slots (acting like a threshold shift that p_start 1.5 already
+  # dominates), instead of a slot-killing -5-logit drop.
   #
-  # Run history: the first v26m ran with gate_tau_log = 0.25 (the pre-fix v26 value)
-  # and lagged badly (val/ari 0.270 @ 57k vs v26's 0.410 @ 32k) -- consistent with the
-  # sharp-tau early-phase pathology that also broke v26 attempts 1-2, and confounded
-  # as an ablation once v26 settled on tau 0.5. Stopped at ~60k (archived under
-  # logs/_archive/*_tau025_*) and relaunched with tau 0.5 so the ONLY difference vs
-  # the final v26 is beta_final = 1.0.
+  # Readout: if v29f trains ~= v29, the beta ramp is unnecessary with the purity
+  # confidence and the method simplifies to a single curriculum schedule (p only).
+  # If v29f degrades or collapses like v26f, the coupling claim ("confidence must
+  # not engage before attention differentiates") holds regardless of conf_kind.
+  # Watch early train/gate_conf, train/active_slots and val/ari vs v29.
   attn_mass_curriculum:
     enabled: true
     n_default: 0
-    p_start_mult: 1.5       # p_start = 1.5/7 ~= 0.214
+    p_start_mult: 1.5       # same as v29: above the distribution, throttles early winner
     p_end_mult: 0.1         # p_end   = 0.1/7 ~= 0.0143
-    p_anneal: cosine        # same coupled lambda schedule as v26
-    anneal_steps: 75000     # same as v26: curriculum over 3/4, last 25k consolidation
+    p_anneal: cosine        # p schedule unchanged vs v29
+    anneal_steps: 75000     # same as v29: curriculum over 3/4, last 25k consolidation
     gate_mode: soft
-    gate_form: logratio     # same gate form as v26
-    gate_tau_log: 0.5       # same temperature as (final) v26
-    beta_final: 1.0         # <-- ONLY change vs v26: evidence is coverage only
+    gate_form: logratio
+    conf_kind: purity_sharp # same as v29: ownership (sum A~^2 / sum A~) confidence
+    gate_tau_log: 0.5       # same as v29
+    beta_start: 0.7         # <-- ONLY change vs v29: confidence engaged from step 0
+    beta_final: 0.7         #     (beta constant; lambda no longer drives it)
     mass_gamma: 2.0
     gate_l1: 0.0
     gate_div: 0.0
