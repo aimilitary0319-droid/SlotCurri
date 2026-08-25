@@ -94,7 +94,9 @@ class MLPDecoder(nn.Module):
             g = active_mask
             if g.dim() == 2:
                 g = g[:, :, None, None]  # (bs, n_slots, 1, 1)
-            masks = torch.softmax(alpha, dim=1) * g
+            # g+eps so all-zero normalized purity recovers softmax(alpha)
+            # (softmax(alpha + log(g+eps))), instead of a zero reconstruction.
+            masks = torch.softmax(alpha, dim=1) * (g + 1e-8)
             masks = masks / masks.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
         recon = torch.sum(recons * masks, dim=1)

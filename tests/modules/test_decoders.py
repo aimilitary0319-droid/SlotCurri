@@ -35,6 +35,23 @@ def test_mlp_decoder(eval_upscale):
     assert outp["masks"].min() >= 0.0 and outp["masks"].max() <= 1.0
 
 
+def test_mlp_decoder_zero_soft_gate_recovers_ungated():
+    """All-zero normalized purity must not zero the reconstruction.
+
+    softmax(alpha) * (0 + eps) / sum recovers softmax(alpha).
+    """
+    decoder = decoders.MLPDecoder(
+        inp_dim=5, outp_dim=8, hidden_dims=[10], n_patches=4
+    )
+    inp = torch.randn(2, 3, 5)
+    zeros = torch.zeros(2, 3)
+    with torch.no_grad():
+        ungated = decoder(inp)
+        gated = decoder(inp, zeros)
+    assert torch.allclose(gated["masks"], ungated["masks"], atol=1e-5)
+    assert torch.allclose(gated["reconstruction"], ungated["reconstruction"], atol=1e-5)
+
+
 def test_spatial_broadcast_decoder():
     bs, inp_dim, outp_dim, feat_dim, height, width, n_slots = 2, 4, 6, 3, 5, 4, 3
     backbone = networks.CNNDecoder(inp_dim, [feat_dim, feat_dim], kernel_sizes=3, strides=2)

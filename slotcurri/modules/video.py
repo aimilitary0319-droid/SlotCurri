@@ -69,6 +69,8 @@ class LatentProcessor(nn.Module):
         gate_tau_log: Optional[float] = None,
         conf_kind: str = "entropy",
         gate_detach: bool = False,
+        key_features: Optional[torch.Tensor] = None,
+        purity_normalize: bool = False,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -80,10 +82,12 @@ class LatentProcessor(nn.Module):
         # inputs: batch x n_inputs x input_dim (1 30 1369 64)
         assert inputs.ndim == 3
         if inputs is not None:
+            corr_kwargs: Dict[str, Any] = {}
             if time_step == 0 and self.first_step_corrector_args:
-                corrector_output = self.corrector(state, inputs, **self.first_step_corrector_args)
-            else:
-                corrector_output = self.corrector(state, inputs)
+                corr_kwargs.update(self.first_step_corrector_args)
+            if key_features is not None:
+                corr_kwargs["key_features"] = key_features
+            corrector_output = self.corrector(state, inputs, **corr_kwargs)
             updated_state = corrector_output[self.state_key]
             state_attn_mask = corrector_output['masks'] if 'masks' in corrector_output else None
         else:
@@ -274,7 +278,18 @@ class LatentProcessor(nn.Module):
                 # attention sharpens (self-annealing, no schedule to mistune). c stays
                 # detached (anti-gaming), so the gate is pure forward modulation.
                 # gate_p_state has no meaning here (there is no threshold to split).
+                #
+                # v36: purity_normalize maps the uniform baseline c=1/K onto 0
+                #   p = clip((K c - 1)/(K - 1), 0, 1)
+                # so ghosts go to 0 while exclusive owners stay at 1. Decoder adds
+                # a floor on g so all-zero p recovers softmax(alpha) (ungated).
                 active_mask = gate_conf
+                if purity_normalize and active_mask is not None:
+                    n_slots_g = active_mask.shape[-1]
+                    if n_slots_g > 1:
+                        active_mask = (
+                            (n_slots_g * active_mask - 1.0) / (n_slots_g - 1.0)
+                        ).clamp(0.0, 1.0)
                 if default_list:
                     default_vec = torch.zeros_like(active_mask[:1])  # (1, S)
                     for di in default_list:
@@ -467,6 +482,8 @@ class ScanOverTime(nn.Module):
         gate_tau_log: Optional[float] = None,
         conf_kind: str = "entropy",
         gate_detach: bool = False,
+        key_inputs: Optional[torch.Tensor] = None,
+        purity_normalize: bool = False,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -482,6 +499,7 @@ class ScanOverTime(nn.Module):
             p_residual_net=p_residual_net, p_residual_alpha=p_residual_alpha,
             gate_form=gate_form, gate_beta=gate_beta, gate_tau_log=gate_tau_log,
             conf_kind=conf_kind, gate_detach=gate_detach,
+            purity_normalize=purity_normalize,
         )
 
         state = initial_state
@@ -495,6 +513,8 @@ class ScanOverTime(nn.Module):
             kwargs = dict(gate_kwargs)
             kwargs["median_ema_prev"] = median_ema
             kwargs["prev_state"] = prev_state
+            if key_inputs is not None:
+                kwargs["key_features"] = key_inputs[:, t]
             if self.pass_step:
                 output = self.module(state, inputs[:, t], t, **kwargs)
             else:
@@ -536,7 +556,7 @@ class ScanOverTime(nn.Module):
                     )
                 self.last_anchor_frames = anchors.detach().to("cpu")
                 return self._cycle_from_anchors(
-                    outputs, inputs, gate_kwargs, median_ema, anchors
+                    outputs, inputs, gate_kwargs, median_ema, anchors, key_inputs
                 )
             if mode != "last":
                 raise ValueError(f"unknown cycle mode {cycle!r}")
@@ -552,6 +572,8 @@ class ScanOverTime(nn.Module):
                 kwargs = dict(gate_kwargs)
                 kwargs["median_ema_prev"] = median_ema
                 kwargs["prev_state"] = prev_state
+                if key_inputs is not None:
+                    kwargs["key_features"] = key_inputs[:, back_t]
                 out = self.module(state, inputs[:, back_t], **kwargs)
                 new_outputs.append(out)
                 prev_state = out["state"]
@@ -570,6 +592,7 @@ class ScanOverTime(nn.Module):
         gate_kwargs: Dict[str, Any],
         median_ema: Optional[torch.Tensor],
         anchors: torch.Tensor,
+        key_inputs: Optional[torch.Tensor] = None,
     ):
         """Backward sweep from a per-sample anchor frame, stitched with the forward sweep.
 
@@ -612,6 +635,8 @@ class ScanOverTime(nn.Module):
             kwargs = dict(gate_kwargs)
             kwargs["median_ema_prev"] = median_ema
             kwargs["prev_state"] = prev_state
+            if key_inputs is not None:
+                kwargs["key_features"] = key_inputs[:, t]
             # no time_step: the first-step corrector args never apply on re-inference
             # sweeps (matches the legacy cycle)
             out = self.module(state, inputs[:, t], **kwargs)

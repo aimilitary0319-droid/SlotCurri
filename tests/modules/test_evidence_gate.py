@@ -19,7 +19,7 @@ class StubCorrector(torch.nn.Module):
         super().__init__()
         self.masks_out = masks
 
-    def forward(self, state, inputs, n_iters=None):
+    def forward(self, state, inputs, n_iters=None, **kwargs):
         return {"slots": state + 1.0, "masks": self.masks_out}
 
 
@@ -255,6 +255,41 @@ def test_purity_weight_thresholdless_schedules():
     assert duck._gate_threshold(True) is None
     assert duck._gate_threshold(False) is None
     assert duck._gate_beta(True) is None
+
+
+def test_purity_normalize_uniform_is_zero_and_exclusive_is_one():
+    """v36: p = clip((K c - 1)/(K - 1), 0, 1) on detached purity_sharp."""
+    att = torch.full((BATCH, SLOTS, FEATS), 1.0 / SLOTS)
+    out = _run_processor(
+        att, gate_p=None, default_idx=[], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity_sharp",
+        purity_normalize=True,
+    )
+    assert torch.allclose(out["active_mask"], torch.zeros(BATCH, SLOTS), atol=1e-6)
+
+    # one-hot exclusive owner on every patch
+    onehot = torch.zeros(BATCH, SLOTS, FEATS)
+    onehot[:, 0, :] = 1.0
+    out_ex = _run_processor(
+        onehot, gate_p=None, default_idx=[], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity_sharp",
+        purity_normalize=True,
+    )
+    assert torch.allclose(out_ex["active_mask"][:, 0], torch.ones(BATCH), atol=1e-5)
+    assert torch.allclose(out_ex["active_mask"][:, 1:], torch.zeros(BATCH, SLOTS - 1), atol=1e-5)
+
+
+def test_purity_normalize_matches_formula_on_sharp_c():
+    _, att = _make_attention()
+    out = _run_processor(
+        att, gate_p=None, default_idx=[], mass_gamma=2.0,
+        gate_form="purity_weight", conf_kind="purity_sharp",
+        purity_normalize=True,
+    )
+    c = _expected_purity(_sharpen(att, 2.0))
+    expected = ((SLOTS * c - 1.0) / (SLOTS - 1.0)).clamp(0.0, 1.0)
+    assert torch.allclose(out["active_mask"], expected, atol=1e-6)
+    assert not out["active_mask"].requires_grad
 
 
 def test_coupled_curriculum_schedules():

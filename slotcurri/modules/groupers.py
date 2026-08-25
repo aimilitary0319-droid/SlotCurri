@@ -81,10 +81,19 @@ class SlotAttention(nn.Module):
 
         return slots, pre_norm_attn
 
-    def forward(self, slots: torch.Tensor, features: torch.Tensor, n_iters: Optional[int] = None):
-        features = self.norm_features(features)
-        keys = self.to_k(features) 
-        values = self.to_v(features)
+    def forward(
+        self,
+        slots: torch.Tensor,
+        features: torch.Tensor,
+        n_iters: Optional[int] = None,
+        key_features: Optional[torch.Tensor] = None,
+    ):
+        # Value always comes from `features` (original / recon-aligned tokens).
+        # Key may come from a separately projected bind tensor (v36 Key-only leveling).
+        values_in = self.norm_features(features)
+        keys_in = values_in if key_features is None else self.norm_features(key_features)
+        keys = self.to_k(keys_in)
+        values = self.to_v(values_in)
 
         if n_iters is None:
             n_iters = self.n_iters

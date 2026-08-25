@@ -49,11 +49,10 @@ class ModelConfig:
     # charge its gate if reconstruction on its territory barely degrades (marginal-utility
     # pricing; replaces the constant gate_l1 rent that suppressed small-object slots).
     slot_utility: Optional[Dict[str, Any]] = None
-    # Feature curriculum (v33): anneal the backbone tokens from affinity-smoothed
-    # (object-level; within-object variance removed, boundaries preserved) to raw patch
-    # features. Task-level coarse-to-fine: early part-splits earn no reconstruction
-    # advantage and cannot hold clean ownership, so they land in the mixed-ownership
-    # regime the purity gate already suppresses. Train-time only; eval sees raw features.
+    # Feature curriculum (v33/v36): anneal backbone tokens from a coarse relational
+    # representation to raw patch features. v33 affinity-smooths the tokens themselves
+    # (grouper + recon target). v36 (anneal=ncut, apply=key) levels Keys only via a
+    # 2-way Ncut barrier. Train-time only; eval sees raw features.
     feature_curriculum: Optional[Dict[str, Any]] = None
     masks_to_visualize: Optional[List[str]] = None
     load_weights: Optional[str] = None

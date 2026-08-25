@@ -1,6 +1,6 @@
 from slotcurri.modules import timm
 from slotcurri.modules.decoders import build as build_decoder
-from slotcurri.modules.encoders import FeatureSmoothing
+from slotcurri.modules.encoders import FeatureModeCollapse, FeatureSmoothing, NcutRelationalLeveling
 from slotcurri.modules.encoders import build as build_encoder
 from slotcurri.modules.groupers import build as build_grouper
 from slotcurri.modules.initializers import build as build_initializer
@@ -27,6 +27,9 @@ __all__ = [
     "LatentProcessor",
     "Resizer",
     "SoftToHardMask",
+    "FeatureSmoothing",
+    "FeatureModeCollapse",
+    "NcutRelationalLeveling",
 ]
 
 

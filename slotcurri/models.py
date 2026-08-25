@@ -33,6 +33,47 @@ def feature_curriculum_mix(step: int, anneal_steps: int, schedule: str = "cosine
     return 0.5 * (1.0 - math.cos(math.pi * t))
 
 
+def feature_curriculum_window(
+    step: int,
+    anneal_steps: int,
+    window_start: int,
+    schedule: str = "cosine",
+) -> int:
+    """Chebyshev radius for the window-anneal curriculum (v34).
+
+    w(t) = round(w0 * (1 - s(t))) with the same s as `feature_curriculum_mix`.
+    Returns 0 at/after `anneal_steps` (smoothing off / raw). Half-up rounding so
+    the midpoint is not banker's-rounded to even.
+    """
+    s = feature_curriculum_mix(step, anneal_steps, schedule)
+    if s >= 1.0:
+        return 0
+    w0 = max(int(window_start), 0)
+    return max(0, int(math.floor(float(w0) * (1.0 - s) + 0.5)))
+
+
+def feature_curriculum_bandwidth(
+    step: int,
+    anneal_steps: int,
+    h_start: float,
+    schedule: str = "cosine",
+    h_min: float = 0.02,
+) -> float:
+    """Mean-shift bandwidth for the modes curriculum (v35).
+
+    h(t) = h0 * (1 - s(t)) with the same s as `feature_curriculum_mix`.
+    Returns 0 at/after `anneal_steps`, and also when h would fall to `h_min`
+    (treated as raw / cover off).
+    """
+    s = feature_curriculum_mix(step, anneal_steps, schedule)
+    if s >= 1.0:
+        return 0.0
+    h = float(h_start) * (1.0 - s)
+    if h <= float(h_min):
+        return 0.0
+    return h
+
+
 def build(
     model_config: configuration.ModelConfig,
     optimizer_config,
@@ -341,7 +382,7 @@ class ObjectCentricModel(pl.LightningModule):
 
         # --- feature curriculum (v33): task-level coarse-to-fine ---
         # The backbone tokens are annealed from affinity-smoothed (object-level: within-
-        # object feature variance removed by one step of non-parametric self-attention,
+        # object feature variance removed by n_steps of non-parametric self-attention,
         # see modules.FeatureSmoothing) to raw patch features over `anneal_steps`. Early
         # on a part-split of one object earns no reconstruction advantage (no variance
         # left to divide) and cannot hold clean ownership (identical features give every
@@ -362,15 +403,79 @@ class ObjectCentricModel(pl.LightningModule):
             )
         if self.featcur_enabled and self.featcur_anneal_steps <= 0:
             raise ValueError("feature_curriculum.anneal_steps must be positive")
-        if self.featcur_enabled:
-            smoothing = modules.FeatureSmoothing(
-                tau=float(fc.get("tau", 0.1)),
-                window=fc.get("window", None),
-                chunk_size=int(fc.get("chunk_size", 16)),
+        self.featcur_anneal = str(fc.get("anneal", "mix")).lower()
+        if self.featcur_anneal not in ("mix", "window", "modes", "ncut"):
+            raise ValueError(
+                "feature_curriculum.anneal must be 'mix', 'window', 'modes' or 'ncut', "
+                f"got {self.featcur_anneal!r}"
             )
+        # window-anneal (v34): the clock is the Chebyshev radius, not the raw blend.
+        # w0 from window_start, else the static `window` field. 0 is illegal (that
+        # would be "always raw"); global affinity (window is null) cannot shrink.
+        w_start = fc.get("window_start", fc.get("window", None))
+        self.featcur_window_start = 0 if w_start is None else int(w_start)
+        if self.featcur_enabled and self.featcur_anneal == "window":
+            if self.featcur_window_start <= 0:
+                raise ValueError(
+                    "feature_curriculum.anneal='window' requires window_start "
+                    f"(or window) > 0, got {w_start!r}"
+                )
+        # modes-anneal (v35): the clock is mean-shift bandwidth, not K and not w.
+        # h(t) = h0 * (1-s); h<=h_min is raw. Tokens are covered by density-mode
+        # means so #{k} = C(scene, h) and occupancy tracks C, not leftover seats.
+        self.featcur_h_start = float(fc.get("h_start", fc.get("bandwidth", 0.5)))
+        self.featcur_h_min = float(fc.get("h_min", 0.02))
+        if self.featcur_enabled and self.featcur_anneal == "modes":
+            if self.featcur_h_start <= 0.0:
+                raise ValueError(
+                    "feature_curriculum.anneal='modes' requires h_start > 0, "
+                    f"got {self.featcur_h_start!r}"
+                )
+        self._featcur_window = None
+        self._featcur_h = 0.0
+        self._featcur_s = 0.0
+        self.featcur_apply = str(fc.get("apply", "key" if self.featcur_anneal == "ncut" else "tokens")).lower()
+        if self.featcur_apply not in ("tokens", "key"):
+            raise ValueError(
+                "feature_curriculum.apply must be 'tokens' or 'key', "
+                f"got {self.featcur_apply!r}"
+            )
+        if self.featcur_enabled:
             inner = self._frame_encoder()
-            inner.feature_smoothing = smoothing
-            inner.feature_smoothing_mix = 0.0  # step-0 value; training_step reschedules
+            inner.feature_curriculum_apply = self.featcur_apply
+            if self.featcur_anneal == "modes":
+                inner.feature_modes = modules.FeatureModeCollapse(
+                    n_iter=int(fc.get("n_iter", 8)),
+                    delta=float(fc.get("delta", 0.02)),
+                    h_min=self.featcur_h_min,
+                    probe=int(fc.get("probe", 128)),
+                    chunk_size=int(fc.get("chunk_size", 16)),
+                )
+                inner.feature_modes.bandwidth = self.featcur_h_start
+                inner.feature_modes_mix = 0.0
+            elif self.featcur_anneal == "ncut":
+                inner.feature_ncut = modules.NcutRelationalLeveling(
+                    chunk_size=int(fc.get("chunk_size", 8)),
+                    eps=float(fc.get("eps", 1e-6)),
+                )
+                inner.feature_ncut_mix = 0.0
+            else:
+                ref = fc.get("window_ref_grid", 37)
+                init_window = (
+                    self.featcur_window_start
+                    if self.featcur_anneal == "window"
+                    else fc.get("window", None)
+                )
+                smoothing = modules.FeatureSmoothing(
+                    tau=float(fc.get("tau", 0.1)),
+                    window=init_window,
+                    n_steps=int(fc.get("n_steps", 1)),
+                    chunk_size=int(fc.get("chunk_size", 16)),
+                    window_ref_grid=None if ref is None else int(ref),
+                )
+                inner.feature_smoothing = smoothing
+                # step-0: mix-anneal starts fully smoothed; window-anneal too (w=w0).
+                inner.feature_smoothing_mix = 0.0
 
         # --- attention-mass curriculum (dynamic slot gating) ---
         amc = attn_mass_curriculum or {}
@@ -501,6 +606,10 @@ class ObjectCentricModel(pl.LightningModule):
         # If False, loss_ss ignores active_mask (baseline-style full-slot contrastive).
         # Default True preserves v6/v7/v8 gated-anchor contrastive.
         self.amc_contrastive_gate = bool(amc.get("contrastive_gate", True))
+        # v36: after computing detached purity c, map the uniform 1/K baseline to 0
+        #   p = clip((K c - 1)/(K - 1), 0, 1)
+        # Default False keeps v32/v33 (raw c is the gate).
+        self.amc_purity_normalize = bool(amc.get("purity_normalize", False))
         # p schedule shape over anneal_steps: "linear" (default, v6/v7/v8), "log"
         # (geometric: p = p_start * (p_end/p_start)^frac), or "cosine" (coupled activity
         # curriculum: p = (1-lambda) p_start + lambda p_end with lambda = (1-cos(pi q))/2,
@@ -809,6 +918,16 @@ class ObjectCentricModel(pl.LightningModule):
                     slots_initial = slots_initial[:, :self.hier_n_slots[hi], :]
                     break
 
+        processor_kwargs: Dict[str, Any] = {"cycle": cycle}
+        key_features = encoder_output.get("features_key")
+        if key_features is not None:
+            # ScanOverTime takes the full (B, T, ...) tensor as key_inputs;
+            # LatentProcessor (image) takes a single frame as key_features.
+            if hasattr(self.processor, "next_state_key"):
+                processor_kwargs["key_inputs"] = key_features
+            else:
+                processor_kwargs["key_features"] = key_features
+
         if self.attn_mass_enabled:
             gate_p = self._gate_threshold(train)
             gate_tau = self._gate_tau(train)
@@ -831,6 +950,8 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_tau_log=self.amc_gate_tau_log,
                 conf_kind=self.amc_conf_kind,
                 gate_detach=self.amc_gate_detach,
+                purity_normalize=self.amc_purity_normalize,
+                **{k: v for k, v in processor_kwargs.items() if k != "cycle"},
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
@@ -859,7 +980,9 @@ class ObjectCentricModel(pl.LightningModule):
             self._gate_delta = None
             self._state_gate_mean = None
             self._gate_conf_mean = None
-            processor_output = self.processor(slots_initial, features, cycle=cycle)
+            processor_output = self.processor(
+                slots_initial, features, **processor_kwargs
+            )
             slots = processor_output["state"]
             decoder_output = self.decoder(slots)
         # feat_orig, feat_recon: (B, C, H, W)
@@ -1397,12 +1520,55 @@ class ObjectCentricModel(pl.LightningModule):
         """The inner FrameEncoder (unwraps MapOverTime for video input)."""
         return self.encoder.module if hasattr(self.encoder, "module") else self.encoder
 
+    def _apply_feature_curriculum(self) -> None:
+        """Write this step's mix / window / bandwidth onto the frame encoder (train only)."""
+        inner = self._frame_encoder()
+        step = self.trainer.global_step
+        self._featcur_s = feature_curriculum_mix(
+            step, self.featcur_anneal_steps, self.featcur_schedule
+        )
+        if self.featcur_anneal == "window":
+            w = feature_curriculum_window(
+                step,
+                self.featcur_anneal_steps,
+                self.featcur_window_start,
+                self.featcur_schedule,
+            )
+            if inner.feature_smoothing is not None:
+                inner.feature_smoothing.window = w
+            # w<=0 is raw: skip the module. Otherwise fully smoothed at the current radius
+            # (no blend with raw -- the clock is w, not the v33 mix).
+            inner.feature_smoothing_mix = 1.0 if w <= 0 else 0.0
+            self._featcur_window = w
+            self._featcur_h = 0.0
+        elif self.featcur_anneal == "modes":
+            h = feature_curriculum_bandwidth(
+                step,
+                self.featcur_anneal_steps,
+                self.featcur_h_start,
+                self.featcur_schedule,
+                self.featcur_h_min,
+            )
+            if inner.feature_modes is not None:
+                inner.feature_modes.bandwidth = h
+            # h==0 is raw. Otherwise fully covered at the current bandwidth
+            # (no blend with raw -- the clock is h, not the v33 mix).
+            inner.feature_modes_mix = 1.0 if h <= 0.0 else 0.0
+            self._featcur_h = h
+            self._featcur_window = None
+        elif self.featcur_anneal == "ncut":
+            inner.feature_ncut_mix = self._featcur_s
+            self._featcur_window = None
+            self._featcur_h = 0.0
+        else:
+            inner.feature_smoothing_mix = self._featcur_s
+            sm = inner.feature_smoothing
+            self._featcur_window = None if sm is None else sm.window
+            self._featcur_h = 0.0
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         if self.featcur_enabled:
-            # schedule the feature curriculum blend before the forward reads it
-            self._frame_encoder().feature_smoothing_mix = feature_curriculum_mix(
-                self.trainer.global_step, self.featcur_anneal_steps, self.featcur_schedule
-            )
+            self._apply_feature_curriculum()
         outputs = self.forward(batch)
         if self.train_metrics or (
             self.visualize and self.trainer.global_step % self.visualize_every_n_steps == 0
@@ -1417,9 +1583,22 @@ class ObjectCentricModel(pl.LightningModule):
             to_log["train/loss"] = total_loss
 
         if self.featcur_enabled:
-            to_log["train/featcur_mix"] = float(
-                self._frame_encoder().feature_smoothing_mix
-            )
+            inner = self._frame_encoder()
+            if self.featcur_anneal == "modes":
+                to_log["train/featcur_mix"] = float(inner.feature_modes_mix)
+                to_log["train/featcur_h"] = float(self._featcur_h)
+                modes = inner.feature_modes
+                if modes is not None and modes.last_c is not None:
+                    to_log["train/featcur_C"] = modes.last_c.float().mean()
+                    to_log["train/featcur_C_std"] = modes.last_c.float().std(unbiased=False)
+            elif self.featcur_anneal == "ncut":
+                to_log["train/featcur_mix"] = float(inner.feature_ncut_mix)
+                to_log["train/featcur_beta"] = 1.0 - float(inner.feature_ncut_mix)
+            else:
+                to_log["train/featcur_mix"] = float(inner.feature_smoothing_mix)
+            to_log["train/featcur_s"] = float(self._featcur_s)
+            if self._featcur_window is not None:
+                to_log["train/featcur_window"] = int(self._featcur_window)
 
         if self.attn_mass_enabled and self._active_mask is not None:
             # for soft gating this is the effective (summed-gate) active slot count
