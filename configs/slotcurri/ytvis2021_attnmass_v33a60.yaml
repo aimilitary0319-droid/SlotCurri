@@ -1,0 +1,230 @@
+experiment_group: slotcurri
+experiment_name: ytvis_attnmass_v33a60
+
+globals:
+  NUM_SLOTS: 7
+  SLOT_DIM: 64
+  DINO_MODEL: vit_base_patch14_dinov2
+  FEAT_DIM: 768
+  NUM_PATCHES: 1369
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
+  cyclic_inference: false
+
+  # --- v33a60 = v33 with anneal_steps 60000 (only change vs v33) ---
+  #
+  # Schedule-robustness check: 2x horizon. Fine-detail learning starts later; mBO
+  # may pay more, anti-split should be at least as strong as v33.
+  # --- v33 = v32 (purity gating) + FEATURE CURRICULUM (single addition) ---
+  #
+  # Everything except the feature_curriculum block is byte-identical to
+  # ytvis2021_attnmass_v32.yaml, so the v33 - v32 gap attributes the curriculum alone.
+  #
+  # Why: the purity gate has exactly one structural blind spot. A CLEAN part-split
+  # (head slot / torso slot, exclusive ownership on both sides) gives both slots
+  # c ~= 1 -- purity measures "do I own my patches exclusively", not "do I own a whole
+  # object". The gate suppresses messy fragmentation (ghosts, halos, duplicates) but is
+  # inert on clean partitions, and by closing the ghost path it may even push surplus
+  # slots toward exclusive-territory grabs (the junk-winner risk noted in v32).
+  #
+  # Mechanism (models.py featcur_* / modules/encoders.py FeatureSmoothing): the backbone
+  # tokens are annealed from affinity-smoothed to raw,
+  #   x_tilde = softmax(cos(x, x)/tau) x        (one step of non-parametric attention)
+  #   x_used  = (1 - s(t)) x_tilde + s(t) x,    s: 0 -> 1 over anneal_steps
+  # applied BEFORE the features/backbone_features split, so the grouper input and the
+  # reconstruction target are both smoothed. DINO affinities are block-structured by
+  # object, so smoothing removes WITHIN-object feature variance while approximately
+  # preserving boundaries (unlike spatial blur).
+  #
+  # Effect early (s ~= 0):
+  #   1. splitting one object earns nothing -- the reconstruction advantage of a part
+  #      slot is proportional to the within-object variance, which is now ~0;
+  #   2. a split cannot be clean -- on a homogeneous blob every competing slot gets the
+  #      same q.k on every patch, ownership mixes, purity drops, and the v32 gate
+  #      (decoder log-prior + temporal max-norm freshness) resolves the tie toward a
+  #      single owner. The curriculum converts the gate's blind spot into the regime it
+  #      already handles; the gate turns the curriculum's "splits are unstable" into
+  #      actual merges. Neither works alone: without the gate, 50/50 co-ownership can
+  #      persist and argmax-fragment at eval.
+  # Effect late (s = 1): raw features return under binding hysteresis -- detail is
+  # learned as within-slot content, and any new split attempt must pass through a
+  # mixed-ownership phase the gate penalizes. Eval always runs on raw features
+  # (train()-only), so the eval pipeline stays identical to v32/SlotContrast.
+  #
+  # Schedule-safety: this is a schedule on the TASK, not on the gate. A mistimed clock
+  # degrades smoothly (weaker anti-split early / later detail learning) instead of
+  # gating real objects away (the v24 failure class). The gate itself remains
+  # schedule-free and detached exactly as in v32; the two mechanisms share no
+  # parameters and no gradient paths (backbone is frozen, P is computed under no_grad).
+  #
+  # Known costs / risks:
+  #   - fine-detail learning starts ~anneal_steps late; mBO may pay a small price.
+  #   - touching same-class instances can homogenize across the contact line early
+  #     (window limits this to local neighbourhoods; distant duplicates never mix).
+  feature_curriculum:
+    enabled: true
+    tau: 0.1          # cosine-affinity temperature for P = softmax(cos/tau)
+    window: 9         # Chebyshev radius on the 37x37 patch grid; blocks distant
+                      # same-appearance regions (two instances) from exchanging features
+    anneal_steps: 60000  # v33a60: 2x the default horizon
+    schedule: cosine
+    chunk_size: 16    # frames per affinity chunk (memory bound, no effect on the math)
+
+  # --- v32 purity gating, unchanged (see ytvis2021_attnmass_v32.yaml for the full
+  # rationale): c = sg(sum A~^2 / sum A~) is the gate; decoder masks become
+  # softmax(alpha + log c), temporal mix uses c / max(c). No thresholds, no gate
+  # schedule, c detached. ---
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    gate_mode: soft         # inert for purity_weight (kept for the gate stats logging)
+    gate_form: purity_weight
+    conf_kind: purity_sharp # ownership purity on the gamma-sharpened attention
+    mass_gamma: 2.0         # sharpening for the purity statistic
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true    # temporal gate alpha = c / max_j(c)
+    contrastive_gate: false # loss_ss ignores the gate (baseline-style)
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
+  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 1
+  val_size: 200
+  num_workers: 4
+  num_val_workers: 1
+  train_pipeline:
+    chunk_size: 4
+    keys: [video]
+    sample_one_chunk_per_video: true
+    transforms:
+      name: ytvis_train
+      type: video
+      crop_type: short_side_resize_random
+      input_size: 518
+      num_classes: 10
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: ytvis_val
+      type: video
+      crop_type: central
+      input_size: 518
+      num_classes: 25

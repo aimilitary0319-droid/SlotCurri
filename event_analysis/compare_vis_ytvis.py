@@ -49,7 +49,8 @@ def score_sample(model, batch, device) -> dict[str, float]:
     batch_dev = {
         k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()
     }
-    outputs = model.forward(batch_dev, train=False, cycle=True)
+    cycle = getattr(model, "cyclic_inference", True)
+    outputs = model.forward(batch_dev, train=False, cycle=cycle)
     aux = model.aux_forward(batch_dev, outputs)
     scores = {}
     for name, metric in build_val_metrics().items():
@@ -90,7 +91,8 @@ def predict_masks(model, batch, device):
         k: (v.to(device) if torch.is_tensor(v) else v)
         for k, v in batch.items()
     }
-    outputs = model.forward(batch, train=False, cycle=True)
+    cycle = getattr(model, "cyclic_inference", True)
+    outputs = model.forward(batch, train=False, cycle=cycle)
     aux = model.aux_forward(batch, outputs)
     # hard decoder masks at video resolution if available
     key = "decoder_masks_vis_hard" if "decoder_masks_vis_hard" in aux else "decoder_masks_hard"
@@ -154,6 +156,14 @@ def _known_runs(root: Path) -> dict[str, tuple[str, str]]:
         "v10": (
             str(root / "logs/_ytvis_attnmass_v10/settings/slotcurri/settings.yaml"),
             str(root / "logs/_ytvis_attnmass_v10/checkpoints/slotcurri_step=step=100000-v1.ckpt"),
+        ),
+        "slotcontrast": (
+            str(root / "logs/_ytvis_slotcontrast/settings/slotcurri/settings.yaml"),
+            str(root / "logs/_ytvis_slotcontrast/checkpoints/slotcurri_step=step=92000.ckpt"),
+        ),
+        "slotcontrast_s12": (
+            str(root / "logs/_ytvis_slotcontrast_s12/settings/slotcurri/settings.yaml"),
+            str(root / "logs/_ytvis_slotcontrast_s12/checkpoints/slotcurri_step=step=100000-v1.ckpt"),
         ),
     }
 

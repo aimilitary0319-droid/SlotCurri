@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Launch YTVIS attn-mass v37 (v36 Key-only mix without the N-cut region + spectral
+# slot purity).
+#
+# v37 vs v36:
+#   - Feature curriculum is the same ReLU-cosine P X, Key-only, 50k cosine mix.
+#     barrier=false skips the 2-way Fiedler/median cut (one global region).
+#     Value and the reconstruction target stay on original DINO. Eval is raw Keys.
+#   - Gate statistic is spectral π = (λ1-λ2)/(Σ A + eps) on C = Z^T diag(a^2) Z
+#     with Z = X^bind, not purity_sharp + 1/K normalization. a^2 is the
+#     sharpening (mass_gamma=1).
+#
+# Usage:
+#   bash scripts/launch_ytvis_attnmass_v37.sh
+#   GPUS=4,5 bash scripts/launch_ytvis_attnmass_v37.sh
+set -euo pipefail
+
+ROOT=/mnt/ssd2/hmlee/SlotCurri
+GPUS="${GPUS:-4,5}"
+IMAGE="${IMAGE:-slotcurri:cuda11.6-torch1.13}"
+OUT_LOG="${ROOT}/logs/ytvis_attnmass_v37_run.out"
+CFG=configs/slotcurri/ytvis2021_attnmass_v37.yaml
+
+mkdir -p "${ROOT}/logs"
+echo "Launching v37 on GPUs=${GPUS} -> ${OUT_LOG}"
+
+# Quote device list so docker sets DeviceIDs (not Count=-1 / all GPUs).
+docker run -d --rm --gpus "\"device=${GPUS}\"" --shm-size=16g \
+  --name "slotcurri_attnmass_v37" \
+  -v "${ROOT}:/workspace/SlotCurri" \
+  -v /mnt/ssd2/hmlee/dataset:/workspace/dataset \
+  -w /workspace/SlotCurri \
+  -e CUDA_VISIBLE_DEVICES=0,1 \
+  -e PYTHONPATH=/workspace/SlotCurri \
+  "${IMAGE}" \
+  bash -lc "python -m slotcurri.train --run-eval-after-training --log-dir logs ${CFG} trainer.log_every_n_steps=100 > logs/ytvis_attnmass_v37_run.out 2>&1"
+
+echo "container: slotcurri_attnmass_v37"
+echo "tail -f ${OUT_LOG}"

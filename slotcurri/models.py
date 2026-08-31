@@ -11,6 +11,11 @@ from torchvision.utils import make_grid
 from slotcurri import configuration, losses, modules, optimizers, utils, visualizations
 from slotcurri.data.transforms import Denormalize
 from slotcurri.modules.gate_p_residual import GatePResidualNet
+from slotcurri.modules.video import (
+    ownership_confidence,
+    slot_confidence_entropy,
+    spectral_graph_n8_impurity,
+)
 import torch.nn.functional as F
 import os
 import re
@@ -205,6 +210,7 @@ def build(
         cyclic_inference=model_config.get("cyclic_inference", True),
         slot_expansion=model_config.get("slot_expansion", True),
         feature_curriculum=model_config.get("feature_curriculum", None),
+        slot_ent_impurity=model_config.get("slot_ent_impurity", None),
     )
 
     if model_config.load_weights:
@@ -244,6 +250,7 @@ class ObjectCentricModel(pl.LightningModule):
         cyclic_inference: Union[bool, str] = True,
         slot_expansion: bool = True,
         feature_curriculum: Optional[Dict[str, Any]] = None,
+        slot_ent_impurity: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         # bool: legacy on/off (backward sweep anchored at the last frame). A string
@@ -457,6 +464,8 @@ class ObjectCentricModel(pl.LightningModule):
                 inner.feature_ncut = modules.NcutRelationalLeveling(
                     chunk_size=int(fc.get("chunk_size", 8)),
                     eps=float(fc.get("eps", 1e-6)),
+                    n_iter=int(fc.get("ncut_iters", 16)),
+                    barrier=bool(fc.get("barrier", True)),
                 )
                 inner.feature_ncut_mix = 0.0
             else:
@@ -592,6 +601,27 @@ class ObjectCentricModel(pl.LightningModule):
         # If True, the predictor re-gate uses g / max(g) so the winning slot always advances
         # fully. Decoder still sees the raw gate (renorm-invariant).
         self.amc_state_max_norm = bool(amc.get("state_max_norm", False))
+        # π hysteresis (occlusion memory, v39h): the confidence statistic becomes the
+        # leaky max π̃_t = max(π_t, γ π̃_{t-1}) with γ = gate_hysteresis in [0, 1).
+        # A slot that was recently pure keeps its gate alive ~1/(1-γ) frames through a
+        # brief occlusion; without it, partial occlusion splits the visible support
+        # into disconnected 8-nbr components, the n8 gap reads that as a merge, and π
+        # collapses exactly while the object is occluded (prior frozen at the wrong
+        # moment, decoder mask suppressed). Ghosts gain nothing (π never was high).
+        # Applies wherever conf feeds the gate (purity_weight, and the logratio
+        # confidence branch); detached like π. 0 disables (v39 default) -- with γ=0
+        # the forward pass is byte-identical to before the knob existed.
+        self.amc_gate_hysteresis = float(amc.get("gate_hysteresis", 0.0))
+        if not (0.0 <= self.amc_gate_hysteresis < 1.0):
+            raise ValueError(
+                f"attn_mass_curriculum.gate_hysteresis must be in [0, 1), "
+                f"got {self.amc_gate_hysteresis}"
+            )
+        # Temporal identity consistency (v39i): after max-norm, the mix gate is
+        #   ρ_s = π̄_s * ReLU(cos(û_{t,s}, u_{t,s}))
+        # Decoder still sees π. SlotAttention / Pred unchanged. Default False
+        # keeps the v39 forward pass byte-identical.
+        self.amc_state_identity_cos = bool(amc.get("state_identity_cos", False))
         # If True, stop-gradient the soft gate: decoder / temporal mix / gated losses see
         # sg(g). The curriculum still computes g from (m, c, p), but featrec cannot open
         # or close slots by backprop through g (same anti-gaming idea as sg(c)).
@@ -603,6 +633,11 @@ class ObjectCentricModel(pl.LightningModule):
         #   hat{x}_{t+1} = g*Pred(u) + (1-g)*prior
         # so low-gate slots advance slowly and dormant ones carry an unchanged prior.
         self.amc_predictor_ungated = bool(amc.get("predictor_ungated", False))
+        # Temporal-mix smoothing of the gate, decoder stays on instantaneous π.
+        # π̃_t = m π_t + (1-m) π̃_{t-1}, then max(π̃_t, hold * π̃_{t-1}).
+        # m=1, hold=0 is a no-op (default). Eval-only or train; no extra weights.
+        self.amc_state_gate_ema = float(amc.get("state_gate_ema", 1.0))
+        self.amc_state_gate_hold = float(amc.get("state_gate_hold", 0.0))
         # If False, loss_ss ignores active_mask (baseline-style full-slot contrastive).
         # Default True preserves v6/v7/v8 gated-anchor contrastive.
         self.amc_contrastive_gate = bool(amc.get("contrastive_gate", True))
@@ -629,46 +664,146 @@ class ObjectCentricModel(pl.LightningModule):
         #               same gamma-sharpened attention as m. Relative (threshold-ratio)
         #               evidence, so the gate stays discriminative across the whole p
         #               schedule instead of saturating once p leaves the mass distribution.
-        #   "purity_weight" (v32): g = sg(c) itself, with c the ownership purity
-        #               (conf_kind purity/purity_sharp). Thresholdless: no p schedule, no
-        #               tau, no beta -- the decoder sees softmax(alpha + log c) and the
-        #               temporal mix uses c / max(c). Self-annealing (uniform untrained c
-        #               is cancelled by the renorm/max-norm), replacing the curriculum.
+        #   "purity_weight" (v32/v37/v38/v39/v39n): g = sg(c) itself. c is ownership
+        #               purity (conf_kind purity/purity_sharp), v37 feature-Gram π
+        #               (spectral), v38 dense relation-graph π (spectral_graph),
+        #               v39 8-neighbor graph π (spectral_graph_n8), v39n
+        #               relative n8 π (spectral_graph_n8_rel = v39 gap / λ1),
+        #               or v39s (spectral_graph_n8_l1imp = [λ1 - λ2⁺/(λ1+ε)]_+).
+        #               Thresholdless: no p schedule, no tau, no beta --
+        #               the decoder sees softmax(alpha + log c) and the temporal mix
+        #               uses c / max(c). Self-annealing (uniform untrained c is
+        #               cancelled by the renorm/max-norm), replacing the curriculum.
+        # state_gate_form (optional, v26p): the temporal mix can use a different form
+        # than the decoder. p_end_mult=0 opens the decoder mass gate (identity) at the
+        # end of the curriculum / at eval, instead of log(eps).
+        # state_mul_decoder (v26pg): temporal = state_statistic ⊙ g_dec before max-norm.
+        # decoder_mul_state (v26pgd): decoder masks = g_dec ⊙ state_statistic. With both
+        # flags the two paths share g ⊙ π; p=0 / eval then uses π on the decoder.
         self.amc_gate_form = str(amc.get("gate_form", "linear")).lower()
         if self.amc_gate_form not in ("linear", "logratio", "purity_weight"):
             raise ValueError(
                 f"attn_mass_curriculum.gate_form must be 'linear', 'logratio' or "
                 f"'purity_weight', got {self.amc_gate_form!r}"
             )
+        # Optional temporal-mix form, independent of the decoder gate (v26p). None / the
+        # same string as gate_form keeps the historical shared path (plus gate_p_state
+        # as a threshold split of that same form).
+        sgf = amc.get("state_gate_form", None)
+        if sgf is None or str(sgf).strip() == "":
+            self.amc_state_gate_form = None
+        else:
+            self.amc_state_gate_form = str(sgf).lower()
+            if self.amc_state_gate_form not in ("linear", "logratio", "purity_weight"):
+                raise ValueError(
+                    f"attn_mass_curriculum.state_gate_form must be 'linear', 'logratio' "
+                    f"or 'purity_weight', got {self.amc_state_gate_form!r}"
+                )
+            if self.amc_state_gate_form == self.amc_gate_form:
+                self.amc_state_gate_form = None
+        if self.amc_state_gate_form is not None and self.amc_state_p_mult is not None:
+            raise ValueError(
+                "attn_mass_curriculum.state_gate_form and state_p_mult cannot both be "
+                "set: the former replaces the temporal mass threshold with a different "
+                "gate statistic"
+            )
+        # v26pg: temporal mix uses (state statistic) ⊙ decoder g, then max-norm.
+        # Requires a split state_gate_form — a shared gate would square g on the mix.
+        self.amc_state_mul_decoder = bool(amc.get("state_mul_decoder", False))
+        if self.amc_state_mul_decoder and self.amc_state_gate_form is None:
+            raise ValueError(
+                "attn_mass_curriculum.state_mul_decoder requires a distinct "
+                "state_gate_form (temporal π ⊙ g_dec); with a shared gate this "
+                "would square g on the mix"
+            )
+        # v26pgd: decoder masks use g_dec ⊙ state statistic (π). Same split-form
+        # requirement: a shared gate would square g on the reconstruction mix.
+        self.amc_decoder_mul_state = bool(amc.get("decoder_mul_state", False))
+        if self.amc_decoder_mul_state and self.amc_state_gate_form is None:
+            raise ValueError(
+                "attn_mass_curriculum.decoder_mul_state requires a distinct "
+                "state_gate_form (decoder g_dec ⊙ π); with a shared gate this "
+                "would square g on the decoder"
+            )
         # Confidence definition for the logratio gate's second branch (v29):
         #   "entropy": c = 1 - H/log F over the gamma-sharpened attention (v26 default).
         #              Spatial concentration; penalizes large objects by construction
         #              (H grows with log(object size)).
+        #   "entropy_max": v26fmax. c_ent * max_f A_{s,f} on RAW softmax-over-slots
+        #              attention. Entropy is scale-invariant inside the slot, so
+        #              always-second leftovers with the same support as a small
+        #              object score like one; the peak restores ownership height
+        #              (winner ~1, never-argmax ghost < 0.5). Still size-penalizes
+        #              large exclusive objects via c_ent. Detached.
         #   "purity" : c = sum A^2 / sum A over the RAW attention -- the attention-weighted
         #              mean of the slot's own per-patch share. Direct, size-invariant
         #              ownership quality.
         #   "purity_sharp": the same statistic on the gamma-sharpened attention the mass
         #              branch uses (one distribution, two moments). Best ghost-vs-small
         #              separation on v20 @ 100k (event_analysis/conf_vs_purity_probe.py).
+        #   "spectral": v37. π_s = (λ1-λ2) / (Σ_i A_{i,s} + eps) from
+        #              C_s = Z^T diag(a_s^2) Z on L2-normalized backbone tokens Z.
+        #              Ownership of two feature modes raises λ2, so the v32 blind
+        #              spot (clean part-split, c~=1) is visible without N-cut.
+        #              No gamma, no 1/K normalization; detached.
+        #   "spectral_graph": v38. π_s = λ1 - max(λ2, 0) of
+        #              G_s = diag(a_s) S diag(a_s), S = D^{-1/2} R D^{-1/2} on the
+        #              same ReLU-cosine R as the Key curriculum (Z from X^bind).
+        #              No /mass, no gamma, no 1/K; detached. Cuts and second
+        #              communities in the patch graph drop π.
+        #   "spectral_graph_n8": v39. Same G_s construction as v38, but R is
+        #              8-neighbor ReLU-cosine only. π_s = λ1 - max(λ2, 0).
+        #              Curriculum P stays global.
+        #   "spectral_graph_n8_rel": v39n. Same G_s / n8 R as v39, then
+        #              π_s = (λ1 - max(λ2, 0)) / max(λ1, eps) in [0, 1].
+        #              Scale-invariant: two-community merge still drops π;
+        #              G_s scale no longer kills ghosts.
+        #   "spectral_graph_n8_l1imp": v39s. Same G_s / n8 R as v39, then
+        #              π_s = [λ1 - max(λ2, 0) / (λ1 + eps)]_+.
+        #              Keeps G_s scale; subtracts relative impurity.
         # Detached in every case (anti-gaming). Not to be confused with the purity_q
         # OR-rescue, which can only OPEN gates and bypasses the evidence score entirely;
         # this is the multiplicative evidence branch.
         self.amc_conf_kind = str(amc.get("conf_kind", "entropy")).lower()
-        if self.amc_conf_kind not in ("entropy", "purity", "purity_sharp"):
-            raise ValueError(
-                f"attn_mass_curriculum.conf_kind must be 'entropy', 'purity' or "
-                f"'purity_sharp', got {self.amc_conf_kind!r}"
-            )
-        # purity_weight is DEFINED as ownership weighting; the conf_kind default
-        # ("entropy") would silently weight by spatial concentration instead, so an
-        # explicit purity choice is required.
-        if self.amc_gate_form == "purity_weight" and self.amc_conf_kind not in (
+        if self.amc_conf_kind not in (
+            "entropy",
+            "entropy_max",
             "purity",
             "purity_sharp",
+            "spectral",
+            "spectral_graph",
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
         ):
             raise ValueError(
-                "attn_mass_curriculum.gate_form='purity_weight' requires conf_kind "
-                f"'purity' or 'purity_sharp', got {self.amc_conf_kind!r}"
+                f"attn_mass_curriculum.conf_kind must be 'entropy', 'entropy_max', "
+                f"'purity', 'purity_sharp', 'spectral', 'spectral_graph', "
+                f"'spectral_graph_n8', 'spectral_graph_n8_rel' or "
+                f"'spectral_graph_n8_l1imp', got {self.amc_conf_kind!r}"
+            )
+        # purity_weight is DEFINED as ownership / spectral weighting; the conf_kind
+        # default ("entropy") would silently weight by spatial concentration instead,
+        # so an explicit purity choice is required. Same check when only the temporal
+        # mix uses purity_weight (v26p).
+        if (
+            self.amc_gate_form == "purity_weight"
+            or self.amc_state_gate_form == "purity_weight"
+        ) and self.amc_conf_kind not in (
+            "purity",
+            "purity_sharp",
+            "spectral",
+            "spectral_graph",
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum gate_form/state_gate_form='purity_weight' "
+                "requires conf_kind 'purity', 'purity_sharp', 'spectral', "
+                f"'spectral_graph', 'spectral_graph_n8', "
+                f"'spectral_graph_n8_rel' or 'spectral_graph_n8_l1imp', "
+                f"got {self.amc_conf_kind!r}"
             )
         # Coupled confidence weight: beta_t = 1 - lambda_t (1 - beta_final), i.e. the
         # confidence contribution 1-beta_t ramps 0 -> 1-beta_final with the SAME lambda that
@@ -706,7 +841,31 @@ class ObjectCentricModel(pl.LightningModule):
         self._state_gate_mean = None
         self._gate_delta = None  # stashed for residual L2 (may be graph-connected)
         self._gate_conf_mean = None  # mean assignment confidence (logratio gate, logging)
+        self._identity_cos_mean = None  # mean ReLU-cosine û vs u (v39i, logging)
         self._util_rel_delta = None  # mean rel_delta of sampled slots (slot_utility, logging)
+
+        # --- v40 coupled slot-entropy / impurity (train-only aux) ---
+        # L_ent = H(q)/log K on K-normalized ownership c (live A): concentrate c
+        # across slots early. L_imp = c-weighted mean of λ2/λ1 on the v39 8-nbr
+        # graph (live a, sg(Z), sg(c) as weights): split merged communities late.
+        # w_ent = w0 (1-λ_t), w_imp = w0 λ_t, same cosine λ as the v26 family.
+        sei = slot_ent_impurity or {}
+        self.sei_enabled = bool(sei.get("enabled", False))
+        self.sei_weight = float(sei.get("weight", 0.2))
+        self.sei_anneal_steps = int(sei.get("anneal_steps", 50000))
+        self.sei_eps = float(sei.get("eps", 1e-6))
+        self.sei_chunk_size = int(sei.get("chunk_size", 8))
+        self.sei_n_iter = int(sei.get("n_iter", 16))
+        if self.sei_enabled:
+            if self.sei_weight < 0.0:
+                raise ValueError(
+                    f"slot_ent_impurity.weight must be >= 0, got {self.sei_weight}"
+                )
+            if self.sei_anneal_steps <= 0:
+                raise ValueError(
+                    "slot_ent_impurity.anneal_steps must be positive, "
+                    f"got {self.sei_anneal_steps}"
+                )
 
     def _p_residual_alpha_eff(self, train: bool) -> float:
         """Warm up residual strength so early coarse curriculum stays near v10."""
@@ -728,6 +887,24 @@ class ObjectCentricModel(pl.LightningModule):
         step = self.trainer.global_step
         frac = min(max(step / max(self.amc_anneal_steps, 1), 0.0), 1.0)
         return 0.5 * (1.0 - float(np.cos(np.pi * frac)))
+
+    def _sei_lambda(self, train: bool) -> float:
+        """v40 cosine coefficient on slot_ent_impurity.anneal_steps.
+
+        Same shape as `_curriculum_lambda`, but its own clock so the gate does
+        not have to carry a p/β schedule. Eval / t>=T uses λ=1.
+        """
+        if not train:
+            return 1.0
+        step = self.trainer.global_step
+        frac = min(max(step / max(self.sei_anneal_steps, 1), 0.0), 1.0)
+        return 0.5 * (1.0 - float(np.cos(np.pi * frac)))
+
+    def _sei_weights(self, train: bool) -> Tuple[float, float, float]:
+        """(w_ent, w_imp, lambda_t) with w_ent + w_imp = sei_weight."""
+        lam = self._sei_lambda(train)
+        w0 = self.sei_weight
+        return w0 * (1.0 - lam), w0 * lam, lam
 
     def _aux_ramp(self, ramp: str) -> float:
         """Weight multiplier for the v27 auxiliary losses.
@@ -802,7 +979,11 @@ class ObjectCentricModel(pl.LightningModule):
         mass threshold under every p_mode: a curriculum-free gate has no reason to track
         scene statistics. Evaluation uses p_end_mult, so it returns the floor.
         """
-        if not self.attn_mass_enabled or self.amc_state_p_mult is None:
+        if (
+            not self.attn_mass_enabled
+            or self.amc_state_p_mult is None
+            or self.amc_state_gate_form is not None
+        ):
             return None
         floor = self.amc_state_p_mult / max(self.n_slots, 1)
         scheduled = self._annealed_p_mult(train) / max(self.n_slots, 1)
@@ -927,6 +1108,28 @@ class ObjectCentricModel(pl.LightningModule):
                 processor_kwargs["key_inputs"] = key_features
             else:
                 processor_kwargs["key_features"] = key_features
+        if self.attn_mass_enabled and self.amc_conf_kind in (
+            "spectral",
+            "spectral_graph",
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+        ):
+            # Z / X^bind for v37 C_s, v38 dense S, and v39 / v39n 8-neighbor S.
+            # Key-only curriculum exposes that as backbone_key; otherwise
+            # backbone_features is X^bind (raw X when the curriculum is off / mix=1).
+            bind = encoder_output.get("backbone_key")
+            if bind is None:
+                bind = encoder_output.get("backbone_features")
+            if bind is None:
+                raise ValueError(
+                    f"attn_mass_curriculum.conf_kind={self.amc_conf_kind!r} "
+                    "requires encoder backbone_features"
+                )
+            if hasattr(self.processor, "next_state_key"):
+                processor_kwargs["bind_inputs"] = bind
+            else:
+                processor_kwargs["bind_features"] = bind
 
         if self.attn_mass_enabled:
             gate_p = self._gate_threshold(train)
@@ -941,6 +1144,8 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_p_state=self._state_gate_threshold(train),
                 state_max_norm=self.amc_state_max_norm,
                 predictor_ungated=self.amc_predictor_ungated,
+                state_gate_ema=self.amc_state_gate_ema,
+                state_gate_hold=self.amc_state_gate_hold,
                 p_mode=self.amc_p_mode,
                 median_ema_momentum=self.amc_median_ema_momentum,
                 p_residual_net=self.amc_p_residual_net,
@@ -951,6 +1156,11 @@ class ObjectCentricModel(pl.LightningModule):
                 conf_kind=self.amc_conf_kind,
                 gate_detach=self.amc_gate_detach,
                 purity_normalize=self.amc_purity_normalize,
+                state_gate_form=self.amc_state_gate_form,
+                state_mul_decoder=self.amc_state_mul_decoder,
+                decoder_mul_state=self.amc_decoder_mul_state,
+                gate_hysteresis=self.amc_gate_hysteresis,
+                state_identity_cos=self.amc_state_identity_cos,
                 **{k: v for k, v in processor_kwargs.items() if k != "cycle"},
             )
             slots = processor_output["state"]
@@ -959,6 +1169,10 @@ class ObjectCentricModel(pl.LightningModule):
             gate_conf = processor_output.get("gate_conf")
             self._gate_conf_mean = (
                 float(gate_conf.float().mean().detach()) if gate_conf is not None else None
+            )
+            ident = processor_output.get("identity_cos")
+            self._identity_cos_mean = (
+                float(ident.float().mean().detach()) if ident is not None else None
             )
             state_gate = processor_output.get("state_gate")
             if state_gate is not None and state_gate.dtype != torch.bool:
@@ -980,6 +1194,7 @@ class ObjectCentricModel(pl.LightningModule):
             self._gate_delta = None
             self._state_gate_mean = None
             self._gate_conf_mean = None
+            self._identity_cos_mean = None
             processor_output = self.processor(
                 slots_initial, features, **processor_kwargs
             )
@@ -1237,7 +1452,69 @@ class ObjectCentricModel(pl.LightningModule):
                     self.util_weight * self._aux_ramp(self.util_ramp) * util_term
                 )
 
+        # --- v40 coupled slot-entropy / 8-neighbor impurity (train-only) ---
+        if self.training and self.sei_enabled and self.sei_weight > 0.0:
+            w_ent, w_imp, _lam = self._sei_weights(True)
+            att, bind = self._sei_att_and_bind(outputs)
+            if att is not None:
+                c = ownership_confidence(att, eps=self.sei_eps)
+                ent = slot_confidence_entropy(c, eps=self.sei_eps).mean()
+                losses["loss_ent"] = ent
+                if w_ent > 0.0:
+                    total_loss = total_loss + w_ent * ent
+                if w_imp > 0.0:
+                    if bind is None:
+                        raise ValueError(
+                            "slot_ent_impurity requires encoder backbone_features"
+                        )
+                    rho = spectral_graph_n8_impurity(
+                        att,
+                        bind,
+                        eps=self.sei_eps,
+                        chunk_size=self.sei_chunk_size,
+                        n_iter=self.sei_n_iter,
+                    )
+                    c_sg = c.detach()
+                    imp = (c_sg * rho).sum(dim=-1) / (
+                        c_sg.sum(dim=-1) + self.sei_eps
+                    )
+                    imp = imp.mean()
+                    losses["loss_imp"] = imp
+                    total_loss = total_loss + w_imp * imp
+
         return total_loss, losses
+
+    def _sei_att_and_bind(
+        self, outputs: Dict[str, Any]
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Last-iter attention (B*T, S, N) and backbone tokens (B*T, N, D) for v40.
+
+        Attention stays live. Bind tokens are detached here; the impurity
+        helper also detaches Z after L2-norm.
+        """
+        proc = outputs.get("processor") or {}
+        att = proc.get("state_attn_mask")
+        if att is None:
+            return None, None
+        if att.ndim == 4:
+            att = att.reshape(-1, att.shape[-2], att.shape[-1])
+        elif att.ndim != 3:
+            raise ValueError(
+                f"slot_ent_impurity expected attention (B, S, N) or (B, T, S, N), "
+                f"got {tuple(att.shape)}"
+            )
+        enc = outputs.get("encoder") or {}
+        bind = enc.get("backbone_features")
+        if bind is None:
+            return att, None
+        if bind.ndim == 4:
+            bind = bind.reshape(-1, bind.shape[-2], bind.shape[-1])
+        elif bind.ndim != 3:
+            raise ValueError(
+                f"slot_ent_impurity expected backbone (B, N, D) or (B, T, N, D), "
+                f"got {tuple(bind.shape)}"
+            )
+        return att, bind.detach()
 
     def _predictive_recon_loss(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Predictive feature reconstruction: MSE(Dec(Pred(x_t)), F_{t+1}).
@@ -1619,9 +1896,13 @@ class ObjectCentricModel(pl.LightningModule):
                 to_log["train/gate_lambda"] = float(self._curriculum_lambda(True))
                 to_log["train/gate_beta"] = float(self._gate_beta(True))
                 to_log["train/gate_tau_log"] = float(self.amc_gate_tau_log)
-            if self.amc_gate_form in ("logratio", "purity_weight"):
+            if self.amc_gate_form in ("logratio", "purity_weight") or (
+                self.amc_state_gate_form in ("logratio", "purity_weight")
+            ):
                 if getattr(self, "_gate_conf_mean", None) is not None:
                     to_log["train/gate_conf"] = self._gate_conf_mean
+            if getattr(self, "_identity_cos_mean", None) is not None:
+                to_log["train/identity_cos"] = self._identity_cos_mean
             if self.amc_gate_mode in ("soft", "ste") or self.amc_gate_form == "purity_weight":
                 if self.amc_gate_form == "linear":
                     # tau in mass units only parameterizes the linear gate
@@ -1646,8 +1927,10 @@ class ObjectCentricModel(pl.LightningModule):
                 # gate_state_slots vs active_slots is the whole point of the split: the
                 # first should stay well below the second once p has annealed.
                 to_log["train/gate_state_p"] = float(state_p)
-                if getattr(self, "_state_gate_mean", None) is not None:
-                    to_log["train/gate_state_slots"] = self._state_gate_mean * self.n_slots
+            if (
+                state_p is not None or self.amc_state_gate_form is not None
+            ) and getattr(self, "_state_gate_mean", None) is not None:
+                to_log["train/gate_state_slots"] = self._state_gate_mean * self.n_slots
 
         if self.pred_weight > 0.0:
             to_log["train/pred_w_eff"] = self.pred_weight * self._aux_ramp(self.pred_ramp)
@@ -1655,6 +1938,11 @@ class ObjectCentricModel(pl.LightningModule):
             to_log["train/util_w_eff"] = self.util_weight * self._aux_ramp(self.util_ramp)
             if self._util_rel_delta is not None:
                 to_log["train/util_rel_delta"] = self._util_rel_delta
+        if self.sei_enabled:
+            w_ent, w_imp, lam = self._sei_weights(True)
+            to_log["train/sei_lambda"] = float(lam)
+            to_log["train/sei_w_ent"] = float(w_ent)
+            to_log["train/sei_w_imp"] = float(w_imp)
 
         if self.train_metrics:
             for key, metric in self.train_metrics.items():

@@ -1,0 +1,195 @@
+experiment_group: slotcurri
+experiment_name: ytvis_attnmass_v39
+
+globals:
+  NUM_SLOTS: 7
+  SLOT_DIM: 64
+  DINO_MODEL: vit_base_patch14_dinov2
+  FEAT_DIM: 768
+  NUM_PATCHES: 1369
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
+  cyclic_inference: false
+
+  # --- v39 = v38 Key-only ReLU-cosine mix + 8-neighbor graph purity ---
+  #
+  # Feature curriculum is byte-identical to v38 / v37 (Key-only mix, barrier: false):
+  #      Z = X/||X||,  W = ReLU(Z Z^T),  W_ii = 0
+  #      X^rel = P X     with P = row-normalize(W)     # no 2-way Fiedler/median cut
+  #      X^bind = (1-s) X^rel + s X,   s: 0 -> 1 cosine over 50k
+  #    Keys = W_K LN(phi(X^bind)); Value and recon target stay on original X.
+  #    Eval / mix=1 is raw Keys.
+  #
+  # The gate uses the same G_s = diag(a) S diag(a) as v38, but R is 8-neighbor
+  # ReLU-cosine only (curriculum P stays global):
+  #      R_ij = ReLU(z_i^T z_j) iff j in N_8(i), else 0
+  #      S = D^{-1/2} R D^{-1/2}
+  #      G_s = diag(a_s) S diag(a_s)
+  #      π_s = λ1 - max(λ2, 0)
+  #    Softmax a, no argmax. No /mass, no 1/K. π detached.
+  #    Decoder: softmax(alpha + log(π+eps)); temporal: π/max(π).
+  feature_curriculum:
+    enabled: true
+    anneal: ncut       # same ReLU-cosine P X as v37
+    apply: key         # Keys only; Value and recon target stay on original X
+    barrier: false     # no 2-way Fiedler/median region
+    anneal_steps: 50000  # s: 0 -> 1 (cosine); remaining 50k is raw Keys
+    schedule: cosine
+    chunk_size: 8      # frames per (N,N) graph chunk (memory bound, not math)
+    eps: 1.0e-6
+
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    gate_mode: soft         # inert for purity_weight (kept for the gate stats logging)
+    gate_form: purity_weight
+    conf_kind: spectral_graph_n8  # 8-nbr G_s; π = λ1 - max(λ2, 0)
+    mass_gamma: 1.0         # unused
+    purity_normalize: false # no 1/K map; G_s scale already kills uniform ghosts
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true    # temporal gate alpha = π / max_j(π)
+    contrastive_gate: false # loss_ss ignores the gate (baseline-style)
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
+  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 1
+  val_size: 200
+  num_workers: 4
+  num_val_workers: 1
+  train_pipeline:
+    chunk_size: 4
+    keys: [video]
+    sample_one_chunk_per_video: true
+    transforms:
+      name: ytvis_train
+      type: video
+      crop_type: short_side_resize_random
+      input_size: 518
+      num_classes: 10
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: ytvis_val
+      type: video
+      crop_type: central
+      input_size: 518
+      num_classes: 25

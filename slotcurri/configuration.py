@@ -52,8 +52,13 @@ class ModelConfig:
     # Feature curriculum (v33/v36): anneal backbone tokens from a coarse relational
     # representation to raw patch features. v33 affinity-smooths the tokens themselves
     # (grouper + recon target). v36 (anneal=ncut, apply=key) levels Keys only via a
-    # 2-way Ncut barrier. Train-time only; eval sees raw features.
+    # 2-way Ncut barrier. v37/v38 keep that Key-only mix/schedule with barrier=false
+    # (global ReLU-cosine P, no region cut). Train-time only; eval sees raw features.
     feature_curriculum: Optional[Dict[str, Any]] = None
+    # v40: coupled slot-confidence entropy (early, concentrate c) and 8-neighbor
+    # spectral impurity (late, split merged communities). Train-only aux losses;
+    # the gate is the existing purity_weight + K-normalized ownership path.
+    slot_ent_impurity: Optional[Dict[str, Any]] = None
     masks_to_visualize: Optional[List[str]] = None
     load_weights: Optional[str] = None
     modules_to_load: Optional[Dict[str, str]] = None

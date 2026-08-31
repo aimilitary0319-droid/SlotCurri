@@ -1,0 +1,217 @@
+experiment_group: slotcurri
+experiment_name: ytvis_attnmass_v32s12
+
+globals:
+  NUM_SLOTS: 12
+  SLOT_DIM: 64
+  DINO_MODEL: vit_base_patch14_dinov2
+  FEAT_DIM: 768
+  NUM_PATCHES: 1369
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+
+  # Single-pass inference (same rationale as v20+): training was always single-pass, so no
+  # extra backward sweep at eval.
+  cyclic_inference: false
+
+  # --- v32s12 = v32 with NUM_SLOTS 12 (only change vs ytvis2021_attnmass_v32.yaml) ---
+  #
+  # Required control for v33s12: extra slots with purity gating but NO feature
+  # curriculum. If v33s12 > v32s12 the gap is the curriculum under surplus capacity.
+  # --- v32: PURITY GATING -- the curriculum is replaced by one statistic ---
+  #
+  # The whole threshold gate is dropped. Per frame, from the gamma-sharpened
+  # last-iteration attention (the same tensor every v2x gate read):
+  #   c_s = sg( sum_f A~_{s,f}^2 / sum_f A~_{s,f} )   in (0, 1]   (ownership purity)
+  # and c IS the gate:
+  #   decoder : M' = M c / sum_j M c   ==  softmax_s(alpha + log c)
+  #   temporal: alpha = c / max_j(c)   (state_max_norm; winner always advances fully)
+  # No p schedule, no tau, no beta, no anneal_steps -- zero curriculum hyperparameters.
+  # gamma stays 2.0 (purity_sharp = the v29-probe winner: conf-only ghost-vs-small AUC
+  # 0.999 vs 0.997 raw vs 0.647 entropy on v20 @ 100k).
+  #
+  # Why replace the curriculum instead of retuning it:
+  #   - mass thresholds are scale-bound: p_end must sit below the smallest object's mass,
+  #     where the gate saturates and goes flat (the v24s21 state_p_mult patch and the v26
+  #     logratio form both compensate for this one defect).
+  #   - the early phase is schedule-fragile: p_start/tau_g settings decided between
+  #     1-slot lock and winner saturation (v26 attempts 1-2, "hard-won settings").
+  #   - v29 showed the probe-superior purity statistic adds nothing when mixed INTO the
+  #     threshold gate (0.397 ~= mass-only v26m 0.399, vs v26 0.448): the mass-scale
+  #     threshold and the purity scale do not compose (config beta sweep: more purity
+  #     weight -> MORE ghost passes, a pure calibration artifact). v32 removes the
+  #     composition instead of rebalancing it.
+  #
+  # Why it is safe to start ungated: untrained attention is diffuse, so c ~= 1/S is
+  # near-uniform across slots -- and a uniform gate is cancelled EXACTLY by both
+  # application points (decoder renorm, temporal max-norm). Early training is therefore
+  # the plain baseline (0.436 on this dataset), and the gate phases itself in only as
+  # attention actually sharpens: the curriculum is self-annealing, driven by the
+  # statistic's own trajectory rather than a hand-tuned clock. There is no sigmoid tail,
+  # so no bistable early regime; slot contrast is bounded by real purity ratios.
+  #
+  # c stays detached (anti-gaming): un-detached purity is maximized by ANY clean
+  # partition (a grid tessellation scores 1), so the gate must remain a pure forward
+  # modulation. Gradients reach attention only through featrec/loss_ss as in the
+  # baseline.
+  #
+  # Known risks, to be read off this run:
+  #   - junk-patch winners (a slot cleanly owning a few uncontested background patches
+  #     scores c ~= 1 and passes; mass used to suppress these). Counter-mechanism if
+  #     needed: the v31 slot-utility rent.
+  #   - unamplified suppression (ghost weight ~ c_ghost / c_obj, no sigmoid sharpening).
+  #     Fallback knob if needed: an exponent k on log c (not used here; k = 1).
+  #
+  # Go/no-go was measured before this run with event_analysis/purity_weight_eval.py
+  # (same weights, gate swapped at eval on the baseline / v26m / v29 checkpoints).
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    gate_mode: soft         # inert for purity_weight (kept for the gate stats logging)
+    gate_form: purity_weight
+    conf_kind: purity_sharp # ownership purity on the gamma-sharpened attention
+    mass_gamma: 2.0         # sharpening for the purity statistic
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true    # temporal gate alpha = c / max_j(c)
+    contrastive_gate: false # loss_ss ignores the gate (baseline-style)
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
+  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 1
+  val_size: 200
+  num_workers: 4
+  num_val_workers: 1
+  train_pipeline:
+    chunk_size: 4
+    keys: [video]
+    sample_one_chunk_per_video: true
+    transforms:
+      name: ytvis_train
+      type: video
+      crop_type: short_side_resize_random
+      input_size: 518
+      num_classes: 10
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: ytvis_val
+      type: video
+      crop_type: central
+      input_size: 518
+      num_classes: 25

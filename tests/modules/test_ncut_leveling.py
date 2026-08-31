@@ -30,6 +30,15 @@ def test_affinity_relu_and_zero_diag():
     assert (w[0, :8, 8:].abs().mean() < 0.05)
 
 
+def test_explain_matches_mix0():
+    x = _two_cluster_tokens(noise=0.0)
+    ncut = NcutRelationalLeveling(chunk_size=1)
+    exp = ncut.explain(x)
+    assert torch.allclose(exp["rel"], ncut(x, 0.0), atol=1e-5)
+    assert exp["region"].shape == (1, 16)
+    assert exp["v2"].shape == (1, 16)
+
+
 def test_ncut_splits_two_clusters_and_levels_inside():
     # Zero within-cluster noise: W is block-diagonal, so the Fiedler/median cut
     # recovers the two components and each token is replaced by its partner mean.
@@ -48,7 +57,15 @@ def test_ncut_splits_two_clusters_and_levels_inside():
     assert F.cosine_similarity(out[0, 0], out[0, 8], dim=0) < 0.2
 
 
-def test_ncut_mix_endpoints():
+def test_ncut_under_cuda_amp():
+    if not torch.cuda.is_available():
+        return
+    x = _two_cluster_tokens(noise=0.0).cuda()
+    ncut = NcutRelationalLeveling(chunk_size=2).cuda()
+    with torch.cuda.amp.autocast():
+        out = ncut(x, 0.0)
+    assert torch.isfinite(out.float()).all()
+    assert out.shape == x.shape
     x = _two_cluster_tokens()
     ncut = NcutRelationalLeveling()
     assert ncut(x, 1.0) is x
@@ -62,6 +79,32 @@ def test_ncut_chunking_matches():
     a = NcutRelationalLeveling(chunk_size=2)(x, 0.0)
     b = NcutRelationalLeveling(chunk_size=16)(x, 0.0)
     assert torch.allclose(a, b, atol=1e-4)
+
+
+def test_no_barrier_is_global_relu_cosine_leveling():
+    """v37: skip Fiedler/median; P is row-normalize(W) on the full graph."""
+    n, dim = 8, 4
+    g = torch.Generator().manual_seed(0)
+    x = torch.zeros(1, n, dim)
+    x[..., 0] = 1.0
+    x = x + 0.05 * torch.randn(1, n, dim, generator=g)
+    no_b = NcutRelationalLeveling(chunk_size=1, barrier=False)
+    out = no_b(x, 0.0)
+    assert float(out[0].var(0).mean()) < float(x[0].var(0).mean())
+    exp = no_b.explain(x)
+    assert bool(exp["region"].all())
+    assert torch.allclose(exp["v2"], torch.zeros_like(exp["v2"]))
+    exp_cut = NcutRelationalLeveling(chunk_size=1, barrier=True).explain(x)
+    assert bool(exp_cut["region"].any()) and bool((~exp_cut["region"]).any())
+
+
+def test_no_barrier_blockdiag_still_does_not_mix_orthogonal_clusters():
+    # Cross-cluster ReLU cosine is 0, so global P is still block-diagonal.
+    x = _two_cluster_tokens(noise=0.0)
+    out = NcutRelationalLeveling(chunk_size=1, barrier=False)(x, 0.0)
+    assert torch.allclose(out[0, :8], out[0, :8].mean(0), atol=1e-5)
+    assert torch.allclose(out[0, 8:], out[0, 8:].mean(0), atol=1e-5)
+    assert F.cosine_similarity(out[0, 0], out[0, 8], dim=0) < 0.2
 
 
 def test_v36_configs_parse_ncut_key_and_purity_norm():
@@ -108,6 +151,7 @@ def test_frame_encoder_ncut_key_only_leaves_target_raw():
     out = enc(images)
     assert torch.equal(out["backbone_features"], tokens)
     assert "features_key" in out
+    assert "backbone_key" in out
     assert not torch.allclose(out["features_key"], out["features"])
     # Value path is the original (Identity MLP)
     assert torch.allclose(out["features"], tokens)

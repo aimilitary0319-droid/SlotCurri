@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Scan full YTVIS val: find clips where v10 loses badly to baseline, visualize them."""
+"""Scan full val: clips where a method loses badly to SlotCurri baseline.
+
+Default --method v10 --dataset ytvis reproduces logs/vis_v10_loses_to_baseline.
+  python event_analysis/vis_v10_vs_baseline_losses.py --method v26
+writes logs/vis_v26_loses_to_baseline (v26 uses its own cyclic_inference=False).
+
+  python event_analysis/vis_v10_vs_baseline_losses.py --method v39 --dataset movi_c
+compares logs/_movi_c_attnmass_v39 to the official SlotCurri MOVi-C checkpoint
+(checkpoints/movi_c.ckpt) with ignore_background=True, and writes
+logs/vis_v39_movi_c_loses_to_baseline.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +27,73 @@ from slotcurri.data.transforms import Denormalize
 from slotcurri.visualizations import mix_videos_with_masks
 
 
+def project_root() -> Path:
+    root = Path("/workspace/SlotCurri")
+    if (root / "slotcurri").exists():
+        return root
+    return Path("/mnt/ssd2/hmlee/SlotCurri")
+
+
+def method_ckpt(root: Path, method: str, dataset: str = "ytvis") -> Path:
+    prefix = "movi_c" if dataset == "movi_c" else "ytvis"
+    ckpt_dir = root / f"logs/_{prefix}_attnmass_{method}" / "checkpoints"
+    named = ckpt_dir / "slotcurri_step=step=100000-v1.ckpt"
+    if named.is_file():
+        return named
+    ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime)
+    if not ckpts:
+        raise FileNotFoundError(f"no checkpoint in {ckpt_dir}")
+    return ckpts[-1]
+
+
+def resolve_run(root: Path, method: str, dataset: str) -> dict:
+    """SlotCurri is the baseline on both datasets (SOTA paper checkpoint / local run)."""
+    if dataset == "movi_c":
+        method_settings = (
+            root / f"logs/_movi_c_attnmass_{method}" / "settings/slotcurri/settings.yaml"
+        )
+        return {
+            "dataset": dataset,
+            "baseline_name": "slotcurri",
+            "baseline_settings": root / "configs/slotcurri/movi_c.yaml",
+            "baseline_ckpt": root / "checkpoints/movi_c.ckpt",
+            "method_settings": method_settings,
+            "method_ckpt": method_ckpt(root, method, dataset),
+            "data_settings": method_settings,
+            "ignore_background": True,
+            "out_stem": f"{method}_movi_c",
+        }
+    if dataset != "ytvis":
+        raise ValueError(f"unknown dataset {dataset!r}")
+    return {
+        "dataset": dataset,
+        "baseline_name": "slotcurri",
+        "baseline_settings": root / "logs/_ytvis/settings/slotcurri/settings.yaml",
+        "baseline_ckpt": root / "logs/_ytvis/checkpoints/slotcurri_step=step=100000-v1.ckpt",
+        "method_settings": root / f"logs/_ytvis_attnmass_{method}" / "settings/slotcurri/settings.yaml",
+        "method_ckpt": method_ckpt(root, method, dataset),
+        "data_settings": root / "logs/_ytvis/settings/slotcurri/settings.yaml",
+        "ignore_background": False,
+        "out_stem": method,
+    }
+
+
+def save_clip(frames, stem: Path) -> None:
+    Image.fromarray(frames[len(frames) // 2]).save(stem.parent / f"{stem.name}_mid.png")
+    try:
+        import imageio
+
+        imageio.mimsave(stem.parent / f"{stem.name}.gif", frames, fps=4)
+    except Exception as e:
+        print("gif skip:", e)
+    try:
+        import imageio
+
+        imageio.mimsave(stem.parent / f"{stem.name}.mp4", frames, fps=4)
+    except Exception as e:
+        print("mp4 skip:", e)
+
+
 def load_model(settings_yaml: str, ckpt: str, device: torch.device):
     config = configuration.load_config(settings_yaml)
     config.model.visualize = False
@@ -26,40 +103,33 @@ def load_model(settings_yaml: str, ckpt: str, device: torch.device):
     return model
 
 
-def build_val_metrics():
+def build_val_metrics(ignore_background: bool = False):
+    kw = dict(pred_key="decoder_masks_hard", true_key="segmentations")
     return {
-        "ari": metric_lib.VideoARI(
-            ignore_background=False, pred_key="decoder_masks_hard", true_key="segmentations"
-        ),
+        "ari": metric_lib.VideoARI(ignore_background=ignore_background, **kw),
         "image_ari": metric_lib.ImageARI(
-            video_input=True,
-            ignore_background=False,
-            pred_key="decoder_masks_hard",
-            true_key="segmentations",
+            video_input=True, ignore_background=ignore_background, **kw
         ),
         "mbo": metric_lib.VideoIoU(
-            matching="overlap",
-            ignore_background=False,
-            pred_key="decoder_masks_hard",
-            true_key="segmentations",
+            matching="overlap", ignore_background=ignore_background, **kw
         ),
         "image_mbo": metric_lib.ImageIoU(
             matching="overlap",
             video_input=True,
-            ignore_background=False,
-            pred_key="decoder_masks_hard",
-            true_key="segmentations",
+            ignore_background=ignore_background,
+            **kw,
         ),
     }
 
 
 @torch.no_grad()
-def score_and_masks(model, batch, device):
+def score_and_masks(model, batch, device, ignore_background: bool = False):
     batch_dev = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-    outputs = model.forward(batch_dev, train=False, cycle=True)
+    cycle = getattr(model, "cyclic_inference", True)
+    outputs = model.forward(batch_dev, train=False, cycle=cycle)
     aux = model.aux_forward(batch_dev, outputs)
     scores = {}
-    for name, metric in build_val_metrics().items():
+    for name, metric in build_val_metrics(ignore_background).items():
         metric = metric.to(device)
         metric.reset()
         metric.update(**batch_dev, **outputs, **aux)
@@ -121,7 +191,14 @@ def hstack_labeled(frame_lists, labels) -> list[np.ndarray]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="/workspace/dataset")
-    ap.add_argument("--out-dir", default="logs/vis_v10_loses_to_baseline")
+    ap.add_argument("--method", default="v10", help="attn-mass run tag, e.g. v10 or v26")
+    ap.add_argument(
+        "--dataset",
+        default="ytvis",
+        choices=("ytvis", "movi_c"),
+        help="ytvis uses logs/_ytvis; movi_c uses official SlotCurri checkpoints/movi_c.ckpt",
+    )
+    ap.add_argument("--out-dir", default=None)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--max-samples", type=int, default=0, help="0 = full val")
     ap.add_argument("--top-k", type=int, default=20, help="visualize worst K by loss score")
@@ -129,31 +206,27 @@ def main():
         "--min-dari",
         type=float,
         default=0.05,
-        help="also keep if baseline_ari - v10_ari >= this",
+        help="also keep if baseline_ari - method_ari >= this",
     )
     ap.add_argument(
         "--min-dmbo",
         type=float,
         default=0.05,
-        help="also keep if baseline_mbo - v10_mbo >= this",
+        help="also keep if baseline_mbo - method_mbo >= this",
     )
     ap.add_argument("--frame-stride", type=int, default=2)
     args = ap.parse_args()
 
-    root = Path("/workspace/SlotCurri")
-    if not (root / "slotcurri").exists():
-        root = Path("/mnt/ssd2/hmlee/SlotCurri")
-
-    base_settings = root / "logs/_ytvis/settings/slotcurri/settings.yaml"
-    base_ckpt = root / "logs/_ytvis/checkpoints/slotcurri_step=step=100000-v1.ckpt"
-    v10_settings = root / "logs/_ytvis_attnmass_v10/settings/slotcurri/settings.yaml"
-    v10_ckpt = root / "logs/_ytvis_attnmass_v10/checkpoints/slotcurri_step=step=100000-v1.ckpt"
+    method = args.method
+    root = project_root()
+    spec = resolve_run(root, method, args.dataset)
+    ign_bg = spec["ignore_background"]
+    out_dir = root / (args.out_dir or f"logs/vis_{spec['out_stem']}_loses_to_baseline")
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    out_dir = root / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = configuration.load_config(str(base_settings))
+    cfg = configuration.load_config(str(spec["data_settings"]))
     cfg.dataset.num_val_workers = 0
     cfg.dataset.val_batch_size = 1
     dm = data.build(cfg.dataset, data_dir=args.data_dir)
@@ -161,8 +234,15 @@ def main():
     loader = dm.val_dataloader()
 
     print("Loading models...")
-    base = load_model(str(base_settings), str(base_ckpt), device)
-    v10 = load_model(str(v10_settings), str(v10_ckpt), device)
+    print(f"  dataset={spec['dataset']} baseline={spec['baseline_name']} {spec['baseline_ckpt']}")
+    print(f"  method={method} ckpt={spec['method_ckpt']}")
+    print(f"  ignore_background={ign_bg}")
+    base = load_model(str(spec["baseline_settings"]), str(spec["baseline_ckpt"]), device)
+    meth = load_model(str(spec["method_settings"]), str(spec["method_ckpt"]), device)
+    print(
+        f"  baseline cycle={getattr(base, 'cyclic_inference', True)}  "
+        f"{method} cycle={getattr(meth, 'cyclic_inference', True)}"
+    )
 
     rows = []
     # keep CPU tensors for later viz of losers only (masks can be large — recompute for top-k)
@@ -170,11 +250,11 @@ def main():
     for si, batch in enumerate(loader):
         if args.max_samples and si >= args.max_samples:
             break
-        sb, _ = score_and_masks(base, batch, device)
-        sv, _ = score_and_masks(v10, batch, device)
+        sb, _ = score_and_masks(base, batch, device, ign_bg)
+        sv, _ = score_and_masks(meth, batch, device, ign_bg)
         dari = sb["ari"] - sv["ari"]
         dmbo = sb["mbo"] - sv["mbo"]
-        # positive = baseline better / v10 loses
+        # positive = baseline better / method loses
         loss_score = max(0.0, dari) + max(0.0, dmbo)
         row = {
             "sample": si,
@@ -182,15 +262,15 @@ def main():
             "baseline_mbo": sb["mbo"],
             "baseline_image_ari": sb["image_ari"],
             "baseline_image_mbo": sb["image_mbo"],
-            "v10_ari": sv["ari"],
-            "v10_mbo": sv["mbo"],
-            "v10_image_ari": sv["image_ari"],
-            "v10_image_mbo": sv["image_mbo"],
+            f"{method}_ari": sv["ari"],
+            f"{method}_mbo": sv["mbo"],
+            f"{method}_image_ari": sv["image_ari"],
+            f"{method}_image_mbo": sv["image_mbo"],
             "d_ari": dari,
             "d_mbo": dmbo,
             "loss_score": loss_score,
-            "v10_loses_ari": dari >= args.min_dari,
-            "v10_loses_mbo": dmbo >= args.min_dmbo,
+            f"{method}_loses_ari": dari >= args.min_dari,
+            f"{method}_loses_mbo": dmbo >= args.min_dmbo,
         }
         rows.append(row)
         if (si + 1) % 10 == 0:
@@ -207,7 +287,7 @@ def main():
     thresh = [
         r
         for r in rows
-        if r["v10_loses_ari"] or r["v10_loses_mbo"]
+        if r[f"{method}_loses_ari"] or r[f"{method}_loses_mbo"]
     ]
     thresh_sorted = sorted(thresh, key=lambda r: -r["loss_score"])
     # also take global top-k by loss_score (even if below threshold) to fill
@@ -226,11 +306,16 @@ def main():
 
     summary = {
         "n_val": len(rows),
-        "n_lose_ari_ge": sum(1 for r in rows if r["v10_loses_ari"]),
-        "n_lose_mbo_ge": sum(1 for r in rows if r["v10_loses_mbo"]),
+        "method": method,
+        "dataset": spec["dataset"],
+        "baseline": spec["baseline_name"],
+        "baseline_ckpt": str(spec["baseline_ckpt"]),
+        "ignore_background": ign_bg,
+        "n_lose_ari_ge": sum(1 for r in rows if r[f"{method}_loses_ari"]),
+        "n_lose_mbo_ge": sum(1 for r in rows if r[f"{method}_loses_mbo"]),
         "n_lose_either": len(thresh),
-        "mean_d_ari": float(np.mean([r["d_ari"] for r in rows])),
-        "mean_d_mbo": float(np.mean([r["d_mbo"] for r in rows])),
+        "mean_d_ari": float(np.nanmean([r["d_ari"] for r in rows])),
+        "mean_d_mbo": float(np.nanmean([r["d_mbo"] for r in rows])),
         "chosen_samples": [r["sample"] for r in chosen],
         "thresholds": {"min_dari": args.min_dari, "min_dmbo": args.min_dmbo, "top_k": args.top_k},
     }
@@ -251,8 +336,8 @@ def main():
             f"viz sample {si}: dARI={meta['d_ari']:+.3f} dMBO={meta['d_mbo']:+.3f} "
             f"loss={meta['loss_score']:.3f}"
         )
-        _, masks_b = score_and_masks(base, batch, device)
-        _, masks_v = score_and_masks(v10, batch, device)
+        _, masks_b = score_and_masks(base, batch, device, ign_bg)
+        _, masks_v = score_and_masks(meth, batch, device, ign_bg)
         video = to_uint8_video(batch["video"])
         spatial = video.shape[-2:]
 
@@ -268,29 +353,21 @@ def main():
             overlays["gt"] = overlay(video, gt)
 
         overlays["baseline"] = overlay(video, prep_masks(masks_b, spatial))
-        overlays["v10"] = overlay(video, prep_masks(masks_v, spatial))
+        overlays[method] = overlay(video, prep_masks(masks_v, spatial))
 
         labels = [
             "gt",
-            f"baseline ARI={meta['baseline_ari']:.3f} mBO={meta['baseline_mbo']:.3f}",
-            f"v10 ARI={meta['v10_ari']:.3f} mBO={meta['v10_mbo']:.3f}  "
+            f"{spec['baseline_name']} ARI={meta['baseline_ari']:.3f} mBO={meta['baseline_mbo']:.3f}",
+            f"{method} ARI={meta[f'{method}_ari']:.3f} mBO={meta[f'{method}_mbo']:.3f}  "
             f"dARI={meta['d_ari']:+.3f} dMBO={meta['d_mbo']:+.3f}",
         ]
-        order = ["gt", "baseline", "v10"]
+        order = ["gt", "baseline", method]
         frames = hstack_labeled([overlays[k] for k in order], labels)
         frames = frames[:: max(args.frame_stride, 1)]
-        mid = frames[len(frames) // 2]
-        rank = sorted(want).index(si) if False else None
         # rank by loss among chosen
         rank_i = next(i for i, r in enumerate(chosen) if r["sample"] == si)
         stem = f"rank{rank_i:02d}_sample{si:03d}_dARI{meta['d_ari']:+.3f}_dMBO{meta['d_mbo']:+.3f}"
-        Image.fromarray(mid).save(out_dir / f"{stem}_mid.png")
-        try:
-            import imageio
-
-            imageio.mimsave(out_dir / f"{stem}.gif", frames, fps=4)
-        except Exception as e:
-            print("gif skip:", e)
+        save_clip(frames, out_dir / stem)
 
     # compact table of chosen
     table_path = out_dir / "losers_table.csv"

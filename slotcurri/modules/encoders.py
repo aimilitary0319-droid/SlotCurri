@@ -162,56 +162,105 @@ class FeatureSmoothing(nn.Module):
 
 
 class NcutRelationalLeveling(nn.Module):
-    """2-way Ncut barrier + region-constrained global leveling (v36 task curriculum).
+    """ReLU-cosine graph leveling, optionally with a 2-way Ncut region barrier.
 
     Frozen DINO tokens x (B, N, D) become a cosine graph
 
         Z = x / ||x||,   W = ReLU(Z Z^T),   W_ii = 0
 
-    The symmetric normalized Laplacian L = I - D^{-1/2} W D^{-1/2} is decomposed
-    with `eigh`; the Fiedler vector (second-smallest eigenvalue, index 1) is split
-    at the per-frame median into two coarse regions r in {0, 1}. Affinity across
-    regions is zeroed, the remaining graph is row-normalized, and
+    Then x_rel = P x with P the row-normalized affinity. `barrier=True` (v36) first
+    takes the Fiedler vector of L = I - D^{-1/2} W D^{-1/2}, median-cuts into two
+    regions, and zeros W across the cut so leveling cannot mix the parts.
+    `barrier=False` (v37) skips that cut: P is global on W, same mix / Key-only
+    schedule as v36.
 
-        x_rel = P x
-
-    globally levels tokens inside each region while blocking mix across the cut.
-    Isolated rows (no remaining neighbours) keep the original token.
+    The Fiedler is batched subspace iteration (k=2) plus a 2x2 Rayleigh-Ritz, not
+    a full `eigh`. Isolated rows keep the original token.
 
     Same mix convention as FeatureSmoothing: mix=0 is fully leveled (X^rel),
     mix=1 is raw (identity). P / Ncut run under no_grad; the module has no
-    parameters. `chunk_size` bounds the (N, N) eigenproblem, not the math.
+    parameters. `chunk_size` bounds the (N, N) work, not the math.
     """
 
-    def __init__(self, chunk_size: int = 8, eps: float = 1e-6):
+    def __init__(
+        self,
+        chunk_size: int = 8,
+        eps: float = 1e-6,
+        n_iter: int = 16,
+        barrier: bool = True,
+    ):
         super().__init__()
         self.chunk_size = max(int(chunk_size), 1)
         self.eps = float(eps)
+        self.n_iter = max(int(n_iter), 1)
+        self.barrier = bool(barrier)
+
+    def _fiedler(self, w_norm: torch.Tensor) -> torch.Tensor:
+        """2nd-largest eigenvector of W_norm (Fiedler of L = I - W_norm).
+
+        Batched subspace iteration on k=2, then Rayleigh-Ritz. Deterministic
+        init (constant + linspace) so chunking is bit-stable.
+        """
+        bsz, n_tokens, _ = w_norm.shape
+        ones = torch.ones(bsz, n_tokens, 1, device=w_norm.device, dtype=w_norm.dtype)
+        grid = torch.linspace(-1.0, 1.0, n_tokens, device=w_norm.device, dtype=w_norm.dtype)
+        x = torch.cat([ones, grid.view(1, n_tokens, 1).expand(bsz, -1, -1)], dim=-1)
+        for _ in range(self.n_iter):
+            x, _ = torch.linalg.qr(torch.bmm(w_norm, x))
+        rax = torch.bmm(x.transpose(1, 2), torch.bmm(w_norm, x))
+        rax = 0.5 * (rax + rax.transpose(1, 2))
+        _, evecs = torch.linalg.eigh(rax)  # ascending: col 0 = smaller = Fiedler
+        return torch.bmm(x, evecs)[:, :, 0]
+
+    @torch.no_grad()
+    def explain(self, x: torch.Tensor) -> dict:
+        """Same mix=0 graph as training. Returns rel, region, v2. x: (B, N, D)."""
+        rels, regions, v2s = [], [], []
+        for i in range(0, x.shape[0], self.chunk_size):
+            rel, region, v2 = self._graph_chunk(x[i : i + self.chunk_size])
+            rels.append(rel.to(dtype=x.dtype))
+            regions.append(region)
+            v2s.append(v2.to(dtype=x.dtype))
+        return {
+            "rel": torch.cat(rels, dim=0),
+            "region": torch.cat(regions, dim=0),
+            "v2": torch.cat(v2s, dim=0),
+        }
+
+    @torch.no_grad()
+    def _graph_chunk(self, x: torch.Tensor):
+        # AMP would downcast bmm/qr to fp16; CUDA geqrf has no Half kernel.
+        with torch.cuda.amp.autocast(enabled=False):
+            x = x.float()
+            z = torch.nn.functional.normalize(x, dim=-1)
+            w = torch.bmm(z, z.transpose(1, 2)).clamp_min(0.0)
+            w.diagonal(dim1=-2, dim2=-1).zero_()
+
+            if self.barrier:
+                degree = w.sum(dim=-1).clamp_min(self.eps)
+                d_inv_sqrt = degree.rsqrt()
+                w_norm = d_inv_sqrt.unsqueeze(-1) * w * d_inv_sqrt.unsqueeze(-2)
+                v2 = self._fiedler(w_norm)
+                threshold = v2.median(dim=-1, keepdim=True).values
+                region = v2 >= threshold  # (B, N)
+                same = region.unsqueeze(-1) == region.unsqueeze(-2)
+                w_tilde = w.masked_fill(~same, 0.0)
+            else:
+                # v37: same W / P / mix as v36, no 2-way region. One region, v2 unused.
+                v2 = torch.zeros(x.shape[:2], device=x.device, dtype=x.dtype)
+                region = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+                w_tilde = w
+
+            row = w_tilde.sum(dim=-1, keepdim=True)
+            p = w_tilde / row.clamp_min(self.eps)
+            rel = torch.bmm(p, x)
+            rel = torch.where(row < self.eps, x, rel)
+            return rel, region, v2
 
     @torch.no_grad()
     def _level_chunk(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, N, D) float32
-        z = torch.nn.functional.normalize(x, dim=-1)
-        w = torch.bmm(z, z.transpose(1, 2)).clamp_min(0.0)
-        w.diagonal(dim1=-2, dim2=-1).zero_()
-
-        degree = w.sum(dim=-1).clamp_min(self.eps)
-        d_inv_sqrt = degree.rsqrt()
-        w_norm = d_inv_sqrt.unsqueeze(-1) * w * d_inv_sqrt.unsqueeze(-2)
-        n_tokens = x.shape[1]
-        eye = torch.eye(n_tokens, device=x.device, dtype=x.dtype).unsqueeze(0)
-        laplacian = eye - w_norm
-        _, eigvecs = torch.linalg.eigh(laplacian)
-        v2 = eigvecs[:, :, 1]
-        threshold = v2.median(dim=-1, keepdim=True).values
-        region = v2 >= threshold  # (B, N)
-
-        same = region.unsqueeze(-1) == region.unsqueeze(-2)
-        w_tilde = w.masked_fill(~same, 0.0)
-        row = w_tilde.sum(dim=-1, keepdim=True)
-        p = w_tilde / row.clamp_min(self.eps)
-        rel = torch.bmm(p, x)
-        return torch.where(row < self.eps, x, rel)
+        rel, _, _ = self._graph_chunk(x)
+        return rel
 
     @torch.no_grad()
     def _level(self, x: torch.Tensor) -> torch.Tensor:
@@ -370,11 +419,11 @@ class FrameEncoder(nn.Module):
         self.spatial_flatten = spatial_flatten
         self.main_features_key = main_features_key
         # v33 feature curriculum: optional affinity smoothing of the backbone tokens,
-        # attached post-build by the model. It runs BEFORE the features/backbone_features
-        # split, so the grouper input and the reconstruction target both derive from the
-        # smoothed tensor. `feature_smoothing_mix` follows the model's schedule
-        # (0 = fully smoothed, 1 = raw); only active in train() mode, so validation and
-        # eval always see raw features.
+        # attached post-build by the model. With apply=tokens it runs BEFORE the
+        # features/backbone_features split, so grouper and recon target both derive
+        # from the smoothed tensor. apply=key (v36/v37) leaves the target raw and
+        # only feeds the bind tensor to Keys. Mix 0 = fully coarsened, 1 = raw;
+        # train()-only, so validation and eval always see raw features.
         self.feature_smoothing: Optional[nn.Module] = None
         self.feature_smoothing_mix: float = 1.0
         # v35 modes curriculum: attached post-build like FeatureSmoothing. Cover is
@@ -384,16 +433,17 @@ class FrameEncoder(nn.Module):
         # v36 Ncut leveling: attached post-build. Mix 0 = fully leveled, 1 = raw.
         # `feature_curriculum_apply == "key"` keeps the reconstruction target (and the
         # Value path) on the original tokens and only feeds the bind tensor to Keys.
+        # v37 uses the same Key-only split with Ncut leveling, barrier=false.
         self.feature_ncut: Optional[nn.Module] = None
         self.feature_ncut_mix: float = 1.0
         self.feature_curriculum_apply: str = "tokens"
 
-    def _apply_feature_curriculum_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Train-only token cover / smooth. Eval and mix=1 skip this."""
-        if not self.training:
+    def _curriculum_bind(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Train-only coarsened tokens (X^bind). Eval and mix=1 skip this."""
+        if not self.training or tokens.ndim != 3:
             return tokens
-        if tokens.ndim != 3:
-            return tokens
+        if self.feature_ncut is not None and self.feature_ncut_mix < 1.0:
+            return self.feature_ncut(tokens, self.feature_ncut_mix)
         if self.feature_modes is not None and self.feature_modes_mix < 1.0:
             return self.feature_modes(tokens, self.feature_modes_mix)
         if self.feature_smoothing is not None and self.feature_smoothing_mix < 1.0:
@@ -405,24 +455,16 @@ class FrameEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """(tokens used as recon target / Value, tokens used as Key).
 
-        v33/v34/v35 (`apply=tokens`): both sides are the curriculumed tensor.
-        v36 (`apply=key`): target/Value stay raw; Key gets Ncut-leveled mix.
-        Eval and mix=1 leave both as the original tokens.
+        `apply=tokens` (v33/v34/v35): both sides are the curriculumed tensor.
+        `apply=key` (v36/v37 Ncut mix): target/Value stay raw; Key gets
+        the mixed bind tensor. Eval and mix=1 leave both as the original tokens.
         """
         if tokens.ndim != 3:
             return tokens, tokens
-        key_only = str(self.feature_curriculum_apply).lower() == "key"
-        if (
-            self.training
-            and self.feature_ncut is not None
-            and self.feature_ncut_mix < 1.0
-        ):
-            bind = self.feature_ncut(tokens, self.feature_ncut_mix)
-            if key_only:
-                return tokens, bind
-            return bind, bind
-        used = self._apply_feature_curriculum_tokens(tokens)
-        return used, used
+        bind = self._curriculum_bind(tokens)
+        if str(self.feature_curriculum_apply).lower() == "key":
+            return tokens, bind
+        return bind, bind
 
     def _project_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         features = tokens.clone()
@@ -478,6 +520,8 @@ class FrameEncoder(nn.Module):
             }
         if features_key is not None:
             out["features_key"] = features_key
+            # DINO-dim X^bind for spectral purity; projected Keys are features_key.
+            out["backbone_key"] = key_tokens
         return out
 
 
