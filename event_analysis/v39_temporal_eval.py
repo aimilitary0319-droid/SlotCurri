@@ -5,6 +5,7 @@ Runs (no retraining):
   gated_single     reported setting: π gate on decoder + temporal mix, cycle=False
   gated_last       SlotCurri cyclic: backward sweep from last frame
   gated_evidence   EABI, anchor = argmax_t sum_s g * ownership-c
+  gated_evidence_sum  EABI, anchor = argmax_t sum_s g  (no extra c)
   ungated_single   predictor_ungated=True (decoder still sees π), cycle=False
   ungated_last     predictor_ungated=True + cyclic
 
@@ -29,6 +30,7 @@ RUNS = {
     "gated_single": {"cycle": False, "ungated": False},
     "gated_last": {"cycle": True, "ungated": False},
     "gated_evidence": {"cycle": "evidence", "ungated": False},
+    "gated_evidence_sum": {"cycle": "evidence_sum", "ungated": False},
     "ungated_single": {"cycle": False, "ungated": True},
     "ungated_last": {"cycle": True, "ungated": True},
     # Temporal-mix only (decoder keeps instantaneous π):
@@ -44,6 +46,19 @@ RUNS = {
     "hyst95_single": {"cycle": False, "ungated": False, "hyst": 0.95},
     "hyst85_evidence": {"cycle": "evidence", "ungated": False, "hyst": 0.85},
     "hyst95_evidence": {"cycle": "evidence", "ungated": False, "hyst": 0.95},
+    # Decoder keeps π; temporal mix uses n8 λ1 or attention mass (eval-only).
+    "temp_l1": {"cycle": False, "ungated": False, "state_conf": "lambda1"},
+    "temp_mass": {"cycle": False, "ungated": False, "state_conf": "mass"},
+    # Eval-only hard π (purity_weight ignores gate_mode). Training yaml stays 0.
+    "hard50_single": {"cycle": False, "ungated": False, "hard_thresh": 0.5},
+    "hard50_last": {"cycle": True, "ungated": False, "hard_thresh": 0.5},
+    # Occupancy mix on Pred / next prior only (decoder still u^SA):
+    #   u_t = π̄ u^SA + (1-π̄) û_t
+    #   û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
+    "umix_single": {"cycle": False, "ungated": False, "umix": True},
+    # Eval-only decoder Perron readout: m_s,i = softmax(α) π_s q̃_{1,s,i}.
+    # Mix / Pred keep scalar π. q1 is max-normed so occupancy stays in π.
+    "perron_single": {"cycle": False, "ungated": False, "perron": True},
 }
 
 
@@ -74,23 +89,38 @@ def run_one(
     hyst: float = 0.0,
     ema: float = 1.0,
     hold: float = 0.0,
+    state_conf: str = "",
+    hard_thresh: float = 0.0,
+    umix: bool = False,
+    perron: bool = False,
 ) -> Dict[str, Any]:
     model.amc_predictor_ungated = bool(ungated)
+    model.amc_predictor_input_mix = bool(umix)
     model.amc_gate_hysteresis = float(hyst)
     model.amc_state_gate_ema = float(ema)
     model.amc_state_gate_hold = float(hold)
+    model.amc_eval_hard_thresh = float(hard_thresh)
+    model.amc_eval_perron_readout = bool(perron)
+    sk = str(state_conf or "").lower()
+    if sk == "l1":
+        sk = "lambda1"
+    model.amc_state_conf_kind = "" if sk in ("", "pi") else sk
     built = {name: metrics.build(cfg).to(device) for name, cfg in metric_cfgs.items()}
     for m in built.values():
         m.reset()
 
     per_clip_ari: List[float] = []
     per_clip_iari: List[float] = []
+    per_clip_mbo: List[float] = []
     n_clips = 0
     clip_ari = metrics.build(metric_cfgs["ari"]).to(device)
     clip_iari = (
         metrics.build(metric_cfgs["image_ari"]).to(device)
         if "image_ari" in metric_cfgs
         else None
+    )
+    clip_mbo = (
+        metrics.build(metric_cfgs["mbo"]).to(device) if "mbo" in metric_cfgs else None
     )
 
     for batch in loader:
@@ -120,6 +150,10 @@ def run_one(
                 clip_iari.reset()
                 clip_iari.update(**clip_kw)
                 per_clip_iari.append(_metric_to_float(clip_iari.compute()))
+            if clip_mbo is not None:
+                clip_mbo.reset()
+                clip_mbo.update(**clip_kw)
+                per_clip_mbo.append(_metric_to_float(clip_mbo.compute()))
 
         n_clips += bsz
         if n_clips % 16 == 0 or n_clips >= max_clips:
@@ -133,6 +167,7 @@ def run_one(
         "n_clips": n_clips,
         "per_clip_ari": per_clip_ari,
         "per_clip_image_ari": per_clip_iari,
+        "per_clip_mbo": per_clip_mbo,
     }
 
 
@@ -184,7 +219,8 @@ def main() -> None:
         print(
             f"\n=== {name}  cycle={spec['cycle']!r}  ungated={spec['ungated']}  "
             f"ema={spec.get('ema', 1.0)}  hold={spec.get('hold', 0.0)}  "
-            f"hyst={spec.get('hyst', 0.0)} ===",
+            f"hyst={spec.get('hyst', 0.0)}  hard_thresh={spec.get('hard_thresh', 0.0)}  "
+            f"umix={spec.get('umix', False)}  perron={spec.get('perron', False)} ===",
             flush=True,
         )
         # new loader each run so every condition sees the same clip order
@@ -200,6 +236,10 @@ def main() -> None:
             hyst=spec.get("hyst", 0.0),
             ema=spec.get("ema", 1.0),
             hold=spec.get("hold", 0.0),
+            state_conf=spec.get("state_conf", ""),
+            hard_thresh=spec.get("hard_thresh", 0.0),
+            umix=spec.get("umix", False),
+            perron=spec.get("perron", False),
         )
         agg = all_runs[name]["agg"]
         n = all_runs[name]["n_clips"]
@@ -240,10 +280,22 @@ def main() -> None:
             n = min(len(a_ref), len(a))
             d = a[:n] - a_ref[:n]
             print(
-                f"  {name} - {ref}: mean {d.mean():+.4f}  "
+                f"  {name} - {ref} ARI: mean {d.mean():+.4f}  "
                 f"median {np.median(d):+.4f}  "
-                f"improved {(d > 0).mean():.1%}  worsened {(d < 0).mean():.1%}"
+                f"improved {(d > 1e-6).mean():.1%}  worsened {(d < -1e-6).mean():.1%}  "
+                f"tied {(np.abs(d) <= 1e-6).mean():.1%}"
             )
+            m_ref = np.asarray(all_runs[ref].get("per_clip_mbo") or [])
+            m = np.asarray(all_runs[name].get("per_clip_mbo") or [])
+            if len(m_ref) and len(m):
+                nm = min(len(m_ref), len(m))
+                dm = m[:nm] - m_ref[:nm]
+                print(
+                    f"  {name} - {ref} mBO: mean {dm.mean():+.4f}  "
+                    f"median {np.median(dm):+.4f}  "
+                    f"improved {(dm > 1e-6).mean():.1%}  worsened {(dm < -1e-6).mean():.1%}  "
+                    f"tied {(np.abs(dm) <= 1e-6).mean():.1%}"
+                )
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     payload = {
@@ -259,6 +311,9 @@ def main() -> None:
                 "ema": RUNS[name].get("ema", 1.0),
                 "hold": RUNS[name].get("hold", 0.0),
                 "hyst": RUNS[name].get("hyst", 0.0),
+                "state_conf": RUNS[name].get("state_conf", ""),
+                "umix": bool(RUNS[name].get("umix", False)),
+                "perron": bool(RUNS[name].get("perron", False)),
                 "n_clips": all_runs[name]["n_clips"],
                 "agg": all_runs[name]["agg"],
             }
@@ -275,6 +330,10 @@ def main() -> None:
         },
         **{
             f"{name}_image_ari": np.asarray(all_runs[name]["per_clip_image_ari"])
+            for name in args.runs
+        },
+        **{
+            f"{name}_mbo": np.asarray(all_runs[name]["per_clip_mbo"])
             for name in args.runs
         },
     )

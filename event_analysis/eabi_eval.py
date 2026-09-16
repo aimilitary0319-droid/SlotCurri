@@ -8,13 +8,15 @@ sweep backward from that anchor, and keeps the forward outputs from the anchor o
 cyclic inference (backward sweep anchored at the LAST frame) is the special case
 anchor = T-1, so it is the natural ablation baseline for anchor *selection*.
 
-Five protocols, one row each:
+Six protocols, one row each:
   single     cycle=False            standard forward pass (v26's reported setting)
   last       cycle=True             legacy cyclic inference (fixed anchor = last frame)
   evidence   cycle="evidence"       EABI, anchor = argmax_t sum_s g*c (purity-weighted
                                     soft object count: "most objects intactly bound")
   ev_mass    cycle="evidence_mass"  EABI, anchor = argmax_t sum_s g*m (trusted mass
                                     share) -- A/B variant of the anchor statistic
+  ev_sum     cycle="evidence_sum"   EABI, anchor = argmax_t sum_s g (gate occupancy
+                                    only; no extra c / m). Default for v39lam1gu.
   random     cycle="random"         EABI with a uniform random anchor -- controls
                                     whether evidence-based selection (not just
                                     re-sweeping from *somewhere*) is what helps
@@ -45,6 +47,7 @@ PROTOCOLS = {
     "last": True,
     "evidence": "evidence",
     "ev_mass": "evidence_mass",
+    "ev_sum": "evidence_sum",
     "random": "random",
 }
 
@@ -147,7 +150,7 @@ def main():
     # --- paired per-clip comparison (video ARI) ---
     per_clip = {p: np.asarray(records[p]) for p in args.protocols}
     if "evidence" in per_clip:
-        for base in ("single", "last", "ev_mass", "random"):
+        for base in ("single", "last", "ev_mass", "ev_sum", "random"):
             if base not in per_clip:
                 continue
             d = per_clip["evidence"] - per_clip[base]
@@ -155,10 +158,19 @@ def main():
                 f"\nevidence vs {base:>8s}: mean {d.mean():+.4f}  median {np.median(d):+.4f}"
                 f"  improved {(d > 0).mean():.1%}  worsened {(d < 0).mean():.1%}"
             )
+    if "ev_sum" in per_clip:
+        for base in ("single", "last"):
+            if base not in per_clip:
+                continue
+            d = per_clip["ev_sum"] - per_clip[base]
+            print(
+                f"\nev_sum vs {base:>8s}: mean {d.mean():+.4f}  median {np.median(d):+.4f}"
+                f"  improved {(d > 0).mean():.1%}  worsened {(d < 0).mean():.1%}"
+            )
 
     # --- anchor statistics ---
     anchor_fracs = {}
-    for proto in ("evidence", "ev_mass"):
+    for proto in ("evidence", "ev_mass", "ev_sum"):
         if proto in anchors and len(anchors[proto]):
             a = np.asarray(anchors[proto], dtype=np.float64)
             t = seq_lens[: len(a)].astype(np.float64)
@@ -176,7 +188,15 @@ def main():
             f"anchor agreement (count vs mass): same frame {(a1[:n] == a2[:n]).mean():.1%}"
             f"  mean |diff| {np.abs(a1[:n] - a2[:n]).mean():.1f} frames"
         )
-    anchor_frac = anchor_fracs.get("evidence")
+    if "evidence" in anchor_fracs and "ev_sum" in anchor_fracs:
+        a1 = np.asarray(anchors["evidence"], dtype=np.float64)
+        a2 = np.asarray(anchors["ev_sum"], dtype=np.float64)
+        n = min(len(a1), len(a2))
+        print(
+            f"anchor agreement (g*c vs sum g): same frame {(a1[:n] == a2[:n]).mean():.1%}"
+            f"  mean |diff| {np.abs(a1[:n] - a2[:n]).mean():.1f} frames"
+        )
+    anchor_frac = anchor_fracs.get("ev_sum") or anchor_fracs.get("evidence")
 
     # --- save ---
     np.savez_compressed(
@@ -193,7 +213,9 @@ def main():
     ax.bar(
         args.protocols,
         vals,
-        color=["gray", "tab:orange", "tab:green", "tab:blue", "tab:red"][: len(vals)],
+        color=["gray", "tab:orange", "tab:green", "tab:blue", "tab:purple", "tab:red"][
+            : len(vals)
+        ],
     )
     for i, v in enumerate(vals):
         ax.text(i, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9)
@@ -202,7 +224,11 @@ def main():
 
     ax = axes[1]
     if anchor_fracs:
-        for proto, color in (("evidence", "tab:green"), ("ev_mass", "tab:blue")):
+        for proto, color in (
+            ("evidence", "tab:green"),
+            ("ev_mass", "tab:blue"),
+            ("ev_sum", "tab:purple"),
+        ):
             if proto in anchor_fracs:
                 ax.hist(
                     anchor_fracs[proto], bins=20, range=(0, 1), color=color,
@@ -213,13 +239,22 @@ def main():
         ax.legend()
 
     ax = axes[2]
-    if anchor_frac is not None and "evidence" in per_clip and "single" in per_clip:
-        d = per_clip["evidence"] - per_clip["single"]
-        ax.scatter(anchor_frac, d[: len(anchor_frac)], s=12, alpha=0.6, color="tab:green")
-        ax.axhline(0.0, color="k", lw=1, ls="--")
-        ax.set_xlabel("anchor position (fraction of clip)")
-        ax.set_ylabel("ARI delta (evidence - single)")
-        ax.set_title("per-clip gain vs anchor position")
+    if anchor_frac is not None and "single" in per_clip:
+        if "ev_sum" in per_clip:
+            d = per_clip["ev_sum"] - per_clip["single"]
+            label = "ev_sum - single"
+        elif "evidence" in per_clip:
+            d = per_clip["evidence"] - per_clip["single"]
+            label = "evidence - single"
+        else:
+            d = None
+            label = ""
+        if d is not None:
+            ax.scatter(anchor_frac, d[: len(anchor_frac)], s=12, alpha=0.6, color="tab:purple")
+            ax.axhline(0.0, color="k", lw=1, ls="--")
+            ax.set_xlabel("anchor position (fraction of clip)")
+            ax.set_ylabel(f"ARI delta ({label})")
+            ax.set_title("per-clip gain vs anchor position")
 
     fig.suptitle(os.path.basename(args.ckpt))
     fig.tight_layout()

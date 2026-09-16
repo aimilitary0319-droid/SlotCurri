@@ -8,6 +8,7 @@ With a stub recurrent cell whose gate/attention depend on the inputs, checks tha
   4. frames < anchor match a hand-rolled backward sweep from the anchor
   5. cycle=True (legacy last-frame cycle) matches a hand-rolled reference (regression)
   6. cycle="random" runs and records in-range anchors
+  7. cycle="evidence_sum" uses sum_s g and disagrees with g*c when they should
 
 Run (CPU is fine):
   python event_analysis/eabi_smoke_test.py
@@ -103,8 +104,12 @@ def main():
         inputs[0, t] += 1.0 if t < 5 else -2.0
         inputs[1, t] += 0.5
 
-    # --- 1/2/3/4: both anchored modes, batched vs per-sample ---
-    for mode, stat in (("evidence", "count"), ("evidence_mass", "mass")):
+    # --- 1/2/3/4: anchored modes, batched vs per-sample ---
+    for mode, stat in (
+        ("evidence", "count"),
+        ("evidence_mass", "mass"),
+        ("evidence_sum", "sum"),
+    ):
         tree = scan(init, inputs, cycle=mode, mass_gamma=2.0)
         anchors = scan.last_anchor_frames
         assert anchors is not None and anchors.shape == (B,)
@@ -126,6 +131,25 @@ def main():
     a = scan.last_anchor_frames
     assert a[0].item() != a[1].item(), "test wants mixed anchors in the batch"
     print("anchored modes: batched == per-sample reference, post-anchor frames untouched")
+
+    # --- sum-g ignores ownership purity c (window=1 so smoothing cannot mix frames) ---
+    # Frame 0: g=1, diffuse A -> low c. Frame 1: g=0.1, one-hot A -> c=1.
+    # count (g*c) prefers t=1; sum (g only) prefers t=0.
+    outs_ab = []
+    for t in range(2):
+        if t == 0:
+            gate = torch.ones(1, S)
+            att = torch.ones(1, S, F_) / float(F_)
+        else:
+            gate = torch.full((1, S), 0.1)
+            att = torch.zeros(1, S, F_)
+            att[:, :, 0] = 1.0
+        outs_ab.append({"active_mask": gate, "state_attn_mask": att})
+    a_count = int(_evidence_anchors(outs_ab, 1.0, window=1, stat="count")[0].item())
+    a_sum = int(_evidence_anchors(outs_ab, 1.0, window=1, stat="sum")[0].item())
+    assert a_sum == 0, f"sum-g should pick high-g frame, got {a_sum}"
+    assert a_count == 1, f"g*c should pick high-c frame, got {a_count}"
+    print("evidence_sum: ignores c (picks sum g, not g*c)")
 
     # --- 5: legacy cycle regression ---
     tree_legacy = scan(init, inputs, cycle=True, mass_gamma=2.0)

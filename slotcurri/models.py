@@ -11,10 +11,15 @@ from torchvision.utils import make_grid
 from slotcurri import configuration, losses, modules, optimizers, utils, visualizations
 from slotcurri.data.transforms import Denormalize
 from slotcurri.modules.gate_p_residual import GatePResidualNet
+from slotcurri.modules.decoders import algebraic_slot_utility_loss
+from slotcurri.modules.usage_redistribute import usage_redistribute_direction
 from slotcurri.modules.video import (
+    SlotUsageHead,
     ownership_confidence,
     slot_confidence_entropy,
+    spectral_cs_impurity,
     spectral_graph_n8_impurity,
+    spectral_graph_n8_induced_impurity,
 )
 import torch.nn.functional as F
 import os
@@ -100,9 +105,28 @@ def build(
             model_config.target_encoder_input is not None
         ), "Please specify `target_encoder_input`."
 
+    uh_cfg = model_config.get("usage_head")
+    usage_head = None
+    if uh_cfg is not None and bool(uh_cfg.get("enabled", False)):
+        n_patches = uh_cfg.get("n_patches")
+        if n_patches is None:
+            raise ValueError("usage_head.enabled requires n_patches")
+        usage_head = SlotUsageHead(
+            n_patches=int(n_patches),
+            mlp_hidden=int(uh_cfg.get("mlp_hidden", 256)),
+            d_model=int(uh_cfg.get("d_model", 64)),
+            n_blocks=int(uh_cfg.get("n_blocks", 1)),
+            n_heads=int(uh_cfg.get("n_heads", 4)),
+            stopgrad_attn=bool(uh_cfg.get("stopgrad_attn", True)),
+            dropout=float(uh_cfg.get("dropout", 0.0)),
+            normalize=str(uh_cfg.get("normalize", "sigmoid")),
+        )
+
     input_type = model_config.get("input_type", "image")
     if input_type == "image":
-        processor = modules.LatentProcessor(grouper, predictor=None)
+        processor = modules.LatentProcessor(
+            grouper, predictor=None, usage_head=usage_head
+        )
     elif input_type == "video": # default input type
         encoder = modules.MapOverTime(encoder)
         decoder = modules.MapOverTime(decoder)
@@ -118,9 +142,12 @@ def build(
                 "LatentProcessor",
                 corrector=grouper,
                 predictor=predictor,
+                usage_head=usage_head,
             )
         else:
-            processor = modules.LatentProcessor(grouper, predictor)
+            processor = modules.LatentProcessor(
+                grouper, predictor, usage_head=usage_head
+            )
         processor = modules.ScanOverTime(processor)
     else:
         raise ValueError(f"Unknown input type {input_type}")
@@ -211,6 +238,8 @@ def build(
         slot_expansion=model_config.get("slot_expansion", True),
         feature_curriculum=model_config.get("feature_curriculum", None),
         slot_ent_impurity=model_config.get("slot_ent_impurity", None),
+        usage_head_config=model_config.get("usage_head", None),
+        slot_usage_redistribute=model_config.get("slot_usage_redistribute", None),
     )
 
     if model_config.load_weights:
@@ -251,11 +280,14 @@ class ObjectCentricModel(pl.LightningModule):
         slot_expansion: bool = True,
         feature_curriculum: Optional[Dict[str, Any]] = None,
         slot_ent_impurity: Optional[Dict[str, Any]] = None,
+        usage_head_config: Optional[Dict[str, Any]] = None,
+        slot_usage_redistribute: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         # bool: legacy on/off (backward sweep anchored at the last frame). A string
-        # selects the anchored re-inference variants in ScanOverTime ("evidence" = EABI,
-        # "random" = its control); eval scripts set this directly on a loaded model.
+        # selects the anchored re-inference variants in ScanOverTime ("evidence" = EABI
+        # with g*c, "evidence_sum" = EABI with sum_s g, "random" = its control); eval
+        # scripts set this directly on a loaded model.
         self.cyclic_inference = (
             cyclic_inference if isinstance(cyclic_inference, str) else bool(cyclic_inference)
         )
@@ -285,6 +317,9 @@ class ObjectCentricModel(pl.LightningModule):
         else:
             self.loss_fns = nn.ModuleDict(loss_fns)
             self.loss_weights = {}
+        # v39lam1gu: second featrec on the ungated softmax mix. Decoder
+        # computes both mixes in one MLP pass when this loss is present.
+        self.featrec_ungated = "loss_featrec_ungated" in self.loss_fns
 
         self.mask_resizers = mask_resizers if mask_resizers else {}
         self.mask_resizers["segmentation"] = modules.Resizer(
@@ -379,13 +414,53 @@ class ObjectCentricModel(pl.LightningModule):
         # its territory by at least the sample-mean per-patch error to live rent-free)
         self.util_margin = float(su.get("margin", 1.0))
         # candidates: slots the gate actually admits and with enough decoder-mask territory
-        # for delta to be measurable
+        # for delta to be measurable. Ignored by mode='algebraic' (all slots).
         self.util_gate_min = float(su.get("gate_min", 0.5))
         self.util_min_mask = float(su.get("min_mask", 0.01))
         self.util_ramp = str(su.get("ramp", "lambda")).lower()
         self.util_start_step = int(su.get("start_step", 0))
+        self.util_mode = str(su.get("mode", "drop")).lower()
         if self.util_ramp not in ("lambda", "none"):
             raise ValueError(f"slot_utility.ramp must be 'lambda' or 'none', got {self.util_ramp!r}")
+        if self.util_mode not in ("drop", "algebraic"):
+            raise ValueError(
+                f"slot_utility.mode must be 'drop' or 'algebraic', got {self.util_mode!r}"
+            )
+        # v44: drop Δ on ungated softmax(α) mix (z-free). Add restores a
+        # suppressed slot to its α-share: ŷ^{+s}=σ_s R_s+(1-σ_s)ŷ^{g,-s}
+        # on patches with σ_s > m_s. add: insert | off.
+        # v45 teacher='ce': L = CE(softmax(([Δ↓]_+ + [Δ↑]_+)/τ), z) instead of ⟨z,c⟩.
+        self.util_add_insert = self._util_add_insert_flag(su)
+        if "add_eps" in su or "add_below" in su:
+            raise ValueError(
+                "slot_utility.add_eps / add_below were removed; use add: insert"
+            )
+        teacher_raw = str(su.get("teacher", "rent")).strip().lower()
+        if teacher_raw in ("inner", "dot"):
+            teacher_raw = "rent"
+        if teacher_raw not in ("rent", "ce"):
+            raise ValueError(
+                f"slot_utility.teacher must be 'rent' or 'ce', got {su.get('teacher')!r}"
+            )
+        self.util_teacher = teacher_raw
+        self.util_ce_tau = float(su.get("ce_tau", su.get("tau", 0.5)))
+        if self.util_teacher == "ce" and self.util_ce_tau <= 0.0:
+            raise ValueError(
+                f"slot_utility.ce_tau must be > 0, got {self.util_ce_tau}"
+            )
+        # v44: 0.05 * (1 - ||z||^2). Slot-independent occupancy tax is constant on
+        # the simplex; this is the convex term that penalizes the uniform vertex.
+        # v45 leaves this at 0: the CE target already pulls z to uniform when Δ=0.
+        self.util_psi_weight = float(su.get("psi_weight", 0.0))
+        self._util_rel_add = None
+        self._util_c_mean = None
+        self._util_n_suppressed = None
+        self._util_pi_max = None
+        self._util_pi_entropy = None
+        if self.util_psi_weight < 0.0:
+            raise ValueError(
+                f"slot_utility.psi_weight must be >= 0, got {self.util_psi_weight}"
+            )
 
         # --- feature curriculum (v33): task-level coarse-to-fine ---
         # The backbone tokens are annealed from affinity-smoothed (object-level: within-
@@ -601,6 +676,15 @@ class ObjectCentricModel(pl.LightningModule):
         # If True, the predictor re-gate uses g / max(g) so the winning slot always advances
         # fully. Decoder still sees the raw gate (renorm-invariant).
         self.amc_state_max_norm = bool(amc.get("state_max_norm", False))
+        # Eval-only: after π is built, binarize decoder + temporal + Pred src-gate at
+        # π >= eval_hard_thresh. 0 disables (training / reported v39lam1gu). Applied
+        # only when train=False; purity_weight ignores gate_mode so this is the hard
+        # path for that form.
+        self.amc_eval_hard_thresh = float(amc.get("eval_hard_thresh", 0.0))
+        # Decoder Perron readout: m_s,i = softmax(α) π_s q̃_{1,s,i}. Mix / Pred
+        # keep scalar π. perron_readout: train+eval. eval_perron_readout: eval only.
+        self.amc_perron_readout = bool(amc.get("perron_readout", False))
+        self.amc_eval_perron_readout = bool(amc.get("eval_perron_readout", False))
         # π hysteresis (occlusion memory, v39h): the confidence statistic becomes the
         # leaky max π̃_t = max(π_t, γ π̃_{t-1}) with γ = gate_hysteresis in [0, 1).
         # A slot that was recently pure keeps its gate alive ~1/(1-γ) frames through a
@@ -617,11 +701,40 @@ class ObjectCentricModel(pl.LightningModule):
                 f"attn_mass_curriculum.gate_hysteresis must be in [0, 1), "
                 f"got {self.amc_gate_hysteresis}"
             )
+        # Decoder-only leaky max (v39d): π̃_t = max(π_t, γ π̃_{t-1}) is applied to
+        # the decoder gate only. Temporal mix keeps instantaneous π so a vanished
+        # object freezes its prior (reappearance). γ=0.85 is ~5 frames of mask
+        # stickiness for n8 false-dips without the v39h 20-frame overwrite.
+        # Mutually exclusive with gate_hysteresis (that one hits both paths).
+        self.amc_decoder_gate_hysteresis = float(
+            amc.get("decoder_gate_hysteresis", 0.0)
+        )
+        if not (0.0 <= self.amc_decoder_gate_hysteresis < 1.0):
+            raise ValueError(
+                f"attn_mass_curriculum.decoder_gate_hysteresis must be in [0, 1), "
+                f"got {self.amc_decoder_gate_hysteresis}"
+            )
+        if self.amc_gate_hysteresis > 0.0 and self.amc_decoder_gate_hysteresis > 0.0:
+            raise ValueError(
+                "attn_mass_curriculum: gate_hysteresis and decoder_gate_hysteresis "
+                "cannot both be > 0 (shared vs decoder-only leaky max)"
+            )
         # Temporal identity consistency (v39i): after max-norm, the mix gate is
         #   ρ_s = π̄_s * ReLU(cos(û_{t,s}, u_{t,s}))
         # Decoder still sees π. SlotAttention / Pred unchanged. Default False
         # keeps the v39 forward pass byte-identical.
         self.amc_state_identity_cos = bool(amc.get("state_identity_cos", False))
+        # Temporal mix statistic, decoder stays on π (v39). Empty / 'pi' is v39.
+        # 'lambda1' uses n8 λ1 (scale); 'mass' uses attention-mass fraction.
+        sk = str(amc.get("state_conf_kind", "") or "").lower()
+        if sk == "l1":
+            sk = "lambda1"
+        if sk not in ("", "pi", "lambda1", "mass"):
+            raise ValueError(
+                "attn_mass_curriculum.state_conf_kind must be '', 'pi', "
+                f"'lambda1' or 'mass', got {sk!r}"
+            )
+        self.amc_state_conf_kind = "" if sk in ("", "pi") else sk
         # If True, stop-gradient the soft gate: decoder / temporal mix / gated losses see
         # sg(g). The curriculum still computes g from (m, c, p), but featrec cannot open
         # or close slots by backprop through g (same anti-gaming idea as sg(c)).
@@ -633,6 +746,26 @@ class ObjectCentricModel(pl.LightningModule):
         #   hat{x}_{t+1} = g*Pred(u) + (1-g)*prior
         # so low-gate slots advance slowly and dormant ones carry an unchanged prior.
         self.amc_predictor_ungated = bool(amc.get("predictor_ungated", False))
+        # If True, Pred self-attention is source-gated (v39lam1g):
+        #   B_{i,j}^g = g_j exp(b_{i,j}) / sum_k g_k exp(b_{i,k})
+        # so low-g slots do not contribute as keys/values. Decoder and the
+        # temporal mix are unchanged. Default False keeps Pred as vanilla SA.
+        self.amc_predictor_src_gate = bool(amc.get("predictor_src_gate", False))
+        # v43: Pred source gate uses g / max(g), matching the temporal mix.
+        # Default False keeps v39lam1g (raw detached statistic, not max-normed).
+        self.amc_predictor_src_max_norm = bool(amc.get("predictor_src_max_norm", False))
+        # v39lam1gu_umix: occupancy-mix the corrector output for Pred / next
+        # prior only. Decoder still reads u^SA. Default False keeps
+        #   û_{t+1} = π̄ Pred(u^SA) + (1-π̄) û_t
+        # True is
+        #   u_t = π̄ u^SA + (1-π̄) û_t
+        #   û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
+        self.amc_predictor_input_mix = bool(amc.get("predictor_input_mix", False))
+        if self.amc_predictor_input_mix and self.amc_predictor_ungated:
+            raise ValueError(
+                "attn_mass_curriculum.predictor_input_mix cannot be combined "
+                "with predictor_ungated"
+            )
         # Temporal-mix smoothing of the gate, decoder stays on instantaneous π.
         # π̃_t = m π_t + (1-m) π̃_{t-1}, then max(π̃_t, hold * π̃_{t-1}).
         # m=1, hold=0 is a no-op (default). Eval-only or train; no extra weights.
@@ -664,12 +797,20 @@ class ObjectCentricModel(pl.LightningModule):
         #               same gamma-sharpened attention as m. Relative (threshold-ratio)
         #               evidence, so the gate stays discriminative across the whole p
         #               schedule instead of saturating once p leaves the mass distribution.
-        #   "purity_weight" (v32/v37/v38/v39/v39n): g = sg(c) itself. c is ownership
-        #               purity (conf_kind purity/purity_sharp), v37 feature-Gram π
-        #               (spectral), v38 dense relation-graph π (spectral_graph),
-        #               v39 8-neighbor graph π (spectral_graph_n8), v39n
-        #               relative n8 π (spectral_graph_n8_rel = v39 gap / λ1),
-        #               or v39s (spectral_graph_n8_l1imp = [λ1 - λ2⁺/(λ1+ε)]_+).
+        #   "purity_weight" (v32/v37/v37g/v37r/v38/v39/v39n/v41): g = c itself (usage is live z).
+        #               c is ownership purity (conf_kind purity/purity_sharp), v37
+        #               feature-Gram π (spectral = (λ1-λ2)/mass), v37g same C_s
+        #               without /mass (spectral_gap = λ1-λ2), v37r same C_s
+        #               (spectral_ratio = (λ1-λ2)/(λ1+λ2), bounded λ1/λ2),
+        #               v38 dense relation-graph π
+        #               (spectral_graph), v39 8-neighbor graph π (spectral_graph_n8),
+        #               v39n relative n8 π (spectral_graph_n8_rel = v39 gap / λ1),
+        #               v39s (spectral_graph_n8_l1imp = [λ1 - λ2⁺/(λ1+ε)]_+),
+        #               v39lam1 (spectral_graph_n8_lam1 = max(λ1, 0) from the
+        #               Perron power pair; no λ2, no k=8 Ritz),
+        #               v39ind induced n8 π (spectral_graph_n8_ind = λ1-λ2 of
+        #               S_ind re-normalized on thresholded support),
+        #               or v41 learned usage z = sigmoid(head(sg(A))) (conf_kind usage).
         #               Thresholdless: no p schedule, no tau, no beta --
         #               the decoder sees softmax(alpha + log c) and the temporal mix
         #               uses c / max(c). Self-annealing (uniform untrained c is
@@ -745,7 +886,16 @@ class ObjectCentricModel(pl.LightningModule):
         #              C_s = Z^T diag(a_s^2) Z on L2-normalized backbone tokens Z.
         #              Ownership of two feature modes raises λ2, so the v32 blind
         #              spot (clean part-split, c~=1) is visible without N-cut.
-        #              No gamma, no 1/K normalization; detached.
+        #              Raw A (no gamma): a^2 is the within-slot moment. No 1/K
+        #              map; detached.
+        #              spectral_proj_dim>0: fixed orthonormal D→d before C_s (fast).
+        #   "spectral_gap": v37g. Same C_s as v37, π_s = λ1-λ2 (no /mass).
+        #              Rank-1 exclusive recovers Σ a^2, not Σ a^2 / Σ A, so a
+        #              one-color leftover no longer scores like a full object.
+        #   "spectral_ratio": v37r. Same C_s, π_s = (λ1-λ2)/(λ1+λ2+eps) in [0,1].
+        #              Bounded map of λ1/λ2: (r-1)/(r+1). Size-free; two equal
+        #              modes and isotropic ghosts go to 0. Raw λ1/λ2 is not
+        #              used (explodes at λ2=0).
         #   "spectral_graph": v38. π_s = λ1 - max(λ2, 0) of
         #              G_s = diag(a_s) S diag(a_s), S = D^{-1/2} R D^{-1/2} on the
         #              same ReLU-cosine R as the Key curriculum (Z from X^bind).
@@ -761,9 +911,18 @@ class ObjectCentricModel(pl.LightningModule):
         #   "spectral_graph_n8_l1imp": v39s. Same G_s / n8 R as v39, then
         #              π_s = [λ1 - max(λ2, 0) / (λ1 + eps)]_+.
         #              Keeps G_s scale; subtracts relative impurity.
-        # Detached in every case (anti-gaming). Not to be confused with the purity_q
-        # OR-rescue, which can only OPEN gates and bypasses the evidence score entirely;
-        # this is the multiplicative evidence branch.
+        #   "spectral_graph_n8_lam1": v39lam1. Same G_s / n8 R as v39, then
+        #              π_s = max(λ1, 0) from the +ones Perron power pair
+        #              (q1^T G q1, q1). Occupancy/scale only; no λ2 / k=8 Ritz.
+        #              Decoder and temporal mix both see λ1 (unlike v39l1).
+        #   "spectral_graph_n8_ind": v39ind. Induced n8 graph on support
+        #              Ω = {a ≥ support_rel * max a}, S re-normalized there.
+        #              π_s = λ1 - max(λ2, 0). Two n8-components → π=0.
+        #   "usage": v41. z_s = sigmoid(MLP(sg(A_s)) -> cross-slot SA). Live; the
+        #              head stop-grads A. No 1/K map (sigmoid is already in (0, 1)).
+        # Detached in every case except usage (anti-gaming). Not to be confused with
+        # the purity_q OR-rescue, which can only OPEN gates and bypasses the evidence
+        # score entirely; this is the multiplicative evidence branch.
         self.amc_conf_kind = str(amc.get("conf_kind", "entropy")).lower()
         if self.amc_conf_kind not in (
             "entropy",
@@ -771,21 +930,29 @@ class ObjectCentricModel(pl.LightningModule):
             "purity",
             "purity_sharp",
             "spectral",
+            "spectral_gap",
+            "spectral_ratio",
             "spectral_graph",
             "spectral_graph_n8",
             "spectral_graph_n8_rel",
             "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+            "spectral_graph_n8_ind",
+            "usage",
         ):
             raise ValueError(
                 f"attn_mass_curriculum.conf_kind must be 'entropy', 'entropy_max', "
-                f"'purity', 'purity_sharp', 'spectral', 'spectral_graph', "
-                f"'spectral_graph_n8', 'spectral_graph_n8_rel' or "
-                f"'spectral_graph_n8_l1imp', got {self.amc_conf_kind!r}"
+                f"'purity', 'purity_sharp', 'spectral', 'spectral_gap', "
+                f"'spectral_ratio', "
+                f"'spectral_graph', 'spectral_graph_n8', 'spectral_graph_n8_rel', "
+                f"'spectral_graph_n8_l1imp', 'spectral_graph_n8_lam1', "
+                f"'spectral_graph_n8_ind' or 'usage', "
+                f"got {self.amc_conf_kind!r}"
             )
-        # purity_weight is DEFINED as ownership / spectral weighting; the conf_kind
-        # default ("entropy") would silently weight by spatial concentration instead,
-        # so an explicit purity choice is required. Same check when only the temporal
-        # mix uses purity_weight (v26p).
+        # purity_weight is DEFINED as ownership / spectral / usage weighting; the
+        # conf_kind default ("entropy") would silently weight by spatial concentration
+        # instead, so an explicit purity/usage choice is required. Same check when
+        # only the temporal mix uses purity_weight (v26p).
         if (
             self.amc_gate_form == "purity_weight"
             or self.amc_state_gate_form == "purity_weight"
@@ -793,16 +960,23 @@ class ObjectCentricModel(pl.LightningModule):
             "purity",
             "purity_sharp",
             "spectral",
+            "spectral_gap",
+            "spectral_ratio",
             "spectral_graph",
             "spectral_graph_n8",
             "spectral_graph_n8_rel",
             "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+            "spectral_graph_n8_ind",
+            "usage",
         ):
             raise ValueError(
                 "attn_mass_curriculum gate_form/state_gate_form='purity_weight' "
                 "requires conf_kind 'purity', 'purity_sharp', 'spectral', "
-                f"'spectral_graph', 'spectral_graph_n8', "
-                f"'spectral_graph_n8_rel' or 'spectral_graph_n8_l1imp', "
+                f"'spectral_gap', 'spectral_ratio', 'spectral_graph', 'spectral_graph_n8', "
+                f"'spectral_graph_n8_rel', 'spectral_graph_n8_l1imp', "
+                f"'spectral_graph_n8_lam1', "
+                f"'spectral_graph_n8_ind' or 'usage', "
                 f"got {self.amc_conf_kind!r}"
             )
         # Coupled confidence weight: beta_t = 1 - lambda_t (1 - beta_final), i.e. the
@@ -837,35 +1011,142 @@ class ObjectCentricModel(pl.LightningModule):
                 f"attn_mass_curriculum.tau_anneal must be 'linear' or 'log', got {self.amc_tau_anneal!r}"
             )
         self._active_mask = None  # stashed per forward for loss/logging
+        # Val scalars for loggers. Lightning 1.9 + max_epochs=-1 keeps one eval
+        # ResultCollection for the whole run; self.log(..., on_epoch=True) of live
+        # CUDA tensors (v41 usage z in featrec) can pin the first val's _computed
+        # and reprint it every val_check_interval. Accumulate python floats here
+        # and write loggers in on_validation_end.
+        self._val_loss_acc: Dict[str, float] = {}
+        self._val_loss_weight: float = 0.0
+        self._pending_val_scalars: Optional[Dict[str, float]] = None
         self._gate_p_eff_mean = None
         self._state_gate_mean = None
         self._gate_delta = None  # stashed for residual L2 (may be graph-connected)
         self._gate_conf_mean = None  # mean assignment confidence (logratio gate, logging)
         self._identity_cos_mean = None  # mean ReLU-cosine û vs u (v39i, logging)
         self._util_rel_delta = None  # mean rel_delta of sampled slots (slot_utility, logging)
+        self._util_rel_add = None
+        self._util_c_mean = None
+        self._util_n_suppressed = None
+        self._util_pi_max = None
+        self._util_pi_entropy = None
 
-        # --- v40 coupled slot-entropy / impurity (train-only aux) ---
-        # L_ent = H(q)/log K on K-normalized ownership c (live A): concentrate c
-        # across slots early. L_imp = c-weighted mean of λ2/λ1 on the v39 8-nbr
-        # graph (live a, sg(Z), sg(c) as weights): split merged communities late.
-        # w_ent = w0 (1-λ_t), w_imp = w0 λ_t, same cosine λ as the v26 family.
+        # --- v40/v41 coupled slot-entropy / impurity (train-only aux) ---
+        # L_ent on the gate scalar (v40: ownership c from live A; v41/v42: usage z).
+        # entropy_normalize True (default): H(q)/log K in [0, 1]. False (v42): raw
+        # H(q) nats so the same object count is K-invariant. L_imp = scalar-weighted
+        # mean of a two-mode impurity: v40 uses λ2/λ1 on G_s (impurity_kind=g_s);
+        # v39ind uses exp(-(λ1-λ2)/τ) of the induced n8 S (induced_n8); v41 uses
+        # λ2/λ1 of the v37 Gram C_s = Z^T diag(a^2) Z (impurity_kind=c_s).
+        # C_s top-2 is 16 subspace iters + 2D Ritz (same solver as the v37
+        # gate); proj_dim is the JL width, not an eigensolver switch.
+        # w_ent = (1-λ) w_ent_start + λ w_ent_end, same for w_imp.
+        # v40 (only `weight` w0):  w_ent w0→0, w_imp 0→w0.
+        # v41 endpoints: w_ent 0.3→0.1, w_imp 0.1→0.3 (neither dies).
         sei = slot_ent_impurity or {}
         self.sei_enabled = bool(sei.get("enabled", False))
         self.sei_weight = float(sei.get("weight", 0.2))
+        self.sei_w_ent_start = float(sei.get("w_ent_start", self.sei_weight))
+        self.sei_w_ent_end = float(sei.get("w_ent_end", 0.0))
+        self.sei_w_imp_start = float(sei.get("w_imp_start", 0.0))
+        self.sei_w_imp_end = float(sei.get("w_imp_end", self.sei_weight))
         self.sei_anneal_steps = int(sei.get("anneal_steps", 50000))
         self.sei_eps = float(sei.get("eps", 1e-6))
         self.sei_chunk_size = int(sei.get("chunk_size", 8))
         self.sei_n_iter = int(sei.get("n_iter", 16))
-        if self.sei_enabled:
-            if self.sei_weight < 0.0:
+        self.sei_entropy_normalize = bool(sei.get("entropy_normalize", True))
+        self.sei_target = str(sei.get("target", "c")).lower()
+        ik = str(sei.get("impurity_kind", "g_s") or "g_s").lower()
+        if ik in ("", "gs", "g_s", "spectral_graph_n8"):
+            ik = "g_s"
+        elif ik in ("induced_n8", "spectral_graph_n8_ind"):
+            ik = "induced_n8"
+        elif ik in ("c_s", "cs", "spectral", "feature_gram"):
+            ik = "c_s"
+        else:
+            raise ValueError(
+                "slot_ent_impurity.impurity_kind must be 'g_s', 'induced_n8' "
+                f"or 'c_s', got {ik!r}"
+            )
+        self.sei_impurity_kind = ik
+        self.sei_proj_dim = int(sei.get("proj_dim", 0))
+        if self.sei_proj_dim < 0:
+            raise ValueError(
+                f"slot_ent_impurity.proj_dim must be >= 0, got {self.sei_proj_dim}"
+            )
+        self.sei_support_rel = float(sei.get("support_rel", 0.25))
+        self.sei_fiedler_tau = float(sei.get("fiedler_tau", 0.05))
+        self.amc_n8_support_rel = float(amc.get("n8_support_rel", 0.25))
+        self.amc_spectral_proj_dim = int(amc.get("spectral_proj_dim", 0))
+        if self.sei_target not in ("c", "z"):
+            raise ValueError(
+                f"slot_ent_impurity.target must be 'c' or 'z', got {self.sei_target!r}"
+            )
+        uh_cfg = usage_head_config or {}
+        self.usage_head_enabled = bool(uh_cfg.get("enabled", False))
+        if self.usage_head_enabled and self.amc_conf_kind != "usage":
+            raise ValueError(
+                "usage_head.enabled requires attn_mass_curriculum.conf_kind='usage'"
+            )
+        if self.amc_conf_kind == "usage" and not self.usage_head_enabled:
+            raise ValueError(
+                "attn_mass_curriculum.conf_kind='usage' requires usage_head.enabled"
+            )
+        if self.sei_enabled and self.sei_target == "z" and not self.usage_head_enabled:
+            raise ValueError(
+                "slot_ent_impurity.target='z' requires usage_head.enabled"
+            )
+        if self.usage_head_enabled and not bool(uh_cfg.get("live_gate", True)):
+            self.amc_gate_detach = True
+        # --- v43 reconstruction-based usage redistribution ---
+        # L_gate trains usage-head logits on simplex-projected ∇J. Decoder /
+        # temporal see sg(z). λ is concentration; 0.3 keeps it below typical |d|.
+        ur = slot_usage_redistribute or {}
+        self.usage_redist_enabled = bool(ur.get("enabled", False))
+        self.usage_redist_lambda = float(ur.get("lambda", ur.get("lam", 0.3)))
+        self.usage_redist_eps = float(ur.get("eps", 1e-8))
+        self.usage_redist_z_eps = float(ur.get("z_eps", 0.0))
+        self._usage_d_rms = None
+        self._usage_v_rms = None
+        self._usage_n_support = None
+        if self.usage_redist_enabled:
+            if not self.usage_head_enabled:
                 raise ValueError(
-                    f"slot_ent_impurity.weight must be >= 0, got {self.sei_weight}"
+                    "slot_usage_redistribute.enabled requires usage_head.enabled"
                 )
+            if self.usage_redist_lambda < 0.0:
+                raise ValueError(
+                    f"slot_usage_redistribute.lambda must be >= 0, got "
+                    f"{self.usage_redist_lambda}"
+                )
+        if self.sei_enabled:
+            for name, val in (
+                ("weight", self.sei_weight),
+                ("w_ent_start", self.sei_w_ent_start),
+                ("w_ent_end", self.sei_w_ent_end),
+                ("w_imp_start", self.sei_w_imp_start),
+                ("w_imp_end", self.sei_w_imp_end),
+            ):
+                if val < 0.0:
+                    raise ValueError(
+                        f"slot_ent_impurity.{name} must be >= 0, got {val}"
+                    )
             if self.sei_anneal_steps <= 0:
                 raise ValueError(
                     "slot_ent_impurity.anneal_steps must be positive, "
                     f"got {self.sei_anneal_steps}"
                 )
+            if self.sei_impurity_kind == "induced_n8":
+                if self.sei_fiedler_tau <= 0.0:
+                    raise ValueError(
+                        "slot_ent_impurity.fiedler_tau must be > 0, "
+                        f"got {self.sei_fiedler_tau}"
+                    )
+                if not (0.0 <= self.sei_support_rel <= 1.0):
+                    raise ValueError(
+                        "slot_ent_impurity.support_rel must be in [0, 1], "
+                        f"got {self.sei_support_rel}"
+                    )
 
     def _p_residual_alpha_eff(self, train: bool) -> float:
         """Warm up residual strength so early coarse curriculum stays near v10."""
@@ -874,6 +1155,34 @@ class ObjectCentricModel(pl.LightningModule):
             return alpha
         step = self.trainer.global_step
         return alpha * min(1.0, float(step) / float(self.amc_p_residual_warmup_steps))
+
+    def _util_add_insert_flag(self, su: Dict[str, Any]) -> bool:
+        """slot_utility.add: insert/sigma/true enables σ-m restore; off disables."""
+        raw = su.get("add", su.get("add_insert", False))
+        if raw in (True, 1):
+            return True
+        if raw in (False, None, 0):
+            return False
+        if isinstance(raw, str):
+            key = raw.strip().lower()
+            if key in ("insert", "sigma", "sigma_m", "on", "true", "yes"):
+                return True
+            if key in ("none", "off", "false", "drop", "0"):
+                return False
+            raise ValueError(
+                f"slot_utility.add must be 'insert' or 'off', got {raw!r}"
+            )
+        return bool(raw)
+
+    def _live_usage_z(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """Live softmax z from the usage head. Decoder/temporal may hold sg(z)."""
+        proc = outputs.get("processor") or {}
+        z = proc.get("gate_conf")
+        if z is None:
+            z = self._active_mask
+        if z is None or not torch.is_floating_point(z):
+            return None
+        return z
 
     def _curriculum_lambda(self, train: bool) -> float:
         """Coupled curriculum coefficient lambda_t = (1 - cos(pi q)) / 2, q = step/anneal.
@@ -901,10 +1210,11 @@ class ObjectCentricModel(pl.LightningModule):
         return 0.5 * (1.0 - float(np.cos(np.pi * frac)))
 
     def _sei_weights(self, train: bool) -> Tuple[float, float, float]:
-        """(w_ent, w_imp, lambda_t) with w_ent + w_imp = sei_weight."""
+        """(w_ent, w_imp, lambda_t) linear in λ on the configured endpoints."""
         lam = self._sei_lambda(train)
-        w0 = self.sei_weight
-        return w0 * (1.0 - lam), w0 * lam, lam
+        w_ent = (1.0 - lam) * self.sei_w_ent_start + lam * self.sei_w_ent_end
+        w_imp = (1.0 - lam) * self.sei_w_imp_start + lam * self.sei_w_imp_end
+        return w_ent, w_imp, lam
 
     def _aux_ramp(self, ramp: str) -> float:
         """Weight multiplier for the v27 auxiliary losses.
@@ -1110,12 +1420,16 @@ class ObjectCentricModel(pl.LightningModule):
                 processor_kwargs["key_features"] = key_features
         if self.attn_mass_enabled and self.amc_conf_kind in (
             "spectral",
+            "spectral_gap",
+            "spectral_ratio",
             "spectral_graph",
             "spectral_graph_n8",
             "spectral_graph_n8_rel",
             "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+            "spectral_graph_n8_ind",
         ):
-            # Z / X^bind for v37 C_s, v38 dense S, and v39 / v39n 8-neighbor S.
+            # Z / X^bind for v37 / v37g / v37r C_s, v38 dense S, and v39 / v39n 8-neighbor S.
             # Key-only curriculum exposes that as backbone_key; otherwise
             # backbone_features is X^bind (raw X when the curriculum is off / mix=1).
             bind = encoder_output.get("backbone_key")
@@ -1144,6 +1458,9 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_p_state=self._state_gate_threshold(train),
                 state_max_norm=self.amc_state_max_norm,
                 predictor_ungated=self.amc_predictor_ungated,
+                predictor_src_gate=self.amc_predictor_src_gate,
+                predictor_src_max_norm=self.amc_predictor_src_max_norm,
+                predictor_input_mix=self.amc_predictor_input_mix,
                 state_gate_ema=self.amc_state_gate_ema,
                 state_gate_hold=self.amc_state_gate_hold,
                 p_mode=self.amc_p_mode,
@@ -1160,7 +1477,16 @@ class ObjectCentricModel(pl.LightningModule):
                 state_mul_decoder=self.amc_state_mul_decoder,
                 decoder_mul_state=self.amc_decoder_mul_state,
                 gate_hysteresis=self.amc_gate_hysteresis,
+                decoder_gate_hysteresis=self.amc_decoder_gate_hysteresis,
                 state_identity_cos=self.amc_state_identity_cos,
+                state_conf_kind=self.amc_state_conf_kind,
+                n8_support_rel=self.amc_n8_support_rel,
+                spectral_proj_dim=self.amc_spectral_proj_dim,
+                eval_hard_thresh=(self.amc_eval_hard_thresh if not train else 0.0),
+                eval_perron_readout=(
+                    bool(self.amc_perron_readout)
+                    or (not train and bool(self.amc_eval_perron_readout))
+                ),
                 **{k: v for k, v in processor_kwargs.items() if k != "cycle"},
             )
             slots = processor_output["state"]
@@ -1187,7 +1513,23 @@ class ObjectCentricModel(pl.LightningModule):
             gate_delta = processor_output.get("gate_delta")
             # keep tensor for residual L2 (needs grad); logging uses detach mean
             self._gate_delta = gate_delta if (gate_delta is not None and torch.is_tensor(gate_delta)) else None
-            decoder_output = self.decoder(slots, active_mask)
+            need_slot_recons = self.training and (
+                (self.util_weight > 0.0 and self.util_mode == "algebraic")
+                or self.usage_redist_enabled
+            )
+            need_ungated = self.featrec_ungated or (
+                self.training
+                and (
+                    self.usage_redist_enabled
+                    or (self.util_weight > 0.0 and self.util_add_insert)
+                )
+            )
+            decoder_output = self.decoder(
+                slots,
+                processor_output.get("decoder_gate", active_mask),
+                return_slot_recons=need_slot_recons,
+                return_ungated=need_ungated,
+            )
         else:
             self._active_mask = None
             self._gate_p_eff_mean = None
@@ -1199,7 +1541,14 @@ class ObjectCentricModel(pl.LightningModule):
                 slots_initial, features, **processor_kwargs
             )
             slots = processor_output["state"]
-            decoder_output = self.decoder(slots)
+            decoder_output = self.decoder(
+                slots,
+                return_ungated=self.featrec_ungated or (
+                    self.training and self.usage_redist_enabled
+                ),
+            )
+        if self.featrec_ungated and "reconstruction_ungated" not in decoder_output:
+            decoder_output["reconstruction_ungated"] = self.decoder(slots)["reconstruction"]
         # feat_orig, feat_recon: (B, C, H, W)
         # 1) compute sobel gradients
         feat_recon = decoder_output['reconstruction'] #
@@ -1452,14 +1801,59 @@ class ObjectCentricModel(pl.LightningModule):
                     self.util_weight * self._aux_ramp(self.util_ramp) * util_term
                 )
 
-        # --- v40 coupled slot-entropy / 8-neighbor impurity (train-only) ---
-        if self.training and self.sei_enabled and self.sei_weight > 0.0:
+        # --- v44 simplex concentration: 1 - ||z||^2 (train-only) ---
+        if self.training and self.util_psi_weight > 0.0:
+            z_psi = self._live_usage_z(outputs)
+            if z_psi is not None:
+                zf = z_psi.float()
+                psi = (1.0 - zf.pow(2).sum(dim=-1)).mean()
+                losses["loss_psi"] = psi
+                total_loss = total_loss + self.util_psi_weight * psi
+
+        # --- v43 reconstruction-based usage redistribution (train-only) ---
+        if self.training and self.usage_redist_enabled:
+            gate_term = self._usage_redistribute_loss(outputs)
+            if gate_term is not None:
+                losses["loss_gate"] = gate_term
+                total_loss = total_loss + gate_term
+
+        # --- v40/v41 coupled slot-entropy / impurity (train-only) ---
+        if self.training and self.sei_enabled and (
+            self.sei_w_ent_start > 0.0
+            or self.sei_w_ent_end > 0.0
+            or self.sei_w_imp_start > 0.0
+            or self.sei_w_imp_end > 0.0
+        ):
             w_ent, w_imp, _lam = self._sei_weights(True)
             att, bind = self._sei_att_and_bind(outputs)
             if att is not None:
-                c = ownership_confidence(att, eps=self.sei_eps)
-                ent = slot_confidence_entropy(c, eps=self.sei_eps).mean()
+                if self.sei_target == "z":
+                    # Prefer live gate_conf so L_ent still trains the head if the
+                    # decoder/temporal gate was stop-grad (live_gate false).
+                    proc = outputs.get("processor") or {}
+                    z = proc.get("gate_conf")
+                    if z is None:
+                        z = self._active_mask
+                    if z is None or not torch.is_floating_point(z):
+                        raise ValueError(
+                            "slot_ent_impurity.target='z' requires a float usage gate"
+                        )
+                    conf = z.reshape(-1, z.shape[-1]) if z.ndim == 3 else z
+                    if conf.shape[0] != att.shape[0] or conf.shape[-1] != att.shape[1]:
+                        raise ValueError(
+                            f"usage gate {tuple(conf.shape)} vs attention {tuple(att.shape)}"
+                        )
+                else:
+                    conf = ownership_confidence(att, eps=self.sei_eps)
+                ent_raw = slot_confidence_entropy(
+                    conf, eps=self.sei_eps, normalize=False
+                )
+                ent_norm = ent_raw / math.log(max(conf.shape[-1], 2))
+                ent = ent_norm if self.sei_entropy_normalize else ent_raw
+                ent = ent.mean()
                 losses["loss_ent"] = ent
+                if not self.sei_entropy_normalize:
+                    losses["loss_ent_norm"] = ent_norm.mean()
                 if w_ent > 0.0:
                     total_loss = total_loss + w_ent * ent
                 if w_imp > 0.0:
@@ -1467,14 +1861,34 @@ class ObjectCentricModel(pl.LightningModule):
                         raise ValueError(
                             "slot_ent_impurity requires encoder backbone_features"
                         )
-                    rho = spectral_graph_n8_impurity(
-                        att,
-                        bind,
-                        eps=self.sei_eps,
-                        chunk_size=self.sei_chunk_size,
-                        n_iter=self.sei_n_iter,
-                    )
-                    c_sg = c.detach()
+                    if self.sei_impurity_kind == "induced_n8":
+                        rho = spectral_graph_n8_induced_impurity(
+                            att,
+                            bind,
+                            eps=self.sei_eps,
+                            chunk_size=self.sei_chunk_size,
+                            n_iter=self.sei_n_iter,
+                            support_rel=self.sei_support_rel,
+                            fiedler_tau=self.sei_fiedler_tau,
+                        )
+                    elif self.sei_impurity_kind == "c_s":
+                        rho = spectral_cs_impurity(
+                            att,
+                            bind,
+                            eps=self.sei_eps,
+                            chunk_size=self.sei_chunk_size,
+                            n_iter=self.sei_n_iter,
+                            proj_dim=self.sei_proj_dim,
+                        )
+                    else:
+                        rho = spectral_graph_n8_impurity(
+                            att,
+                            bind,
+                            eps=self.sei_eps,
+                            chunk_size=self.sei_chunk_size,
+                            n_iter=self.sei_n_iter,
+                        )
+                    c_sg = conf.detach()
                     imp = (c_sg * rho).sum(dim=-1) / (
                         c_sg.sum(dim=-1) + self.sei_eps
                     )
@@ -1548,28 +1962,104 @@ class ObjectCentricModel(pl.LightningModule):
         tgt = target[:, idx + 1].detach()
         return F.mse_loss(recon, tgt)
 
+    def _algebraic_slot_utility_loss(
+        self,
+        outputs: Dict[str, Any],
+        gate: torch.Tensor,
+        dec: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        mix = dec.get("reconstruction")
+        if self.usage_redist_enabled:
+            slot_recons = dec.get("slot_recons")
+        else:
+            slot_recons = dec.pop("slot_recons", None)
+        masks = dec.get("masks")
+        masks_ungated = dec.get("masks_ungated")
+        mix_ungated = dec.get("reconstruction_ungated")
+        target = outputs.get("encoder", {}).get("backbone_features")
+        if mix is None or slot_recons is None or masks is None or target is None:
+            return None
+        if gate.ndim == 2:
+            gate = gate.unsqueeze(1)
+        if gate.ndim != 3:
+            return None
+        want_add = self.util_add_insert
+        if want_add and masks_ungated is None:
+            raise ValueError(
+                "slot_utility.add=insert requires decoder masks_ungated "
+                "(enable loss_featrec_ungated)"
+            )
+        # v44: drop on softmax(α). v42 has neither ungated tensor.
+        use_ungated_drop = masks_ungated is not None and (
+            want_add or mix_ungated is not None
+        )
+        proc = outputs.get("processor") or {}
+        logits = proc.get("gate_logits")
+        result = algebraic_slot_utility_loss(
+            mix,
+            slot_recons,
+            masks,
+            target,
+            gate,
+            margin=self.util_margin,
+            min_mask=self.util_min_mask,
+            masks_ungated=masks_ungated if use_ungated_drop else None,
+            mix_ungated=mix_ungated if use_ungated_drop else None,
+            add_insert=want_add,
+            return_aux=True,
+            teacher=self.util_teacher,
+            ce_tau=self.util_ce_tau,
+            logits=logits if self.util_teacher == "ce" else None,
+        )
+        loss, rel_delta, aux = result
+        self._util_rel_delta = float(rel_delta.mean())
+        self._util_c_mean = float(aux["cost"].mean()) if "cost" in aux else None
+        pi = aux.get("pi")
+        if pi is not None:
+            q = pi.clamp_min(1e-8)
+            self._util_pi_max = float(pi.amax(dim=-1).mean())
+            self._util_pi_entropy = float(-(q * q.log()).sum(dim=-1).mean())
+        else:
+            self._util_pi_max = None
+            self._util_pi_entropy = None
+        if "rel_add" in aux:
+            rel_add = aux["rel_add"]
+            suppressed = aux.get("suppressed")
+            if suppressed is not None and float(suppressed.sum()) > 0.0:
+                self._util_rel_add = float((rel_add * suppressed).sum() / suppressed.sum())
+                self._util_n_suppressed = float(suppressed.sum(dim=-1).mean())
+            else:
+                self._util_rel_add = float(rel_add.mean())
+                self._util_n_suppressed = 0.0
+        else:
+            self._util_rel_add = None
+            self._util_n_suppressed = None
+        return loss
+
     def _slot_utility_loss(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Counterfactual slot-utility rent (marginal-utility replacement for gate_l1).
 
-        Per sample, one random gated slot is dropped and the batch is re-decoded under
-        no_grad (the counterfactual carries no activations, so this pass is cheap). The
-        error increase is measured ON THE DROPPED SLOT'S OWN TERRITORY (decoder-mask
-        weighted) and normalized by the sample's mean per-patch error, which removes the
-        size bias that made the constant rent evict small-object slots:
+        mode='drop' (v27): per sample, one random gated slot is dropped and the batch is
+        re-decoded under no_grad. The error increase is measured on that slot's decoder
+        mask and charged as gate * sg(rent).
 
-            rel_delta = E_mask[err_drop - err_full] / E[err_full]
-            rent      = clamp(1 - rel_delta / margin, 0, 1)
-            loss      = mean_b [ gate(dropped slot) * sg(rent) ]
-
-        Only the live gate carries gradient (through the sigmoid into the mass branch),
-        matching the detach discipline of the confidence branch and gate_cov's error
-        weights. Bool (hard) gates carry no gradient, so the term is skipped then.
+        mode='algebraic' (v42/v44/v45): all slots, no extra decode, per frame.
+        MLPDecoder α/recon_s do not depend on z. v44 drop uses ungated mix_{-s};
+        add restores σ-share on [σ-m]_+. teacher='rent': ⟨z, sg(c)⟩. teacher='ce'
+        (v45): CE(softmax(([Δ↓]_+ + [Δ↑]_+)/τ), z).
         """
-        gate = self._active_mask
-        if gate is None or gate.dtype == torch.bool or gate.ndim != 3:
+        gate = self._live_usage_z(outputs)
+        if gate is None:
+            gate = self._active_mask
+        if gate is None or gate.dtype == torch.bool:
             return None
         proc = outputs.get("processor") or {}
         dec = outputs.get("decoder") or {}
+        if self.util_mode == "algebraic":
+            return self._algebraic_slot_utility_loss(outputs, gate, dec)
+
+        if gate.ndim != 3:
+            return None
         slots = proc.get("state")
         masks = dec.get("masks")
         recon = dec.get("reconstruction")
@@ -1611,6 +2101,44 @@ class ObjectCentricModel(pl.LightningModule):
         g_live = gate.float().mean(dim=1)  # (B, S), graph-connected to the mass branch
         g_sel = g_live[torch.arange(b, device=slots.device), safe_idx]
         return (g_sel * rent)[valid].mean()
+
+    def _usage_redistribute_loss(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """v43 L_gate: train usage-head logits toward simplex-projected ∇J."""
+        proc = outputs.get("processor") or {}
+        dec = outputs.get("decoder") or {}
+        mix = dec.get("reconstruction")
+        slot_recons = dec.get("slot_recons")
+        masks_ungated = dec.get("masks_ungated")
+        target = outputs.get("encoder", {}).get("backbone_features")
+        logits = proc.get("gate_logits")
+        z = proc.get("gate_conf")
+        if z is None:
+            z = self._active_mask
+        if (
+            mix is None
+            or slot_recons is None
+            or masks_ungated is None
+            or target is None
+            or logits is None
+            or z is None
+            or not torch.is_floating_point(z)
+        ):
+            return None
+        loss, d, _, v = usage_redistribute_direction(
+            mix,
+            slot_recons,
+            masks_ungated,
+            z,
+            target,
+            logits,
+            lam=self.usage_redist_lambda,
+            eps=self.usage_redist_eps,
+            z_eps=self.usage_redist_z_eps,
+        )
+        self._usage_d_rms = float(d.float().pow(2).mean().sqrt())
+        self._usage_v_rms = float(v.float().pow(2).mean().sqrt())
+        self._usage_n_support = float((z.detach() > self.usage_redist_z_eps).float().sum(-1).mean())
+        return loss
 
     def _dynamics_direction(self, outputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Cosine alignment between the predictor's step and the next-frame displacement.
@@ -1880,7 +2408,11 @@ class ObjectCentricModel(pl.LightningModule):
         if self.attn_mass_enabled and self._active_mask is not None:
             # for soft gating this is the effective (summed-gate) active slot count
             gate = self._active_mask.float()  # (B, T, S) or (B, S)
-            to_log["train/active_slots"] = gate.sum(-1).mean()
+            to_log["train/active_slots"] = (
+                gate.mean(dim=-1).sum(dim=-1).mean()
+                if gate.ndim >= 4
+                else gate.sum(-1).mean()
+            )
             gate_p_now = self._gate_threshold(True)
             if gate_p_now is not None:  # purity_weight is thresholdless
                 to_log["train/gate_p"] = float(gate_p_now)
@@ -1938,6 +2470,30 @@ class ObjectCentricModel(pl.LightningModule):
             to_log["train/util_w_eff"] = self.util_weight * self._aux_ramp(self.util_ramp)
             if self._util_rel_delta is not None:
                 to_log["train/util_rel_delta"] = self._util_rel_delta
+            if self._util_rel_add is not None:
+                to_log["train/util_rel_add"] = self._util_rel_add
+            if self._util_c_mean is not None:
+                to_log["train/util_c_mean"] = self._util_c_mean
+            if self._util_n_suppressed is not None:
+                to_log["train/util_n_suppressed"] = self._util_n_suppressed
+            if self.util_add_insert:
+                to_log["train/util_add_insert"] = 1.0
+            if self.util_teacher == "ce":
+                to_log["train/util_ce_tau"] = float(self.util_ce_tau)
+                if self._util_pi_max is not None:
+                    to_log["train/util_pi_max"] = self._util_pi_max
+                if self._util_pi_entropy is not None:
+                    to_log["train/util_pi_entropy"] = self._util_pi_entropy
+        if self.util_psi_weight > 0.0:
+            to_log["train/util_psi_w"] = float(self.util_psi_weight)
+        if getattr(self, "usage_redist_enabled", False):
+            to_log["train/usage_lambda"] = float(self.usage_redist_lambda)
+            if self._usage_d_rms is not None:
+                to_log["train/usage_d_rms"] = self._usage_d_rms
+            if self._usage_v_rms is not None:
+                to_log["train/usage_v_rms"] = self._usage_v_rms
+            if self._usage_n_support is not None:
+                to_log["train/usage_n_support"] = self._usage_n_support
         if self.sei_enabled:
             w_ent, w_imp, lam = self._sei_weights(True)
             to_log["train/sei_lambda"] = float(lam)
@@ -1985,13 +2541,22 @@ class ObjectCentricModel(pl.LightningModule):
         else:
             to_log = {f"val/{name}": loss for name, loss in losses.items()}
             to_log["val/loss"] = total_loss
+        to_log = {k: self._as_log_float(v) for k, v in to_log.items()}
+        self._accumulate_val_losses(to_log, int(outputs["batch_size"]))
 
         if self.val_metrics:
             for metric in self.val_metrics.values():
                 metric.update(**batch, **outputs, **aux_outputs)
 
+        # Progress bar only. Logger output is written in on_validation_end from
+        # python floats so Lightning cannot reprint the first val's _computed.
         self.log_dict(
-            to_log, on_step=False, on_epoch=True, batch_size=outputs["batch_size"], prog_bar=True
+            to_log,
+            on_step=False,
+            on_epoch=True,
+            batch_size=outputs["batch_size"],
+            prog_bar=True,
+            logger=False,
         )
 
         if self.visualize and batch_idx == 0 and self.global_rank == 0:
@@ -2011,13 +2576,48 @@ class ObjectCentricModel(pl.LightningModule):
             )
             self._log_masks(aux_outputs, self.mask_keys_to_visualize, mode="val")
 
+    def on_validation_epoch_start(self):
+        self._val_loss_acc = {}
+        self._val_loss_weight = 0.0
+        self._pending_val_scalars = None
+
     def validation_epoch_end(self, outputs):
+        to_log: Dict[str, float] = {}
+        if self._val_loss_weight > 0.0:
+            w = self._val_loss_weight
+            to_log = {k: v / w for k, v in self._val_loss_acc.items()}
         if self.val_metrics:
-            to_log = {}
             for key, metric in self.val_metrics.items():
                 self._add_metric_to_log(to_log, f"val/{key}", metric.compute())
                 metric.reset()
-            self.log_dict(to_log, prog_bar=True)
+        to_log = {k: self._as_log_float(v) for k, v in to_log.items()}
+        self._pending_val_scalars = to_log
+        if to_log:
+            self.log_dict(to_log, prog_bar=True, logger=False, on_step=False, on_epoch=True)
+
+    def on_validation_end(self):
+        scalars = self._pending_val_scalars
+        self._pending_val_scalars = None
+        self._val_loss_acc = {}
+        self._val_loss_weight = 0.0
+        if not scalars or self.trainer.sanity_checking:
+            return
+        if self.trainer.is_global_zero:
+            for logger in self.trainer.loggers:
+                logger.log_metrics(dict(scalars), step=int(self.trainer.global_step))
+                logger.save()
+
+    def _accumulate_val_losses(self, to_log: Dict[str, float], batch_size: int) -> None:
+        bs = max(int(batch_size), 1)
+        for name, value in to_log.items():
+            self._val_loss_acc[name] = self._val_loss_acc.get(name, 0.0) + float(value) * bs
+        self._val_loss_weight += bs
+
+    @staticmethod
+    def _as_log_float(value: Any) -> float:
+        if torch.is_tensor(value):
+            return float(value.detach().float().mean().cpu())
+        return float(value)
 
     @staticmethod
     def _add_metric_to_log(

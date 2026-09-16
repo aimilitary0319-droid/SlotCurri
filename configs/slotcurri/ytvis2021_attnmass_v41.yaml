@@ -1,0 +1,211 @@
+experiment_group: slotcurri
+experiment_name: ytvis_attnmass_v41
+
+globals:
+  NUM_SLOTS: 7
+  SLOT_DIM: 64
+  DINO_MODEL: vit_base_patch14_dinov2
+  FEAT_DIM: 768
+  NUM_PATCHES: 1369
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+
+  # --- v41 = v40 with learned usage z in place of ownership c ---
+  #
+  # Slot Attention always uses K_max. z_s = sigmoid(MLP(sg(A_s)) -> 1-block
+  # cross-slot SA). Continuous z goes live into decoder and temporal.
+  # Both paths are relative in z (absolute scale is unidentified):
+  #      Decoder: softmax(alpha + log(z+eps)); uniform z recovers softmax.
+  #      Temporal: alpha = z / max_j(z); winner always advances fully.
+  #    No p, tau, beta, mass, ownership, or spectral-π gate. No 0/1 discretization.
+  #
+  # Aux losses share v40's cosine clock on z instead of c, T = 50k:
+  #      L_ent = E[ H(q) / log K ],  q ∝ z+eps          # head: concentrate usage
+  #      L_imp = E[ sum_s sg(z_s) ρ_s / (sum sg(z)+eps) ]
+  #      ρ_s   = max(λ2, 0) / (max(λ1, 0) + eps) of v37 C_s = Z^T diag(a^2) Z
+  #    No /mass, no across-slot gamma. Live a, sg(Z), sg(z) as weights.
+  #    proj_dim=64: same JL map as the v37 gate. Top-2 of C_s is 16 subspace
+  #    iters + 2D Ritz (same solver as the v37 gate), not batched 64×64 eigh.
+  #    Cosine λ over T=50k, then hold:
+  #      w_ent: 0.3 → 0.1,  w_imp: 0.1 → 0.3
+  #    Neither goes to 0: entropy keeps z from all-1s, impurity still splits.
+  slot_expansion: false
+  cyclic_inference: false
+
+  usage_head:
+    enabled: true
+    n_patches: ${globals.NUM_PATCHES}
+    mlp_hidden: 256
+    d_model: 64
+    n_blocks: 1
+    n_heads: 4
+    stopgrad_attn: true     # sg(A) into the head
+    live_gate: true         # decoder + temporal see live z
+
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    gate_mode: soft
+    gate_form: purity_weight
+    conf_kind: usage
+    mass_gamma: 1.0
+    purity_normalize: false # z is already in (0, 1); no 1/K map
+    gate_detach: false      # live z
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true     # temporal mix uses z/max(z); winner mix = 1
+    contrastive_gate: false
+
+  slot_ent_impurity:
+    enabled: true
+    anneal_steps: 50000         # T; λ: 0→1 cosine, then hold
+    target: z                   # L_ent(z), L_imp weighted by sg(z)
+    w_ent_start: 0.3            # concentrate usage
+    w_ent_end: 0.1              # floor: stop z saturating to 1
+    w_imp_start: 0.1            # weak split from step 0
+    w_imp_end: 0.3              # late: two-mode C_s
+    impurity_kind: c_s          # v37 Gram λ2/λ1; not n8 G_s
+    proj_dim: 64                # JL width, not the eigensolver; 0 = full D
+    eps: 1.0e-6
+    chunk_size: 8               # frames per C_s chunk (occupancy); 128 is one-shot
+    n_iter: 16                  # 2D subspace iters for λ1, λ2 (same as v37 gate)
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    video_input: true
+    ignore_background: false
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "ytvis2021_resized/ytvis-train-{000000..000083}.tar"
+  val_shards: "ytvis2021_resized/ytvis-validation-{000000..000029}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 1
+  val_size: 200
+  num_workers: 4
+  num_val_workers: 1
+  train_pipeline:
+    chunk_size: 4
+    keys: [video]
+    sample_one_chunk_per_video: true
+    transforms:
+      name: ytvis_train
+      type: video
+      crop_type: short_side_resize_random
+      input_size: 518
+      num_classes: 10
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: ytvis_val
+      type: video
+      crop_type: central
+      input_size: 518
+      num_classes: 25

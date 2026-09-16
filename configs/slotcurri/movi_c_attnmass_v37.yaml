@@ -55,9 +55,13 @@ model:
   #    L2-normalized curriculum tokens Z (X^bind):
   #      C_s = Z^T diag(a_s^2) Z
   #      π_s = clip((λ1 - λ2) / (sum_i A_{i,s} + eps), 0, 1)
-  #    a^2 is the sharpening (mass_gamma unused). No 1/K slot-count map
-  #    (uniform ghosts already sit at O(1/(K N)) after a^2). π stays detached.
-  #    Decoder: softmax(alpha + log(π+eps)); temporal: π/max(π).
+  #    a^2 is the within-slot moment (rank-1 recovers ownership). No across-slot
+  #    gamma: that would score won patches, not this slot's mass, and would
+  #    flatten always-second ghosts to the same π≈0 as two-mode winners.
+  #    No 1/K map. π stays detached.
+  #    Decoder: softmax(alpha)(π+eps) renormalized; temporal: π/max(π).
+  #    spectral_proj_dim=64: C_s on a fixed orthonormal 64-d map of Z.
+  #    32 is scientifically fine; lowering is not why v39 was fast.
   #
   # Rank-1 exclusive ownership recovers v32's Σ a^2 / Σ A. A slot that exclusively
   # owns two feature modes raises λ2 and drops π -- the v32 blind spot the N-cut
@@ -69,7 +73,7 @@ model:
     barrier: false     # no 2-way Fiedler/median region
     anneal_steps: 50000  # s: 0 -> 1 (cosine); remaining 50k is raw Keys
     schedule: cosine
-    chunk_size: 8      # frames per (N,N) graph chunk (memory bound, not math)
+    chunk_size: 256    # one shot: 64 img/GPU × 4 frames; occupancy, not math
     eps: 1.0e-6
 
   attn_mass_curriculum:
@@ -78,8 +82,9 @@ model:
     gate_mode: soft         # inert for purity_weight (kept for the gate stats logging)
     gate_form: purity_weight
     conf_kind: spectral     # (λ1-λ2) / mass on C_s = Z^T diag(a^2) Z
-    mass_gamma: 1.0         # unused: a^2 in C_s is the sharpening
-    purity_normalize: false # no 1/K map; spectral scale already kills uniform ghosts
+    spectral_proj_dim: 64   # JL width, not the eigensolver; 32 OK, 0 = full D
+    mass_gamma: 1.0         # unused: v37 uses raw A; a^2 is the within-slot moment
+    purity_normalize: false # no 1/K map; two-mode gaps stay distinct from ghosts
     gate_l1: 0.0
     gate_div: 0.0
     state_max_norm: true    # temporal gate alpha = π / max_j(π)

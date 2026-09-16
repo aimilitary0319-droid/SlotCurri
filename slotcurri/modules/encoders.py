@@ -233,6 +233,7 @@ class NcutRelationalLeveling(nn.Module):
         with torch.cuda.amp.autocast(enabled=False):
             x = x.float()
             z = torch.nn.functional.normalize(x, dim=-1)
+            # fp32 ReLU-cosine P (AMP would downcast bmm). (W X)/row = P X.
             w = torch.bmm(z, z.transpose(1, 2)).clamp_min(0.0)
             w.diagonal(dim1=-2, dim2=-1).zero_()
 
@@ -252,9 +253,8 @@ class NcutRelationalLeveling(nn.Module):
                 w_tilde = w
 
             row = w_tilde.sum(dim=-1, keepdim=True)
-            p = w_tilde / row.clamp_min(self.eps)
-            rel = torch.bmm(p, x)
-            rel = torch.where(row < self.eps, x, rel)
+            rel = torch.bmm(w_tilde, x)
+            rel = torch.where(row < self.eps, x, rel / row.clamp_min(self.eps))
             return rel, region, v2
 
     @torch.no_grad()

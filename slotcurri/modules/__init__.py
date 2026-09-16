@@ -8,7 +8,7 @@ from slotcurri.modules.networks import build as build_network
 from slotcurri.modules.utils import Resizer, SoftToHardMask
 from slotcurri.modules.utils import build as build_utils
 from slotcurri.modules.utils import build_module, build_torch_function, build_torch_module
-from slotcurri.modules.video import LatentProcessor, MapOverTime, ScanOverTime
+from slotcurri.modules.video import LatentProcessor, MapOverTime, ScanOverTime, SlotUsageHead
 from slotcurri.modules.video import build as build_video
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "MapOverTime",
     "ScanOverTime",
     "LatentProcessor",
+    "SlotUsageHead",
     "Resizer",
     "SoftToHardMask",
     "FeatureSmoothing",

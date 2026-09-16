@@ -31,7 +31,7 @@ class ModelConfig:
     # Run the extra backward sweep over each clip at validation/eval time. Training is
     # always single-pass; this only affects inference. bool = legacy on/off (backward
     # sweep anchored at the last frame); the strings "evidence" / "evidence_mass" /
-    # "random" select the anchored EABI variants (see ScanOverTime).
+    # "evidence_sum" / "random" select the anchored EABI variants (see ScanOverTime).
     cyclic_inference: Any = True
     # Reconstruction-guided slot expansion (start with 2 slots, split into the full budget
     # at max_steps//10 and max_steps//4). Only applies when attn_mass_curriculum is off;
@@ -45,9 +45,12 @@ class ModelConfig:
     # Dense, feature-space supervision of motion; the only training signal that penalizes
     # holding two independently-moving instances in one slot.
     pred_recon: Optional[Dict[str, Any]] = None
-    # Counterfactual slot-utility rent (v27): drop one gated slot (no_grad re-decode) and
-    # charge its gate if reconstruction on its territory barely degrades (marginal-utility
-    # pricing; replaces the constant gate_l1 rent that suppressed small-object slots).
+    # Counterfactual slot-utility rent: drop one gated slot (v27) or algebraic
+    # all-slot mix_{-s}=(mix-m_s recon_s)/(1-m_s) with no extra decode (v42), per frame.
+    # Charges z if reconstruction on that slot's territory barely degrades.
+    # v44: drop Δ on ungated softmax(α) mix (z-free); add: insert restores
+    # a suppressed slot to its α-share (ŷ^{+s}=σ R+(1-σ)ŷ^{g,-s}); psi_weight.
+    # v45 teacher='ce': L = CE(softmax(([Δ↓]_+ + [Δ↑]_+)/ce_tau), z); no ψ.
     slot_utility: Optional[Dict[str, Any]] = None
     # Feature curriculum (v33/v36): anneal backbone tokens from a coarse relational
     # representation to raw patch features. v33 affinity-smooths the tokens themselves
@@ -55,10 +58,24 @@ class ModelConfig:
     # 2-way Ncut barrier. v37/v38 keep that Key-only mix/schedule with barrier=false
     # (global ReLU-cosine P, no region cut). Train-time only; eval sees raw features.
     feature_curriculum: Optional[Dict[str, Any]] = None
-    # v40: coupled slot-confidence entropy (early, concentrate c) and 8-neighbor
-    # spectral impurity (late, split merged communities). Train-only aux losses;
-    # the gate is the existing purity_weight + K-normalized ownership path.
+    # v40/v41: coupled slot-confidence entropy (early, concentrate) and a
+    # two-mode impurity (late, split merged communities). Train-only aux.
+    # impurity_kind: g_s (v40 λ2/λ1 on diag(a)S diag(a) n8), induced_n8
+    # (v39ind exp(-(λ1-λ2)/τ) of S on thresholded support), or c_s (v41
+    # λ2/λ1 of the v37 Gram C_s = Z^T diag(a^2) Z; optional proj_dim;
+    # top-2 via the same 2D subspace as the v37 gate, not d×d eigh).
+    # target: c (v40 ownership) or z (v41 usage-head gate).
+    # w_ent/w_imp: optional endpoints (default v40: w_ent w0→0, w_imp 0→w0).
+    # v41 uses w_ent 0.3→0.1 and w_imp 0.1→0.3 so neither term dies.
+    # entropy_normalize: True = H/log K (v40/v41); False = raw H nats (v42).
     slot_ent_impurity: Optional[Dict[str, Any]] = None
+    # Learned slot-usage head from sg(A). Applied as the purity_weight gate
+    # when conf_kind=usage. normalize: sigmoid (v41), softmax (v42), or
+    # sparsemax (v43, exact zeros).
+    usage_head: Optional[Dict[str, Any]] = None
+    # v43: reconstruction-based usage redistribution. Train the usage head
+    # on simplex-projected ∇J, J = E(p) + (λ/2)(1-||p||^2). Weight 0 disables.
+    slot_usage_redistribute: Optional[Dict[str, Any]] = None
     masks_to_visualize: Optional[List[str]] = None
     load_weights: Optional[str] = None
     modules_to_load: Optional[Dict[str, str]] = None

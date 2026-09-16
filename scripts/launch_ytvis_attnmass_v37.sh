@@ -7,8 +7,8 @@
 #     barrier=false skips the 2-way Fiedler/median cut (one global region).
 #     Value and the reconstruction target stay on original DINO. Eval is raw Keys.
 #   - Gate statistic is spectral π = (λ1-λ2)/(Σ A + eps) on C = Z^T diag(a^2) Z
-#     with Z = X^bind, not purity_sharp + 1/K normalization. a^2 is the
-#     sharpening (mass_gamma=1).
+#     with Z = X^bind projected to 64-d (spectral_proj_dim=64). Raw A, no gamma,
+#     no 1/K map. Set spectral_proj_dim=0 for full D.
 #
 # Usage:
 #   bash scripts/launch_ytvis_attnmass_v37.sh

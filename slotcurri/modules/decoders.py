@@ -60,7 +60,11 @@ class MLPDecoder(nn.Module):
         self.pos_emb = nn.Parameter(torch.randn(1, 1, n_patches, inp_dim) * inp_dim**-0.5)
 
     def forward(
-        self, slots: torch.Tensor, active_mask: Optional[torch.Tensor] = None
+        self,
+        slots: torch.Tensor,
+        active_mask: Optional[torch.Tensor] = None,
+        return_slot_recons: bool = False,
+        return_ungated: bool = False,
     ) -> Dict[str, torch.Tensor]:
         bs, n_slots, dims = slots.shape
 
@@ -77,6 +81,9 @@ class MLPDecoder(nn.Module):
         slots = slots + pos_emb
 
         recons, alpha = self.mlp(slots).split((self.outp_dim, 1), dim=-1)
+        # Softmax-over-slots mix with no gate. Same α / recon_s as the gated
+        # path; only the mix weights change. Used by loss_featrec_ungated.
+        masks_ungated = torch.softmax(alpha, dim=1) if return_ungated else None
 
         if active_mask is None:
             masks = torch.softmax(alpha, dim=1)
@@ -89,11 +96,20 @@ class MLPDecoder(nn.Module):
             alpha = alpha.masked_fill(~m, torch.finfo(alpha.dtype).min)
             masks = torch.softmax(alpha, dim=1)
         else:
-            # soft gating: down-weight each slot's mask by its gate g in [0, 1], then
+            # soft gating: down-weight each slot's mask by its gate g, then
             # renormalize over slots so the per-patch masks still sum to 1.
+            # g may be (B, S) broadcast to every patch, or (B, S, N) spatial
+            # (eval Perron readout: π_s * q̃_{1,s,i}).
             g = active_mask
             if g.dim() == 2:
                 g = g[:, :, None, None]  # (bs, n_slots, 1, 1)
+            elif g.dim() == 3:
+                g = g.unsqueeze(-1)  # (bs, n_slots, n_patches, 1)
+            elif g.dim() != 4:
+                raise ValueError(
+                    f"decoder active_mask expected (B,S), (B,S,N) or "
+                    f"(B,S,N,1), got {tuple(g.shape)}"
+                )
             # g+eps so all-zero normalized purity recovers softmax(alpha)
             # (softmax(alpha + log(g+eps))), instead of a zero reconstruction.
             masks = torch.softmax(alpha, dim=1) * (g + 1e-8)
@@ -101,7 +117,13 @@ class MLPDecoder(nn.Module):
 
         recon = torch.sum(recons * masks, dim=1)
 
-        return {"reconstruction": recon, "masks": masks.squeeze(-1)}
+        out = {"reconstruction": recon, "masks": masks.squeeze(-1)}
+        if return_slot_recons:
+            out["slot_recons"] = recons
+        if return_ungated:
+            out["reconstruction_ungated"] = torch.sum(recons * masks_ungated, dim=1)
+            out["masks_ungated"] = masks_ungated.squeeze(-1)
+        return out
 
 
 class SpatialBroadcastDecoder(nn.Module):
@@ -259,3 +281,193 @@ class SlotMixerDecoder(nn.Module):
         recons = self.output_transform(features)
 
         return {"reconstruction": recons, "masks": attn.transpose(-2, -1)}
+
+
+def algebraic_slot_utility_loss(
+    mix: torch.Tensor,
+    slot_recons: torch.Tensor,
+    masks: torch.Tensor,
+    target: torch.Tensor,
+    gate: torch.Tensor,
+    margin: float = 1.0,
+    min_mask: float = 0.0,
+    mix_eps: float = 1e-8,
+    masks_ungated: Optional[torch.Tensor] = None,
+    mix_ungated: Optional[torch.Tensor] = None,
+    add_insert: bool = False,
+    return_aux: bool = False,
+    teacher: str = "rent",
+    ce_tau: float = 0.5,
+    logits: Optional[torch.Tensor] = None,
+) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]]:
+    """All-slot leave-one-out teacher (no extra decode).
+
+    Drop (Δ↓) is z-free when mix_ungated / masks_ungated = softmax(α) mix are
+    given (v44). Then mix_{-s} = (ŷ^u - σ_s R_s)/(1-σ_s) on ungated territory.
+    v42 omits those and drop uses the gated mix (legacy).
+
+    Add (Δ↑, v44): restore slot s to its α-share on the gated canvas,
+    ŷ^{+s} = σ_s R_s + (1-σ_s) ŷ^{g,-s}, only on patches where σ_s > m_s.
+
+    teacher='rent' (v42/v44):
+        L = mean_{b,t} sum_s z_{t,s} * sg(c_{t,s})
+        c = clamp( [1-Δ↓/margin]_+ - [Δ↑]_+, -1, 1 )   (add_insert=False → drop only)
+        Rent is detached; live `gate` (`z`) only enters the inner product.
+
+    teacher='ce' (v45):
+        u = [Δ↓]_+ + [Δ↑]_+ ,  π = softmax(u / τ)
+        L = mean CE(π, z) = -⟨π, log z⟩.  ∂L/∂ℓ = z-π if z=softmax(ℓ).
+        π is detached. Optional live `logits` uses log_softmax (stable).
+    """
+    del min_mask  # drop-mode candidate cutoff; algebraic taxes all slots
+    if mix.ndim == 3:
+        mix = mix.unsqueeze(1)
+        target = target.unsqueeze(1)
+        slot_recons = slot_recons.unsqueeze(1)
+        masks = masks.unsqueeze(1)
+        if gate.ndim == 2:
+            gate = gate.unsqueeze(1)
+        if masks_ungated is not None and masks_ungated.ndim == 3:
+            masks_ungated = masks_ungated.unsqueeze(1)
+        if mix_ungated is not None and mix_ungated.ndim == 3:
+            mix_ungated = mix_ungated.unsqueeze(1)
+        if logits is not None and logits.ndim == 2:
+            logits = logits.unsqueeze(1)
+    if mix.ndim != 4 or slot_recons.ndim != 5 or masks.ndim != 4:
+        raise ValueError(
+            "algebraic_slot_utility_loss expected mix (B,T,F,D), "
+            f"got mix {tuple(mix.shape)}, slot_recons {tuple(slot_recons.shape)}, "
+            f"masks {tuple(masks.shape)}"
+        )
+    if gate.ndim != 3:
+        raise ValueError(
+            f"algebraic_slot_utility_loss expected gate (B,T,S), got {tuple(gate.shape)}"
+        )
+    if logits is not None and logits.ndim == 2:
+        logits = logits.unsqueeze(1)
+    teacher_key = str(teacher).strip().lower()
+    if teacher_key in ("inner", "dot"):
+        teacher_key = "rent"
+    if teacher_key not in ("rent", "ce"):
+        raise ValueError(
+            f"algebraic_slot_utility_loss teacher must be 'rent' or 'ce', got {teacher!r}"
+        )
+    if teacher_key == "ce" and float(ce_tau) <= 0.0:
+        raise ValueError(f"algebraic_slot_utility_loss ce_tau must be > 0, got {ce_tau}")
+
+    add_insert = bool(add_insert)
+    if add_insert:
+        if masks_ungated is None:
+            raise ValueError("algebraic σ-m insert add requires masks_ungated = softmax(α)")
+        if masks_ungated.shape != masks.shape:
+            raise ValueError(
+                f"masks_ungated {tuple(masks_ungated.shape)} vs masks {tuple(masks.shape)}"
+            )
+
+    # v44: drop Δ on softmax(α) mix so rent does not see the current gate.
+    # v42 omits masks_ungated and keeps gated drop. Add still uses gated mix.
+    use_ungated_drop = masks_ungated is not None
+    if use_ungated_drop:
+        drop_masks = masks_ungated
+        if mix_ungated is None:
+            mix_ungated = (drop_masks.unsqueeze(-1) * slot_recons).sum(dim=2)
+        if mix_ungated.shape != mix.shape:
+            raise ValueError(
+                f"mix_ungated {tuple(mix_ungated.shape)} vs mix {tuple(mix.shape)}"
+            )
+        drop_mix = mix_ungated
+    else:
+        drop_mix = mix
+        drop_masks = masks
+
+    n_slots = drop_masks.shape[2]
+    err_drop_full = (drop_mix - target).pow(2).mean(-1)  # (B, T, F)
+    err_drop_mean = err_drop_full.mean(dim=-1).clamp_min(mix_eps)
+    err_gate_full = (mix - target).pow(2).mean(-1)
+    err_gate_mean = err_gate_full.mean(dim=-1).clamp_min(mix_eps)
+    mar = max(float(margin), mix_eps)
+
+    rel_parts = []
+    add_parts = []
+    with torch.no_grad():
+        for s in range(n_slots):
+            m_s = drop_masks[:, :, s].unsqueeze(-1)
+            r_s = slot_recons[:, :, s]
+            denom = (1.0 - drop_masks[:, :, s]).clamp_min(mix_eps).unsqueeze(-1)
+            mix_drop = (drop_mix - m_s * r_s) / denom
+            err_drop = (mix_drop - target).pow(2).mean(-1)
+            w = drop_masks[:, :, s]
+            wsum = w.sum(dim=-1).clamp_min(mix_eps)
+            delta = ((err_drop - err_drop_full) * w).sum(dim=-1) / wsum
+            rel_parts.append(delta / err_drop_mean)
+        rel_delta = torch.stack(rel_parts, dim=-1)
+        rent_drop = (1.0 - rel_delta / mar).clamp(min=0.0, max=1.0)
+
+        rel_add = None
+        suppressed = None
+        if add_insert:
+            sm = masks_ungated.float()
+            m_g = masks.float()
+            rec = slot_recons.float()
+            mix_g = mix.float()
+            tgt = target.float()
+            err_g = err_gate_full.float()
+            err_g_mean = err_gate_mean.float()
+            supp_parts = []
+            for s in range(n_slots):
+                m_s = m_g[:, :, s]
+                sm_s = sm[:, :, s]
+                r_s = rec[:, :, s]
+                denom_g = (1.0 - m_s).clamp_min(mix_eps).unsqueeze(-1)
+                mix_wo = (mix_g - m_s.unsqueeze(-1) * r_s) / denom_g
+                mix_ins = sm_s.unsqueeze(-1) * r_s + (1.0 - sm_s).unsqueeze(-1) * mix_wo
+                err_ins = (mix_ins - tgt).pow(2).mean(-1)
+                w = (sm_s - m_s).clamp(min=0.0)
+                wsum = w.sum(dim=-1)
+                d_up = ((err_g - err_ins) * w).sum(dim=-1) / wsum.clamp_min(mix_eps)
+                d_up = torch.where(wsum > mix_eps, d_up, torch.zeros_like(d_up))
+                add_parts.append(d_up / err_g_mean)
+                supp_parts.append((wsum > mix_eps).to(dtype=rel_delta.dtype))
+            rel_add = torch.stack(add_parts, dim=-1).to(dtype=rel_delta.dtype)
+            suppressed = torch.stack(supp_parts, dim=-1)
+            bonus = rel_add.clamp(min=0.0)
+            rent = (rent_drop - bonus).clamp(min=-1.0, max=1.0)
+        else:
+            rent = rent_drop
+
+    z = gate.float()
+    if z.shape != rent.shape:
+        raise ValueError(
+            f"algebraic_slot_utility_loss gate {tuple(z.shape)} vs rent {tuple(rent.shape)}"
+        )
+    if teacher_key == "ce":
+        u = rel_delta.clamp(min=0.0)
+        if rel_add is not None:
+            u = u + rel_add.clamp(min=0.0)
+        pi = torch.softmax(u / float(ce_tau), dim=-1)
+        if logits is not None:
+            if logits.shape != z.shape:
+                raise ValueError(
+                    f"algebraic_slot_utility_loss logits {tuple(logits.shape)} "
+                    f"vs gate {tuple(z.shape)}"
+                )
+            log_z = torch.log_softmax(logits.float(), dim=-1)
+        else:
+            log_z = z.clamp_min(mix_eps).log()
+        loss = -(pi * log_z).sum(dim=-1).mean()
+    else:
+        pi = None
+        u = None
+        loss = (z * rent).sum(dim=-1).mean()
+    if not return_aux:
+        return loss, rel_delta
+    aux: Dict[str, torch.Tensor] = {"cost": rent, "rel_delta": rel_delta}
+    if rel_add is not None:
+        aux["rel_add"] = rel_add
+        if suppressed is not None:
+            aux["suppressed"] = suppressed
+    if pi is not None:
+        aux["pi"] = pi
+        aux["u"] = u
+    return loss, rel_delta, aux
+

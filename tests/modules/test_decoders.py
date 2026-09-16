@@ -33,6 +33,37 @@ def test_mlp_decoder(eval_upscale):
     assert outp["reconstruction"].shape == (1, n_output_patches, outp_dim)
     assert outp["masks"].shape == (1, n_slots, n_output_patches)
     assert outp["masks"].min() >= 0.0 and outp["masks"].max() <= 1.0
+    assert "slot_recons" not in outp
+
+
+def test_mlp_decoder_slot_recons_matches_mix():
+    decoder = decoders.MLPDecoder(
+        inp_dim=5, outp_dim=8, hidden_dims=[10], n_patches=4
+    )
+    inp = torch.randn(2, 3, 5)
+    gate = torch.softmax(torch.randn(2, 3), dim=-1)
+    with torch.no_grad():
+        outp = decoder(inp, gate, return_slot_recons=True)
+    masks = outp["masks"].unsqueeze(-1)
+    mix = (outp["slot_recons"] * masks).sum(dim=1)
+    assert torch.allclose(mix, outp["reconstruction"], atol=1e-5)
+    assert outp["slot_recons"].shape == (2, 3, 4, 8)
+
+
+def test_mlp_decoder_return_ungated_matches_no_gate():
+    """Gated mix changes reconstruction; ungated mix equals decoder(slots)."""
+    decoder = decoders.MLPDecoder(
+        inp_dim=5, outp_dim=8, hidden_dims=[10], n_patches=4
+    )
+    inp = torch.randn(2, 3, 5)
+    gate = torch.tensor([[1.0, 0.2, 0.0], [0.1, 1.0, 0.4]])
+    with torch.no_grad():
+        both = decoder(inp, gate, return_ungated=True)
+        plain = decoder(inp)
+    assert torch.allclose(both["reconstruction_ungated"], plain["reconstruction"], atol=1e-5)
+    assert not torch.allclose(both["reconstruction"], plain["reconstruction"], atol=1e-4)
+    assert torch.allclose(both["masks"], decoder(inp, gate)["masks"], atol=1e-5)
+    assert torch.allclose(both["masks_ungated"], plain["masks"], atol=1e-5)
 
 
 def test_mlp_decoder_zero_soft_gate_recovers_ungated():

@@ -458,6 +458,8 @@ class Attention(nn.Module):
         value: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
+        key_weights: Optional[torch.Tensor] = None,
+        key_weight_eps: float = 1e-6,
         return_weights: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         key = key if key is not None else query
@@ -509,6 +511,29 @@ class Attention(nn.Module):
             attn = torch.baddbmm(attn_mask, q_scaled, k.transpose(-2, -1))
         else:
             attn = torch.bmm(q_scaled, k.transpose(-2, -1))
+
+        # Source-gated softmax (predictor):
+        #   B_{i,j}^g = g_j exp(b_{i,j}) / sum_k g_k exp(b_{i,k})
+        # which is softmax(b_{i,j} + log g_j). g is per-key, broadcast over queries/heads.
+        # g_j = 0 → log g_j = -inf so that key gets exactly zero mass. An all-zero
+        # row is 0/0; treat it as uniform (ungated) rather than NaN.
+        if key_weights is not None:
+            expected = (bs, n_keys)
+            if key_weights.shape != expected:
+                raise ValueError(
+                    f"`key_weights` should have shape {expected}, but has shape "
+                    f"{tuple(key_weights.shape)}"
+                )
+            g = key_weights.to(dtype=attn.dtype).clamp_min(0.0)
+            alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
+            g = torch.where(alive, g, torch.ones_like(g))
+            log_g = torch.where(
+                g > 0, g.log(), torch.full_like(g, float("-inf"))
+            )
+            log_g = einops.repeat(
+                log_g, "b n -> (b h) 1 n", b=bs, h=self.num_heads, n=n_keys
+            )
+            attn = attn + log_g
 
         attn = attn.softmax(dim=-1)  # (B x H) x N x M
         pre_dropout_attn = attn
@@ -600,6 +625,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[torch.Tensor] = None,
         keys: Optional[torch.Tensor] = None,
         values: Optional[torch.Tensor] = None,
+        key_weights: Optional[torch.Tensor] = None,
         return_weights: bool = False,
     ) -> torch.Tensor:
         keys = keys if keys is not None else x
@@ -610,6 +636,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
             values,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
+            key_weights=key_weights,
             return_weights=return_weights,
         )
         x = self.dropout1(x)
@@ -642,13 +669,17 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
         src_key_padding_mask: Optional[torch.Tensor] = None,
         memory: Optional[torch.Tensor] = None,
         vel: Optional[torch.Tensor] = None,
+        key_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = src
         if self.norm_first:
             h = self.norm1(x)
             kv = self._keys_values(h, memory, vel)
             x = x + self.scale1(
-                self._sa_block(h, src_mask, src_key_padding_mask, keys=kv, values=kv)
+                self._sa_block(
+                    h, src_mask, src_key_padding_mask, keys=kv, values=kv,
+                    key_weights=key_weights,
+                )
             )
             x = x + self.scale2(self._ff_block(self.norm2(x)))
         else:
@@ -656,7 +687,10 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
             x = self.norm1(
                 x
                 + self.scale1(
-                    self._sa_block(x, src_mask, src_key_padding_mask, keys=kv, values=kv)
+                    self._sa_block(
+                        x, src_mask, src_key_padding_mask, keys=kv, values=kv,
+                        key_weights=key_weights,
+                    )
                 )
             )
             x = self.norm2(x + self.scale2(self._ff_block(x)))
@@ -715,11 +749,12 @@ class TransformerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         memory: Optional[torch.Tensor] = None,
         vel: Optional[torch.Tensor] = None,
+        key_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = inp
 
         for block in self.blocks:
-            x = block(x, mask, key_padding_mask, memory, vel)
+            x = block(x, mask, key_padding_mask, memory, vel, key_weights)
 
         return x
 

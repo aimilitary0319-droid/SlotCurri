@@ -1,0 +1,187 @@
+experiment_group: slotcurri
+experiment_name: movi_c_attnmass_v37r
+
+globals:
+  # SlotCurri MOVi-C backbone / pool (same as movi_c_attnmass_v29.yaml).
+  NUM_SLOTS: 11
+  SLOT_DIM: 64
+  DINO_MODEL: vit_small_patch14_dinov2
+  FEAT_DIM: 384
+  NUM_PATCHES: 576
+  NUM_GPUS: 2
+  BATCH_SIZE_PER_GPU: 64
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 2500
+  val_check_interval: 2500
+  gradient_clip_val: 0.05
+
+optimizer:
+  name: Adam
+  lr: 0.0008
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  experiment_name: ${experiment_name}
+  experiment_group: ${experiment_group}
+  input_type: video
+  max_steps: ${trainer.max_steps}
+  visualize: false
+  visualize_every_n_steps: 10000
+  cyclic_inference: false
+
+  # --- MOVi-C v37r = YTVIS v37r method on the MOVi-C backbone / pool ---
+  #
+  # Dataset / encoder / slot-count / ignore_background follow movi_c_attnmass_v29.yaml.
+  # Feature curriculum is byte-identical to v37 / v37g (Key-only mix, barrier: false).
+  # Gate is the v37 content Gram with the bounded λ1/λ2 map:
+  #      C_s = Z^T diag(a_s^2) Z
+  #      π_s = (λ1 - λ2) / (λ1 + λ2 + eps)
+  #    conf_kind: spectral_ratio. Decoder: softmax(alpha)(π+ε); temporal: π/max(π).
+  feature_curriculum:
+    enabled: true
+    anneal: ncut       # same ReLU-cosine P X as v36
+    apply: key         # Keys only; Value and recon target stay on original X
+    barrier: false     # no 2-way Fiedler/median region
+    anneal_steps: 50000  # s: 0 -> 1 (cosine); remaining 50k is raw Keys
+    schedule: cosine
+    chunk_size: 256    # one shot: 64 img/GPU × 4 frames; occupancy, not math
+    eps: 1.0e-6
+
+  attn_mass_curriculum:
+    enabled: true
+    n_default: 0
+    gate_mode: soft         # inert for purity_weight (kept for the gate stats logging)
+    gate_form: purity_weight
+    conf_kind: spectral_ratio # (λ1-λ2)/(λ1+λ2) on C_s; bounded λ1/λ2
+    spectral_proj_dim: 64   # fixed orthonormal D→64; 0 = full DINO dim (slow)
+    mass_gamma: 1.0         # unused: a^2 in C_s is the sharpening
+    purity_normalize: false # ratio already in [0,1]; isotropic ghosts at 0
+    gate_l1: 0.0
+    gate_div: 0.0
+    state_max_norm: true    # temporal gate alpha = π / max_j(π)
+    contrastive_gate: false # loss_ss ignores the gate (baseline-style)
+
+  losses:
+    loss_featrec:
+      name: MSELoss
+      pred_dims:
+        - 0
+        - ${globals.FEAT_DIM}
+    loss_ss:
+      name: Slot_Slot_Contrastive_Loss
+      pred_key: processor.state
+      temperature: 0.1
+      batch_contrast: true
+      patch_inputs: false
+      keep_input_dim: true
+      gate_negatives: false
+
+  loss_weights:
+    loss_featrec: 1.0
+    loss_ss: 0.5
+
+  initializer:
+    name: FixedLearnedInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.DINO_MODEL}
+      features: vit_block12
+      frozen: true
+      pretrained: true
+      model_kwargs:
+        dynamic_img_size: True
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: true
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: MLPDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    outp_dim: ${globals.FEAT_DIM}
+    hidden_dims: [1024, 1024, 1024]
+    n_patches: ${globals.NUM_PATCHES}
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics:
+  ari:
+    name: VideoARI
+    ignore_background: true
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_ari:
+    name: ImageARI
+    ignore_background: true
+    video_input: true
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  mbo:
+    name: VideoIoU
+    matching: overlap
+    ignore_background: true
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+  image_mbo:
+    name: ImageIoU
+    matching: overlap
+    ignore_background: true
+    video_input: true
+    pred_key: decoder_masks_hard
+    true_key: segmentations
+
+dataset:
+  train_shards: "movi_c/movi_c-train-{000000..000304}.tar"
+  val_shards: "movi_c/movi_c-validation-{000000..000007}.tar"
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 16
+  val_size: 250
+  num_workers: 4
+  num_val_workers: 2
+  train_pipeline:
+    video_size: 24
+    chunk_size: 4
+    sample_one_chunk_per_video: true
+    keys: [video]
+    shuffle_size: 512
+    transforms:
+      name: movi_train
+      type: video
+      input_size: 336
+      h_flip_prob: 0.5
+  val_pipeline:
+    use_chunks: false
+    keys: [video, segmentations]
+    transforms:
+      name: movi_val
+      type: video
+      input_size: 336
+      num_classes: 11

@@ -8,6 +8,15 @@ import torch
 from slotcurri.modules.video import (
     LatentProcessor,
     _N8_OFFSETS,
+    _apply_g_n8,
+    _apply_r_n8,
+    _apply_s_n8,
+    _n8_affinity,
+    _n8_gather,
+    _pad1_hw,
+    _shift_hw,
+    _top2_algebraic_n8,
+    spectral_graph_n8_eigs,
     spectral_graph_n8_slot_purity,
     spectral_graph_slot_purity,
 )
@@ -41,7 +50,8 @@ def _n8_S_dense(z, eps=1e-6):
 
 
 def _hand_pi_n8(
-    att, features, eps=1e-6, divide_by_lambda1=False, l1_minus_imp=False
+    att, features, eps=1e-6, divide_by_lambda1=False, l1_minus_imp=False,
+    use_lambda1=False,
 ):
     z = torch.nn.functional.normalize(features.float(), dim=-1)
     a = att.float()
@@ -56,7 +66,9 @@ def _hand_pi_n8(
         lam1 = evals[:, -1]
         lam2 = evals[:, -2] if n_tokens >= 2 else torch.zeros_like(lam1)
         lam2p = lam2.clamp_min(0.0)
-        if l1_minus_imp:
+        if use_lambda1:
+            out.append(lam1.clamp_min(0.0))
+        elif l1_minus_imp:
             out.append((lam1 - lam2p / (lam1 + eps)).clamp_min(0.0))
         elif divide_by_lambda1:
             out.append(((lam1 - lam2p).clamp_min(0.0) / lam1.clamp_min(eps)).clamp(0.0, 1.0))
@@ -71,6 +83,63 @@ def _mask_xy(grid, ys, ye, xs, xe):
         for x in range(xs, xe):
             a[y * grid + x] = 1.0
     return a
+
+
+def _n8_affinity_shift_hw(z, eps=1e-6):
+    """Original eight-pad affinity; used to lock the pad-once rewrite."""
+    bsz, n_tokens, _ = z.shape
+    grid = int(math.sqrt(n_tokens))
+    z_hw = z.view(bsz, grid, grid, -1)
+    weights = []
+    deg = z.new_zeros(bsz, grid, grid)
+    for dy, dx in _N8_OFFSETS:
+        r = (z_hw * _shift_hw(z_hw, dy, dx)).sum(dim=-1).clamp_min(0.0)
+        weights.append(r)
+        deg = deg + r
+    d_inv = deg.clamp_min(eps).rsqrt()
+    return d_inv, torch.stack(weights, dim=1)
+
+
+def _apply_s_n8_shift_hw(d_inv, weights, vec):
+    bsz, n_tokens, n_c = vec.shape
+    grid = d_inv.shape[1]
+    v_hw = vec.view(bsz, grid, grid, n_c)
+    w_hw = d_inv.unsqueeze(-1) * v_hw
+    acc = vec.new_zeros(bsz, grid, grid, n_c)
+    for i, (dy, dx) in enumerate(_N8_OFFSETS):
+        acc = acc + weights[:, i].unsqueeze(-1) * _shift_hw(w_hw, dy, dx)
+    return (d_inv.unsqueeze(-1) * acc).view(bsz, n_tokens, n_c)
+
+
+def _apply_r_n8_shift_hw(weights, vec):
+    bsz, n_tokens, n_c = vec.shape
+    grid = weights.shape[2]
+    v_hw = vec.view(bsz, grid, grid, n_c)
+    acc = vec.new_zeros(bsz, grid, grid, n_c)
+    for i, (dy, dx) in enumerate(_N8_OFFSETS):
+        acc = acc + weights[:, i].unsqueeze(-1) * _shift_hw(v_hw, dy, dx)
+    return acc.view(bsz, n_tokens, n_c)
+
+
+def test_pad1_gather_matches_shift_hw():
+    torch.manual_seed(0)
+    x = torch.randn(3, 5, 5, 7)
+    xp = _pad1_hw(x)
+    for dy, dx in _N8_OFFSETS:
+        got = _n8_gather(xp, dy, dx, 5, 5)
+        assert torch.equal(got, _shift_hw(x, dy, dx))
+
+
+def test_n8_kernels_match_shift_hw_reference():
+    torch.manual_seed(1)
+    z = torch.nn.functional.normalize(torch.randn(2, 36, 11), dim=-1)
+    vec = torch.randn(2, 36, 14)
+    d_inv, weights = _n8_affinity(z, 1e-6)
+    d_ref, w_ref = _n8_affinity_shift_hw(z, 1e-6)
+    assert torch.equal(d_inv, d_ref)
+    assert torch.equal(weights, w_ref)
+    assert torch.equal(_apply_s_n8(d_inv, weights, vec), _apply_s_n8_shift_hw(d_inv, weights, vec))
+    assert torch.equal(_apply_r_n8(weights, vec), _apply_r_n8_shift_hw(weights, vec))
 
 
 def test_matches_hand_formula_and_is_detached():
@@ -413,6 +482,305 @@ def test_processor_gate_is_n8_l1imp_pi():
         bind_features=feat,
     )
     assert not torch.allclose(out["active_mask"], v39["active_mask"], atol=1e-3)
+
+
+def test_lam1_is_perron_power_pair():
+    """v39lam1 uses q1^T G q1 from +ones power iteration, not k=8 Ritz λ1."""
+    torch.manual_seed(0)
+    att = torch.softmax(torch.randn(2, 4, 36), dim=1)
+    feat = torch.randn(2, 36, 8)
+    z = torch.nn.functional.normalize(feat.float(), dim=-1)
+    a = att.float()
+    lam1, lam2, q1 = _top2_algebraic_n8(
+        z, a, n_iter=16, eps=1e-6, return_q1=True, lam1_only=True
+    )
+    assert torch.equal(lam2, torch.zeros_like(lam2))
+    d_inv, weights = _n8_affinity(z, 1e-6)
+    gq = _apply_g_n8(d_inv, weights, a, q1)
+    rayleigh = (q1 * gq).sum(dim=2).squeeze(-1)
+    assert torch.allclose(lam1, rayleigh, atol=1e-6)
+    pi, lam1_out, lam2_out, q1_out = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, return_q1=True, chunk_size=1
+    )
+    assert torch.allclose(pi, lam1.clamp_min(0.0), atol=1e-6)
+    assert torch.allclose(lam1_out, lam1, atol=1e-6)
+    assert torch.equal(lam2_out, torch.zeros_like(lam2_out))
+    assert torch.allclose(q1_out, q1.squeeze(-1), atol=1e-6)
+    lam1_ritz, _ = _top2_algebraic_n8(z, a, n_iter=16, eps=1e-6, lam1_only=False)
+    assert not torch.allclose(lam1, lam1_ritz, atol=0.0, rtol=0.0)
+
+
+def test_lam1_matches_hand_formula_and_is_detached():
+    torch.manual_seed(0)
+    att = torch.softmax(torch.randn(2, 4, 16), dim=1)
+    att.requires_grad_(True)
+    feat = torch.randn(2, 16, 6, requires_grad=True)
+    pi = spectral_graph_n8_slot_purity(
+        att, feat, chunk_size=1, use_lambda1=True
+    )
+    z = torch.nn.functional.normalize(feat.detach().float(), dim=-1)
+    lam1, _ = _top2_algebraic_n8(
+        z, att.detach().float(), n_iter=16, eps=1e-6, lam1_only=True
+    )
+    assert torch.allclose(pi, lam1.clamp_min(0.0).to(dtype=pi.dtype), atol=1e-6)
+    # Power Rayleigh tracks dense λ1 closely enough on N=16 that occupancy
+    # ranking is unchanged; the gate is not the k=8 Ritz value.
+    expected_dense = _hand_pi_n8(att.detach(), feat.detach(), use_lambda1=True)
+    assert torch.allclose(pi, expected_dense, atol=2e-2)
+    assert not pi.requires_grad
+    assert (pi >= 0).all()
+    gap = spectral_graph_n8_slot_purity(att.detach(), feat.detach(), chunk_size=1)
+    assert not torch.allclose(pi, gap, atol=1e-3)
+
+
+def test_processor_gate_is_n8_lam1():
+    torch.manual_seed(0)
+    att = torch.softmax(torch.randn(2, 3, 16), dim=1)
+    feat = torch.randn(2, 16, 5)
+    processor = LatentProcessor(StubCorrector(att), predictor=None)
+    out = processor(
+        torch.randn(2, 3, 8),
+        torch.randn(2, 16, 8),
+        gate_p=None,
+        default_idx=[],
+        gate_form="purity_weight",
+        conf_kind="spectral_graph_n8_lam1",
+        bind_features=feat,
+        state_max_norm=True,
+    )
+    expected = spectral_graph_n8_slot_purity(att, feat, use_lambda1=True)
+    assert torch.allclose(out["active_mask"], expected, atol=1e-5)
+    v39 = processor(
+        torch.randn(2, 3, 8),
+        torch.randn(2, 16, 8),
+        gate_p=None,
+        default_idx=[],
+        gate_form="purity_weight",
+        conf_kind="spectral_graph_n8",
+        bind_features=feat,
+        state_max_norm=True,
+    )
+    assert not torch.allclose(out["active_mask"], v39["active_mask"], atol=1e-3)
+
+
+def test_v39lam1_configs_parse():
+    from slotcurri import configuration
+
+    v39 = configuration.load_config("configs/slotcurri/ytvis2021_attnmass_v39.yaml")
+    assert v39.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8"
+    assert str(v39.model.attn_mass_curriculum.get("state_conf_kind", "") or "") in (
+        "",
+        "pi",
+    )
+
+    for path, name, n_slots in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1.yaml",
+            "ytvis_attnmass_v39lam1",
+            7,
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1.yaml",
+            "movi_c_attnmass_v39lam1",
+            11,
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["gate_form"] == "purity_weight"
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert str(amc.get("state_conf_kind", "") or "") in ("", "pi")
+        assert bool(amc.get("purity_normalize", False)) is False
+        assert bool(amc["state_max_norm"]) is True
+        assert int(cfg.globals["NUM_SLOTS"]) == n_slots
+        fc = cfg.model.feature_curriculum
+        assert bool(fc["enabled"]) is True
+        assert fc["anneal"] == "ncut"
+        assert fc["apply"] == "key"
+        assert bool(fc["barrier"]) is False
+
+
+def test_v39lam1g_configs_parse_predictor_src_gate():
+    from slotcurri import configuration
+
+    for path, name, n_slots in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1g.yaml",
+            "ytvis_attnmass_v39lam1g",
+            7,
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1g.yaml",
+            "movi_c_attnmass_v39lam1g",
+            11,
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["gate_form"] == "purity_weight"
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert bool(amc.get("predictor_ungated", False)) is False
+        assert bool(amc["state_max_norm"]) is True
+        assert int(cfg.globals["NUM_SLOTS"]) == n_slots
+        lam1 = configuration.load_config(path.replace("lam1g", "lam1"))
+        assert bool(lam1.model.attn_mass_curriculum.get("predictor_src_gate", False)) is False
+
+
+def test_v39lam1gu_configs_split_featrec():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu.yaml",
+            "ytvis_attnmass_v39lam1gu",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu.yaml",
+            "movi_c_attnmass_v39lam1gu",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert bool(amc["predictor_src_gate"]) is True
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        losses = cfg.model.losses
+        assert "loss_featrec" in losses
+        assert losses["loss_featrec_ungated"]["pred_key"] == "decoder.reconstruction_ungated"
+        weights = cfg.model.loss_weights
+        assert abs(float(weights["loss_featrec"]) - 1.0) < 1e-9
+        assert abs(float(weights["loss_featrec_ungated"]) - 0.5) < 1e-9
+        assert abs(float(weights["loss_ss"]) - 0.5) < 1e-9
+        parent = configuration.load_config(path.replace("lam1gu", "lam1g"))
+        assert "loss_featrec_ungated" not in parent.model.losses
+
+
+def test_v39lam1gu_umix_configs_predictor_input_mix():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix.yaml",
+            "ytvis_attnmass_v39lam1gu_umix",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix.yaml",
+            "movi_c_attnmass_v39lam1gu_umix",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert bool(amc["predictor_input_mix"]) is True
+        assert bool(amc["state_max_norm"]) is True
+        assert "loss_featrec_ungated" in cfg.model.losses
+        parent = configuration.load_config(path.replace("lam1gu_umix", "lam1gu"))
+        assert bool(parent.model.attn_mass_curriculum.get("predictor_input_mix", False)) is False
+        assert parent.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8_lam1"
+
+
+def test_v39lam1gu_umix_perron_configs():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron.yaml",
+            "ytvis_attnmass_v39lam1gu_umix_perron",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron.yaml",
+            "movi_c_attnmass_v39lam1gu_umix_perron",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_input_mix"]) is True
+        assert bool(amc["perron_readout"]) is True
+        assert bool(amc.get("eval_perron_readout", False)) is False
+        parent = configuration.load_config(path.replace("_perron", ""))
+        assert bool(parent.model.attn_mass_curriculum.get("perron_readout", False)) is False
+        assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+
+
+def test_v39lam1u_configs_split_featrec_no_src_gate():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1u.yaml",
+            "ytvis_attnmass_v39lam1u",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1u.yaml",
+            "movi_c_attnmass_v39lam1u",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["gate_form"] == "purity_weight"
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is False
+        assert bool(amc.get("predictor_ungated", False)) is False
+        assert bool(amc["state_max_norm"]) is True
+        losses = cfg.model.losses
+        assert "loss_featrec" in losses
+        assert losses["loss_featrec_ungated"]["pred_key"] == "decoder.reconstruction_ungated"
+        weights = cfg.model.loss_weights
+        assert abs(float(weights["loss_featrec"]) - 1.0) < 1e-9
+        assert abs(float(weights["loss_featrec_ungated"]) - 0.5) < 1e-9
+        assert abs(float(weights["loss_ss"]) - 0.5) < 1e-9
+        lam1 = configuration.load_config(path.replace("lam1u", "lam1"))
+        assert bool(lam1.model.attn_mass_curriculum.get("predictor_src_gate", False)) is False
+        assert "loss_featrec_ungated" not in lam1.model.losses
+        lam1gu = configuration.load_config(path.replace("lam1u", "lam1gu"))
+        assert bool(lam1gu.model.attn_mass_curriculum["predictor_src_gate"]) is True
+        assert "loss_featrec_ungated" in lam1gu.model.losses
+
+
+def test_v39gu_configs_gap_plus_src_gate_split_featrec():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39gu.yaml",
+            "ytvis_attnmass_v39gu",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39gu.yaml",
+            "movi_c_attnmass_v39gu",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert bool(amc["predictor_src_gate"]) is True
+        assert amc["conf_kind"] == "spectral_graph_n8"
+        losses = cfg.model.losses
+        assert "loss_featrec" in losses
+        assert losses["loss_featrec_ungated"]["pred_key"] == "decoder.reconstruction_ungated"
+        weights = cfg.model.loss_weights
+        assert abs(float(weights["loss_featrec"]) - 1.0) < 1e-9
+        assert abs(float(weights["loss_featrec_ungated"]) - 0.5) < 1e-9
+        assert abs(float(weights["loss_ss"]) - 0.5) < 1e-9
+        parent = configuration.load_config(path.replace("v39gu", "v39"))
+        assert parent.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8"
+        assert bool(parent.model.attn_mass_curriculum.get("predictor_src_gate", False)) is False
+        assert "loss_featrec_ungated" not in parent.model.losses
+        lam1gu = configuration.load_config(path.replace("v39gu", "v39lam1gu"))
+        assert lam1gu.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(lam1gu.model.attn_mass_curriculum["predictor_src_gate"]) is True
+        assert "loss_featrec_ungated" in lam1gu.model.losses
+        eabis = configuration.load_config(path.replace("v39gu", "v39lam1gu_eabis"))
+        assert eabis.model.cyclic_inference == "evidence_sum"
+        assert eabis.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8_lam1"
 
 
 def test_v39s_config_parses_l1imp():

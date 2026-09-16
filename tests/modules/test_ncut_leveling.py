@@ -81,6 +81,17 @@ def test_ncut_chunking_matches():
     assert torch.allclose(a, b, atol=1e-4)
 
 
+def test_no_barrier_cuda_matches_cpu():
+    if not torch.cuda.is_available():
+        return
+    x = _two_cluster_tokens(noise=0.0).cuda()
+    out = NcutRelationalLeveling(chunk_size=2, barrier=False).cuda()(x, 0.0)
+    assert torch.isfinite(out).all()
+    assert out.shape == x.shape
+    cpu = NcutRelationalLeveling(chunk_size=2, barrier=False)(x.cpu(), 0.0)
+    assert torch.allclose(out.cpu(), cpu, atol=1e-4, rtol=1e-4)
+
+
 def test_no_barrier_is_global_relu_cosine_leveling():
     """v37: skip Fiedler/median; P is row-normalize(W) on the full graph."""
     n, dim = 8, 4

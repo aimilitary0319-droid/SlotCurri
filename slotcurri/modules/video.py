@@ -1,10 +1,12 @@
 import math
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 from torch import nn
 
+from slotcurri.modules.networks import MLP, TransformerEncoder
+from slotcurri.modules.usage_redistribute import sparsemax
 from slotcurri.utils import make_build_fn
 
 
@@ -23,6 +25,41 @@ def _max_norm(gate: Optional[torch.Tensor], enabled: bool) -> Optional[torch.Ten
     if not enabled or gate is None or gate.dtype == torch.bool:
         return gate
     return gate / gate.amax(dim=-1, keepdim=True).clamp_min(1e-8)
+
+
+def _eval_hard_threshold(gate: Optional[torch.Tensor], thresh: float) -> Optional[torch.Tensor]:
+    """Eval-only binarize: float π -> bool 1{π >= thresh}. Bool / None / thresh<=0 pass through.
+
+    purity_weight ignores gate_mode, so hard dormancy at test time has to be applied
+    after π is built. Decoder then takes the bool path (masked softmax); the mix
+    and Pred src-gate see 0/1.
+    """
+    if gate is None or thresh is None or float(thresh) <= 0.0:
+        return gate
+    if gate.dtype == torch.bool:
+        return gate
+    return gate >= float(thresh)
+
+
+def _perron_spatial_gate(
+    pi: torch.Tensor, q1: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Decoder gate π_s * q̃_{1,s}. q1 is the Perron mode of the same G_s as π.
+
+    q1 is L2-unit, so raw values confound support size with occupancy. Per-slot
+    max-norm keeps the occupancy scale in π and uses q1 only as a spatial
+    profile in [0, 1]. Sign is flipped if a numerical inversion left q1 in the
+    negative cone (power iteration from +ones is nonnegative).
+
+    pi: (B, S), q1: (B, S, N) or (B, S, N, 1) -> (B, S, N)
+    """
+    q = q1.squeeze(-1) if q1.ndim == 4 else q1
+    q = q.to(dtype=pi.dtype)
+    flip = (q.sum(dim=-1, keepdim=True) < 0).to(dtype=q.dtype)
+    q = q * (1.0 - 2.0 * flip)
+    q = q.clamp_min(0.0)
+    q = q / q.amax(dim=-1, keepdim=True).clamp_min(float(eps))
+    return pi.unsqueeze(-1) * q
 
 
 def _slot_identity_cos(
@@ -57,6 +94,15 @@ def _temporal_gate_smooth(
     if h > 0.0:
         out = torch.maximum(out, h * prev)
     return out
+
+
+def _leaky_max_gate(
+    cur: torch.Tensor, prev: Optional[torch.Tensor], gamma: float
+) -> torch.Tensor:
+    """π̃_t = max(π_t, γ π̃_{t-1}). γ=0 or a missing prev is identity."""
+    if prev is None or float(gamma) <= 0.0:
+        return cur
+    return torch.maximum(cur, float(gamma) * prev.detach())
 
 
 def _threshold_is_open(p_thresh) -> bool:
@@ -135,6 +181,8 @@ def _qr_mgs(q: torch.Tensor, eps: float) -> torch.Tensor:
 
     Avoids `torch.linalg.qr` / geqrf on many skinny tall factors (the v37
     spectral bottleneck when k=2, and v38 when k=8 on N-dimensional G_s).
+    Columns stay separate tensors until `stack` so later writes cannot bump
+    the version of an earlier column (live n8 impurity autograd).
     """
     cols = []
     for i in range(q.shape[-1]):
@@ -149,6 +197,50 @@ def _qr_mgs(q: torch.Tensor, eps: float) -> torch.Tensor:
 def _qr_k2(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Batched modified Gram-Schmidt for k=2. q: (..., D, 2) -> (..., D, 2)."""
     return _qr_mgs(q, eps)
+
+
+_PROJ_CACHE: Dict[tuple, torch.Tensor] = {}
+_EIGH_DIM = 96
+
+
+def _orthonormal_proj(
+    d_in: int, d_out: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Fixed orthonormal D→d map (seeded QR). Cached per (D, d, device, dtype)."""
+    key = (int(d_in), int(d_out), str(device), str(dtype))
+    cached = _PROJ_CACHE.get(key)
+    if cached is not None:
+        return cached
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(37000 + int(d_in) * 10007 + int(d_out))
+    raw = torch.randn(int(d_in), int(d_out), generator=gen, dtype=torch.float32)
+    q, _ = torch.linalg.qr(raw, mode="reduced")
+    proj = q.to(device=device, dtype=dtype)
+    _PROJ_CACHE[key] = proj
+    return proj
+
+
+def _weighted_grams(z: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    """C_s = Z^T diag(a^2) Z as (B, S, d, d). W = a ⊙ Z, C = W^T W.
+
+    Do not einsum `bnd,bsn,bne->bsde`: that path materializes a (B,S,N,d,d)
+    intermediate (several GB at YTVIS/MOVi shapes) even when d=64.
+    """
+    w = a.unsqueeze(-1) * z.unsqueeze(1)
+    cmat = torch.matmul(w.transpose(-1, -2), w)
+    return 0.5 * (cmat + cmat.transpose(-1, -2))
+
+
+def _top2_gap_c_eigh(z: torch.Tensor, a: torch.Tensor, eps: float) -> torch.Tensor:
+    """λ1-λ2 of C_s = Z^T diag(a^2) Z by forming the d×d Gram. z: (B, N, d)."""
+    dim = z.shape[-1]
+    if dim < 2:
+        lam1 = torch.einsum("bnd,bsn,bnd->bs", z, a * a, z).clamp_min(0.0)
+        return lam1
+    cmat = _weighted_grams(z, a)
+    eye = torch.eye(dim, device=z.device, dtype=z.dtype).mul_(float(eps))
+    evals = torch.linalg.eigvalsh(cmat + eye)
+    return (evals[..., -1] - evals[..., -2]).clamp_min(0.0)
 
 
 def _top2_gap_c_from_z(
@@ -201,34 +293,107 @@ def _top2_gap_c_from_z(
     return (evals[..., 1] - evals[..., 0]).clamp_min(0.0)
 
 
+def _top2_eigs_c_eigh(
+    z: torch.Tensor, a: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """λ1 ≥ λ2 of C_s = Z^T diag(a^2) Z by forming the d×d Gram. Live in a.
+
+    No ridge: empty slots must stay λ1=λ2=0 so ρ=λ2/(λ1+eps)→0. The v37
+    gate gap λ1-λ2 is invariant to eps I; the ratio is not.
+    z: (B, N, d), a: (B, S, N) -> (B, S), (B, S).
+    """
+    dim = z.shape[-1]
+    if dim < 2:
+        lam1 = torch.einsum("bnd,bsn,bnd->bs", z, a * a, z).clamp_min(0.0)
+        return lam1, torch.zeros_like(lam1)
+    evals = torch.linalg.eigvalsh(_weighted_grams(z, a))
+    return evals[..., -1].clamp_min(0.0), evals[..., -2].clamp_min(0.0)
+
+
+def _top2_eigs_c_from_z(
+    z: torch.Tensor, a: torch.Tensor, n_iter: int, eps: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """λ1 ≥ λ2 of C_s via the same 2D subspace / Ritz as `_top2_gap_c_from_z`."""
+    bsz, n_slots, _ = a.shape
+    dim = z.shape[-1]
+    if dim < 2:
+        lam1 = torch.einsum("bnd,bsn,bnd->bs", z, a * a, z).clamp_min(0.0)
+        return lam1, torch.zeros_like(lam1)
+
+    a2 = a * a
+    ones = torch.ones(bsz, n_slots, dim, 1, device=z.device, dtype=z.dtype)
+    grid = torch.linspace(-1.0, 1.0, dim, device=z.device, dtype=z.dtype)
+    q = torch.cat(
+        [ones, grid.view(1, 1, dim, 1).expand(bsz, n_slots, -1, -1)], dim=-1
+    )
+    q = _qr_k2(q, eps)
+
+    def apply_c(basis: torch.Tensor) -> torch.Tensor:
+        n_k = basis.shape[-1]
+        zq = torch.bmm(
+            z, basis.permute(0, 2, 1, 3).reshape(bsz, dim, n_slots * n_k)
+        )
+        zq = zq.view(bsz, z.shape[1], n_slots, n_k).permute(0, 2, 1, 3)
+        zq = a2.unsqueeze(-1) * zq
+        cq = torch.bmm(
+            z.transpose(1, 2),
+            zq.permute(0, 2, 1, 3).reshape(bsz, z.shape[1], n_slots * n_k),
+        )
+        return cq.view(bsz, dim, n_slots, n_k).permute(0, 2, 1, 3)
+
+    n_iter = max(int(n_iter), 1)
+    for _ in range(n_iter):
+        q = _qr_k2(apply_c(q) + float(eps) * q, eps)
+
+    cq = apply_c(q)
+    rax = torch.matmul(q.transpose(-1, -2), cq)
+    rax = 0.5 * (rax + rax.transpose(-1, -2))
+    evals = torch.linalg.eigvalsh(rax)
+    return evals[..., 1].clamp_min(0.0), evals[..., 0].clamp_min(0.0)
+
+
 def spectral_slot_purity(
     att: torch.Tensor,
     features: torch.Tensor,
     eps: float = 1e-6,
-    chunk_size: int = 64,
+    chunk_size: int = 256,
     n_iter: int = 16,
+    divide_by_mass: bool = True,
+    proj_dim: int = 0,
+    ratio: bool = False,
 ) -> torch.Tensor:
-    """Detached spectral slot purity π_s (v37). No gamma, no 1/K normalization.
+    """Detached spectral slot purity π_s (v37 / v37g). No gamma; no 1/K here.
 
     Last-iter ownership a_s = A_{:,s} and L2-normalized bind tokens Z give
 
         C_s = Z^T diag(a_s^2) Z
 
-    then π_s = clip((λ1 - λ2) / (sum_i A_{i,s} + eps), 0, 1). a^2 already sharpens,
-    so mass_gamma is not applied here. Rank-1 exclusive ownership recovers the
-    ownership purity Σ a^2 / Σ A; a slot covering two feature modes raises λ2 and
-    drops π even when ownership is exclusive (the v32 blind spot N-cut was papering
-    over). features is X^bind at DINO dim (Key-only curriculum's bind tokens;
-    raw backbone tokens when the curriculum is off / mix=1).
+    then the gap λ1-λ2. v37 (`divide_by_mass=True`) returns
+    clip(gap / (sum_i A_{i,s} + eps), 0, 1): rank-1 exclusive ownership recovers
+    Σ a^2 / Σ A. The v36 1/K map, if enabled, is applied later in
+    `_purity_weight_gate`, not here. v37g (`divide_by_mass=False`) returns the
+    raw gap, same as v38/v39's λ1-λ2 on their graphs: occupancy stays in λ1,
+    two feature modes still raise λ2. v37r (`ratio=True`) returns
+    (λ1-λ2)/(λ1+λ2+eps) in [0, 1], the bounded map of λ1/λ2:
+    (r-1)/(r+1) with r=λ1/λ2. Empty / isotropic slots (λ1≈λ2) go to 0
+    without a threshold; raw λ1/λ2 is not used (it explodes at λ2=0).
+    a^2 is the within-slot moment (rank-1 ownership); across-slot gamma
+    is not applied.
+    features is X^bind at DINO dim (Key-only curriculum's bind tokens; raw
+    backbone tokens when the curriculum is off / mix=1).
 
-    λ1, λ2 come from k=2 subspace iteration on C_s (same method as the Ncut
-    Fiedler): π only needs that gap, not the full spectrum of the D×D matrix.
-    Matvecs are Z^T (a^2 ⊙ (Z q)); the (B, S, N, D) token copies are never
-    materialized. `chunk_size` only bounds peak memory.
+    `proj_dim` > 0 and < D maps Z through a fixed orthonormal D→d matrix
+    (seeded QR) then re-normalizes. Person-vs-car modes survive a 64-d
+    Johnson–Lindenstrauss map. Top-2 of C_s is 16 subspace iters + MGS
+    (same solver family as v39 n8), not batched eigvalsh of the d×d Gram.
+    `proj_dim=0` is the original full-D path. `chunk_size` bounds peak
+    memory on that path.
     """
     if features is None:
         raise ValueError(
-            "conf_kind='spectral' requires bind_features (encoder backbone tokens)"
+            "conf_kind='spectral' / 'spectral_gap' / 'spectral_ratio' "
+            "requires bind_features "
+            "(encoder backbone tokens)"
         )
     if att.ndim != 3 or features.ndim != 3:
         raise ValueError(
@@ -246,17 +411,114 @@ def spectral_slot_purity(
     )
     with torch.no_grad(), amp_ctx:
         z = torch.nn.functional.normalize(features.float(), dim=-1)
+        d_out = int(proj_dim)
+        if d_out > 0 and d_out < z.shape[-1]:
+            z = torch.nn.functional.normalize(
+                z @ _orthonormal_proj(z.shape[-1], d_out, z.device, z.dtype),
+                dim=-1,
+            )
         a = att.float()
         mass = a.sum(dim=-1)
+        # Always 2D subspace / MGS for λ1-λ2. Batched eigvalsh of C_s is the
+        # v37-only tax vs v39 n8: MOVi is ~256 frames × 11 slots = 2816 of
+        # 64×64 syev, YTVIS 128×7. proj_dim only sets the matvec width; it
+        # does not pick the eigensolver. chunk_size bounds peak memory when
+        # proj_dim=0 (full DINO dim).
         bsz = a.shape[0]
-        gaps = a.new_empty(bsz, a.shape[1])
         step = max(int(chunk_size), 1)
-        for i in range(0, bsz, step):
-            gaps[i : i + step] = _top2_gap_c_from_z(
-                z[i : i + step], a[i : i + step], n_iter, eps
-            )
-        pi = (gaps / (mass + float(eps))).clamp(0.0, 1.0)
+        if ratio:
+            if z.shape[-1] < 2:
+                lam1, lam2 = _top2_eigs_c_eigh(z, a)
+            else:
+                lam1 = a.new_empty(bsz, a.shape[1])
+                lam2 = a.new_empty(bsz, a.shape[1])
+                for i in range(0, bsz, step):
+                    l1, l2 = _top2_eigs_c_from_z(
+                        z[i : i + step], a[i : i + step], n_iter, eps
+                    )
+                    lam1[i : i + step] = l1
+                    lam2[i : i + step] = l2
+            pi = ((lam1 - lam2) / (lam1 + lam2 + float(eps))).clamp(0.0, 1.0)
+        else:
+            if z.shape[-1] < 2:
+                gaps = _top2_gap_c_eigh(z, a, eps)
+            else:
+                gaps = a.new_empty(bsz, a.shape[1])
+                for i in range(0, bsz, step):
+                    gaps[i : i + step] = _top2_gap_c_from_z(
+                        z[i : i + step], a[i : i + step], n_iter, eps
+                    )
+            if divide_by_mass:
+                pi = (gaps / (mass + float(eps))).clamp(0.0, 1.0)
+            else:
+                pi = gaps.clamp_min(0.0)
     return pi.detach().to(dtype=att.dtype)
+
+
+def spectral_cs_impurity(
+    att: torch.Tensor,
+    features: torch.Tensor,
+    eps: float = 1e-6,
+    chunk_size: int = 64,
+    n_iter: int = 16,
+    proj_dim: int = 0,
+) -> torch.Tensor:
+    """Differentiable v37 Gram impurity ρ_s = max(λ2, 0) / (max(λ1, 0) + eps).
+
+    Same C_s = Z^T diag(a_s^2) Z as the v37 gate, but the loss uses the
+    scale-free ratio (no /mass, no across-slot gamma). Z is detached
+    (frozen DINO). a is live last-iter softmax so two feature modes can
+    split a slot. att (B, S, N), features (B, N, D) -> rho (B, S).
+    `proj_dim` matches the v37 gate: 64-d JL, then 16 subspace iters +
+    2D Ritz for (λ1, λ2). Not batched eigvalsh of the d×d Gram.
+    `proj_dim=0` is full D. `chunk_size` bounds peak memory on that path.
+    """
+    if features is None:
+        raise ValueError(
+            "spectral_cs_impurity requires bind_features "
+            "(encoder backbone tokens)"
+        )
+    if att.ndim != 3 or features.ndim != 3:
+        raise ValueError(
+            f"C_s impurity expects att (B, S, N) and features (B, N, D), "
+            f"got {tuple(att.shape)} and {tuple(features.shape)}"
+        )
+    if att.shape[0] != features.shape[0] or att.shape[-1] != features.shape[1]:
+        raise ValueError(
+            f"C_s impurity batch/token mismatch: att {tuple(att.shape)} vs "
+            f"features {tuple(features.shape)}"
+        )
+
+    amp_ctx = (
+        torch.cuda.amp.autocast(enabled=False) if att.is_cuda else nullcontext()
+    )
+    with amp_ctx:
+        z = torch.nn.functional.normalize(features.float(), dim=-1).detach()
+        d_out = int(proj_dim)
+        if d_out > 0 and d_out < z.shape[-1]:
+            z = torch.nn.functional.normalize(
+                z @ _orthonormal_proj(z.shape[-1], d_out, z.device, z.dtype),
+                dim=-1,
+            )
+        a = att.float()
+        # Same 2D subspace as the v37 gate. Batched eigvalsh of C_s is the
+        # old tax; proj_dim only sets the matvec width.
+        if z.shape[-1] < 2:
+            lam1, lam2 = _top2_eigs_c_eigh(z, a)
+        else:
+            step = max(int(chunk_size), 1)
+            lam1_chunks = []
+            lam2_chunks = []
+            for i in range(0, a.shape[0], step):
+                l1, l2 = _top2_eigs_c_from_z(
+                    z[i : i + step], a[i : i + step], n_iter, eps
+                )
+                lam1_chunks.append(l1)
+                lam2_chunks.append(l2)
+            lam1 = torch.cat(lam1_chunks, dim=0)
+            lam2 = torch.cat(lam2_chunks, dim=0)
+        rho = lam2.clamp_min(0.0) / (lam1.clamp_min(0.0) + float(eps))
+    return rho.to(dtype=att.dtype)
 
 
 def _relation_graph_S(z: torch.Tensor, eps: float) -> torch.Tensor:
@@ -309,19 +571,49 @@ def _shift_hw(x: torch.Tensor, dy: int, dx: int) -> torch.Tensor:
     return xp[:, y0 : y0 + height, x0 : x0 + width]
 
 
+def _pad1_hw(x: torch.Tensor) -> torch.Tensor:
+    """Zero-pad spatial dims 1,2 by 1. Same values as eight `_shift_hw` calls."""
+    tail = x.ndim - 3
+    pad = (0, 0) * tail + (1, 1, 1, 1)
+    return torch.nn.functional.pad(x, pad)
+
+
+def _n8_gather(xp: torch.Tensor, dy: int, dx: int, height: int, width: int) -> torch.Tensor:
+    """Slice +1-padded `xp` so out[y, x] = orig[y-dy, x-dx] (0 outside).
+
+    Identical to `_shift_hw(orig, dy, dx)` when `xp = _pad1_hw(orig)`.
+    """
+    return xp[:, 1 - dy : 1 - dy + height, 1 - dx : 1 - dx + width]
+
+
+def _n8_weighted_sum(field: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """acc[y,x] = Σ_i weights[i,y,x] * field[y-dy_i, x-dx_i]; offset order is `_N8_OFFSETS`.
+
+    field: (B, H, W, C), weights: (B, 8, H, W). One pad instead of eight `_shift_hw`.
+    """
+    height, width = field.shape[1], field.shape[2]
+    fp = _pad1_hw(field)
+    acc = field.new_zeros(field.shape)
+    for i, (dy, dx) in enumerate(_N8_OFFSETS):
+        acc = acc + weights[:, i].unsqueeze(-1) * _n8_gather(fp, dy, dx, height, width)
+    return acc
+
+
 def _n8_affinity(z: torch.Tensor, eps: float):
     """Precompute 8-neighbor ReLU-cosine weights and d^{-1/2}.
 
     z: (B, N, D) L2-normalized -> d_inv (B, H, W), weights (B, 8, H, W).
     Affinity is fixed for the eigensolve, so matvecs must not recompute z·z_nb.
+    Same formula as eight `_shift_hw` dots; pad Z once.
     """
     bsz, n_tokens, _ = z.shape
     grid = _square_grid(n_tokens)
     z_hw = z.view(bsz, grid, grid, -1)
+    zp = _pad1_hw(z_hw)
     weights = []
     deg = z.new_zeros(bsz, grid, grid)
     for dy, dx in _N8_OFFSETS:
-        r = (z_hw * _shift_hw(z_hw, dy, dx)).sum(dim=-1).clamp_min(0.0)
+        r = (z_hw * _n8_gather(zp, dy, dx, grid, grid)).sum(dim=-1).clamp_min(0.0)
         weights.append(r)
         deg = deg + r
     d_inv = deg.clamp_min(eps).rsqrt()
@@ -339,10 +631,77 @@ def _apply_s_n8(
     grid = d_inv.shape[1]
     v_hw = vec.view(bsz, grid, grid, n_c)
     w_hw = d_inv.unsqueeze(-1) * v_hw
-    acc = vec.new_zeros(bsz, grid, grid, n_c)
-    for i, (dy, dx) in enumerate(_N8_OFFSETS):
-        acc = acc + weights[:, i].unsqueeze(-1) * _shift_hw(w_hw, dy, dx)
+    acc = _n8_weighted_sum(w_hw, weights)
     return (d_inv.unsqueeze(-1) * acc).view(bsz, n_tokens, n_c)
+
+
+def _apply_r_n8(weights: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+    """Unnormalized 8-neighbor affinity R v. Never forms N×N.
+
+    weights: (B, 8, H, W), vec: (B, N, C) -> (B, N, C).
+    """
+    bsz, n_tokens, n_c = vec.shape
+    grid = weights.shape[2]
+    v_hw = vec.view(bsz, grid, grid, n_c)
+    return _n8_weighted_sum(v_hw, weights).view(bsz, n_tokens, n_c)
+
+
+def _support_threshold(
+    a: torch.Tensor, support_rel: float, eps: float
+) -> torch.Tensor:
+    """Zero patches below support_rel * max_j a_j. support_rel<=0 keeps a."""
+    if float(support_rel) <= 0.0:
+        return a
+    thr = float(support_rel) * a.amax(dim=-1, keepdim=True).clamp_min(eps)
+    return torch.where(a >= thr, a, torch.zeros_like(a))
+
+
+def _induced_n8_d_inv(
+    weights: torch.Tensor, a: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """D^{-1/2} of W = diag(a) R diag(a). a: (B, S, N) -> (B, S, N).
+
+    Isolated / below-eps rows get d_inv=0 so they drop out of S_ind.
+    """
+    packed = a.permute(0, 2, 1)
+    ra = _apply_r_n8(weights, packed).permute(0, 2, 1)
+    deg = a * ra
+    alive = (deg > float(eps)).to(dtype=deg.dtype)
+    return deg.clamp_min(eps).rsqrt() * alive.detach()
+
+
+def _apply_s_ind_n8(
+    weights: torch.Tensor,
+    d_inv: torch.Tensor,
+    a: torch.Tensor,
+    basis: torch.Tensor,
+) -> torch.Tensor:
+    """Induced S v = d_inv ⊙ a ⊙ R(a ⊙ d_inv ⊙ v). Re-normalized on support."""
+    bsz, n_slots, n_tokens = a.shape
+    n_k = basis.shape[-1]
+    av = a.unsqueeze(-1) * d_inv.unsqueeze(-1) * basis
+    packed = av.permute(0, 2, 1, 3).reshape(bsz, n_tokens, n_slots * n_k)
+    rav = _apply_r_n8(weights, packed)
+    rav = rav.view(bsz, n_tokens, n_slots, n_k).permute(0, 2, 1, 3)
+    return d_inv.unsqueeze(-1) * a.unsqueeze(-1) * rav
+
+
+def _top2_induced_n8(
+    z: torch.Tensor,
+    a: torch.Tensor,
+    n_iter: int,
+    eps: float,
+    support_rel: float,
+):
+    """Algebraic λ1 ≥ λ2 of the induced n8 normalized adjacency S_ind."""
+    _, weights = _n8_affinity(z, eps)
+    a_s = _support_threshold(a, support_rel, eps)
+    d_inv = _induced_n8_d_inv(weights, a_s, eps)
+
+    def apply_g(basis: torch.Tensor) -> torch.Tensor:
+        return _apply_s_ind_n8(weights, d_inv, a_s, basis)
+
+    return _top2_algebraic_g(apply_g, a_s, n_iter, eps), a_s
 
 
 def _apply_g_n8(
@@ -384,18 +743,28 @@ def _top2_algebraic_g(
     a: torch.Tensor,
     n_iter: int,
     eps: float,
+    return_q1: bool = False,
+    lam1_only: bool = False,
 ):
     """Algebraic λ1 ≥ λ2 of G_s given Gv = apply_g(v).
 
     G is not PSD (zero diagonal). For a nonnegative symmetric matrix the
-    spectral radius is λ1, so |λ_min| ≤ λ1. Shift H = G + (λ1 + eps) I
-    (Perron λ1 from a power iteration) so H is PSD with condition ~2, then
+    spectral radius is λ1, so |λ_min| ≤ λ1. A +ones power iteration gives the
+    Perron pair (q1, q1^T G q1). v39lam1 (`lam1_only`) stops there: occupancy
+    only needs that pair, and the k=8 Ritz below exists to resolve λ2.
+
+    Otherwise shift H = G + (λ1 + eps) I so H is PSD with condition ~2, then
     a k=8 subspace iteration + Rayleigh-Ritz; the two largest Ritz values
     minus the shift are λ1, λ2 of G. Matvecs never form G.
     """
     bsz, n_slots, n_tokens = a.shape
     zero = a.new_zeros(bsz, n_slots)
     if n_tokens < 2:
+        if return_q1:
+            q0 = torch.ones(
+                bsz, n_slots, n_tokens, 1, device=a.device, dtype=a.dtype
+            )
+            return zero, zero, q0
         return zero, zero
 
     n_iter = max(int(n_iter), 1)
@@ -408,6 +777,10 @@ def _top2_algebraic_g(
         nrm = gq.norm(dim=2, keepdim=True)
         q1 = torch.where(nrm > float(eps), gq / nrm.clamp_min(eps), q1)
     lam1 = (q1 * apply_g(q1)).sum(dim=2).squeeze(-1)
+    if lam1_only:
+        if return_q1:
+            return lam1, zero, q1
+        return lam1, zero
     shift = lam1.clamp_min(0.0) + float(eps)
 
     n_k = int(min(8, n_tokens))
@@ -430,6 +803,8 @@ def _top2_algebraic_g(
     rax = 0.5 * (rax + rax.transpose(-1, -2))
     evals_h = torch.linalg.eigvalsh(rax)
     lam = evals_h[..., -2:] - shift.unsqueeze(-1)
+    if return_q1:
+        return lam[..., 1], lam[..., 0], q1
     return lam[..., 1], lam[..., 0]
 
 
@@ -445,15 +820,25 @@ def _top2_algebraic_diag_s_diag(
 
 
 def _top2_algebraic_n8(
-    z: torch.Tensor, a: torch.Tensor, n_iter: int, eps: float
+    z: torch.Tensor,
+    a: torch.Tensor,
+    n_iter: int,
+    eps: float,
+    return_q1: bool = False,
+    lam1_only: bool = False,
 ):
-    """Algebraic λ1 ≥ λ2 of G_s on the 8-neighbor ReLU-cosine S (v39)."""
+    """Algebraic λ1 ≥ λ2 of G_s on the 8-neighbor ReLU-cosine S (v39).
+
+    lam1_only is v39lam1: Perron power pair, no k=8 Ritz / λ2.
+    """
     d_inv, weights = _n8_affinity(z, eps)
 
     def apply_g(basis: torch.Tensor) -> torch.Tensor:
         return _apply_g_n8(d_inv, weights, a, basis)
 
-    return _top2_algebraic_g(apply_g, a, n_iter, eps)
+    return _top2_algebraic_g(
+        apply_g, a, n_iter, eps, return_q1=return_q1, lam1_only=lam1_only
+    )
 
 
 def spectral_graph_slot_purity(
@@ -511,7 +896,7 @@ def spectral_graph_slot_purity(
     return pi.detach().to(dtype=att.dtype)
 
 
-def spectral_graph_n8_slot_purity(
+def spectral_graph_n8_eigs(
     att: torch.Tensor,
     features: torch.Tensor,
     eps: float = 1e-6,
@@ -519,26 +904,14 @@ def spectral_graph_n8_slot_purity(
     n_iter: int = 16,
     divide_by_lambda1: bool = False,
     l1_minus_imp: bool = False,
-) -> torch.Tensor:
-    """Detached 8-neighbor relation-graph spectral purity π_s (v39 / v39n / v39s).
-
-    Same G_s = diag(a) S diag(a) as v38, but R is ReLU-cosine on 8-neighbors
-    only (no dense N×N). Last-iter softmax a is used as-is (no argmax).
-
-        π_s = λ1 - max(λ2, 0)                         # v39
-        π_s = (λ1 - max(λ2, 0)) / max(λ1, eps)        # v39n (divide_by_lambda1)
-        π_s = [λ1 - max(λ2, 0) / (λ1 + eps)]_+        # v39s (l1_minus_imp)
-
-    Same gap as v38; only R is 8-neighbor. Z is L2-normalized X^bind.
-    π stays detached. Curriculum P is unchanged (global ReLU-cosine);
-    this graph is gate-only. The relative form is in [0, 1] and drops
-    the G_s scale (ghosts no longer die from a_i a_j). v39s keeps the
-    G_s scale (λ1) and subtracts relative impurity λ2⁺/(λ1+ε).
-    """
-    if divide_by_lambda1 and l1_minus_imp:
+    use_lambda1: bool = False,
+    return_q1: bool = False,
+):
+    """Detached n8 spectrum: π, λ1, λ2 each (B, S). π is the v39 / v39n / v39s / v39lam1 gate."""
+    if sum(bool(x) for x in (divide_by_lambda1, l1_minus_imp, use_lambda1)) > 1:
         raise ValueError(
-            "spectral_graph_n8_slot_purity: divide_by_lambda1 and "
-            "l1_minus_imp cannot both be True"
+            "spectral_graph_n8_eigs: divide_by_lambda1, "
+            "l1_minus_imp and use_lambda1 are mutually exclusive"
         )
     if features is None:
         raise ValueError(
@@ -565,14 +938,32 @@ def spectral_graph_n8_slot_purity(
         a = att.float()
         bsz = a.shape[0]
         pi = a.new_empty(bsz, a.shape[1])
+        lam1_out = a.new_empty(bsz, a.shape[1])
+        lam2_out = a.new_empty(bsz, a.shape[1])
+        q1_out = a.new_empty(bsz, a.shape[1], a.shape[2]) if return_q1 else None
         step = max(int(chunk_size), 1)
         for i in range(0, bsz, step):
             z_c = z[i : i + step]
             a_c = a[i : i + step]
-            lam1, lam2 = _top2_algebraic_n8(z_c, a_c, n_iter, eps)
+            packed = _top2_algebraic_n8(
+                z_c,
+                a_c,
+                n_iter,
+                eps,
+                return_q1=return_q1,
+                lam1_only=use_lambda1,
+            )
+            if return_q1:
+                lam1, lam2, q1 = packed
+                q1_out[i : i + step] = q1.squeeze(-1)
+            else:
+                lam1, lam2 = packed
             lam2p = lam2.clamp_min(0.0)
-            if l1_minus_imp:
-                # v39s: [λ1 - λ2⁺ / (λ1 + ε)]_+
+            lam1_out[i : i + step] = lam1
+            lam2_out[i : i + step] = lam2
+            if use_lambda1:
+                pi[i : i + step] = lam1.clamp_min(0.0)
+            elif l1_minus_imp:
                 pi[i : i + step] = (lam1 - lam2p / (lam1 + float(eps))).clamp_min(0.0)
             elif divide_by_lambda1:
                 pi[i : i + step] = (
@@ -580,7 +971,200 @@ def spectral_graph_n8_slot_purity(
                 ).clamp(0.0, 1.0)
             else:
                 pi[i : i + step] = (lam1 - lam2p).clamp_min(0.0)
-    return pi.detach().to(dtype=att.dtype)
+    dtype = att.dtype
+    out = (
+        pi.detach().to(dtype=dtype),
+        lam1_out.detach().to(dtype=dtype),
+        lam2_out.detach().to(dtype=dtype),
+    )
+    if return_q1:
+        return out + (q1_out.detach().to(dtype=dtype),)
+    return out
+
+
+def spectral_graph_n8_slot_purity(
+    att: torch.Tensor,
+    features: torch.Tensor,
+    eps: float = 1e-6,
+    chunk_size: int = 32,
+    n_iter: int = 16,
+    divide_by_lambda1: bool = False,
+    l1_minus_imp: bool = False,
+    use_lambda1: bool = False,
+) -> torch.Tensor:
+    """Detached 8-neighbor relation-graph spectral purity π_s (v39 / v39n / v39s / v39lam1).
+
+    Same G_s = diag(a) S diag(a) as v38, but R is ReLU-cosine on 8-neighbors
+    only (no dense N×N). Last-iter softmax a is used as-is (no argmax).
+
+        π_s = λ1 - max(λ2, 0)                         # v39
+        π_s = (λ1 - max(λ2, 0)) / max(λ1, eps)        # v39n (divide_by_lambda1)
+        π_s = [λ1 - max(λ2, 0) / (λ1 + eps)]_+        # v39s (l1_minus_imp)
+        π_s = max(λ1, 0)                              # v39lam1 (use_lambda1)
+                                                      # Perron power Rayleigh, not k=8 Ritz
+
+    Same gap as v38; only R is 8-neighbor. Z is L2-normalized X^bind.
+    π stays detached. Curriculum P is unchanged (global ReLU-cosine);
+    this graph is gate-only. The relative form is in [0, 1] and drops
+    the G_s scale (ghosts no longer die from a_i a_j). v39s keeps the
+    G_s scale (λ1) and subtracts relative impurity λ2⁺/(λ1+ε).
+    v39lam1 keeps the G_s scale, ignores λ2, and uses the power pair
+    (q1^T G q1, q1) instead of the gap solver's Ritz λ1.
+    """
+    pi, _, _ = spectral_graph_n8_eigs(
+        att,
+        features,
+        eps=eps,
+        chunk_size=chunk_size,
+        n_iter=n_iter,
+        divide_by_lambda1=divide_by_lambda1,
+        l1_minus_imp=l1_minus_imp,
+        use_lambda1=use_lambda1,
+    )
+    return pi
+
+
+def _induced_n8_check_shapes(att: torch.Tensor, features: torch.Tensor, name: str):
+    if features is None:
+        raise ValueError(
+            f"{name} requires bind_features (encoder backbone tokens)"
+        )
+    if att.ndim != 3 or features.ndim != 3:
+        raise ValueError(
+            f"{name} expects att (B, S, N) and features (B, N, D), "
+            f"got {tuple(att.shape)} and {tuple(features.shape)}"
+        )
+    if att.shape[0] != features.shape[0] or att.shape[-1] != features.shape[1]:
+        raise ValueError(
+            f"{name} batch/token mismatch: att {tuple(att.shape)} vs "
+            f"features {tuple(features.shape)}"
+        )
+    _square_grid(att.shape[-1])
+
+
+def _induced_n8_pi_from_eigs(
+    lam1: torch.Tensor, lam2: torch.Tensor, a_s: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """π = λ1-λ2⁺ of S_ind. Empty support → 0; one patch → 1 (exclusive)."""
+    gap = (lam1 - lam2.clamp_min(0.0)).clamp_min(0.0)
+    n_sup = (a_s > float(eps)).sum(dim=-1)
+    pi = torch.where(n_sup <= 0, torch.zeros_like(gap), gap)
+    return torch.where(n_sup == 1, torch.ones_like(pi), pi)
+
+
+def spectral_graph_n8_induced_eigs(
+    att: torch.Tensor,
+    features: torch.Tensor,
+    eps: float = 1e-6,
+    chunk_size: int = 32,
+    n_iter: int = 16,
+    support_rel: float = 0.0,
+):
+    """Detached induced n8 spectrum: π, λ1, λ2 each (B, S).
+
+    Support Ω_s = {i: a_{s,i} ≥ support_rel * max_j a_{s,j}} (support_rel=0
+    keeps every positive a). On Ω, W = diag(a) R diag(a) with n8 ReLU-cosine
+    R, then S_ind is re-normalized with those induced degrees:
+
+        S_ind = D_Ω^{-1/2} W D_Ω^{-1/2}
+        π_s = λ1 - max(λ2, 0)
+
+    Two n8-components ⇒ λ1=λ2=1 ⇒ π=0, independent of blob size.
+    One connected blob ⇒ λ1=1 > λ2 ⇒ π = μ2 of the normalized Laplacian.
+    Curriculum P stays global. This graph is gate/loss only.
+    """
+    _induced_n8_check_shapes(att, features, "conf_kind='spectral_graph_n8_ind'")
+    amp_ctx = (
+        torch.cuda.amp.autocast(enabled=False) if att.is_cuda else nullcontext()
+    )
+    with torch.no_grad(), amp_ctx:
+        z = torch.nn.functional.normalize(features.float(), dim=-1)
+        a = att.float()
+        bsz, n_slots, _ = a.shape
+        pi = a.new_empty(bsz, n_slots)
+        lam1_out = a.new_empty(bsz, n_slots)
+        lam2_out = a.new_empty(bsz, n_slots)
+        step = max(int(chunk_size), 1)
+        for i in range(0, bsz, step):
+            (lam1, lam2), a_s = _top2_induced_n8(
+                z[i : i + step],
+                a[i : i + step],
+                n_iter,
+                eps,
+                support_rel,
+            )
+            lam1_out[i : i + step] = lam1
+            lam2_out[i : i + step] = lam2
+            pi[i : i + step] = _induced_n8_pi_from_eigs(lam1, lam2, a_s, eps)
+    dtype = att.dtype
+    return (
+        pi.detach().to(dtype=dtype),
+        lam1_out.detach().to(dtype=dtype),
+        lam2_out.detach().to(dtype=dtype),
+    )
+
+
+def spectral_graph_n8_induced_purity(
+    att: torch.Tensor,
+    features: torch.Tensor,
+    eps: float = 1e-6,
+    chunk_size: int = 32,
+    n_iter: int = 16,
+    support_rel: float = 0.0,
+) -> torch.Tensor:
+    """Detached induced-n8 connectivity purity π_s (v39ind gate statistic)."""
+    pi, _, _ = spectral_graph_n8_induced_eigs(
+        att,
+        features,
+        eps=eps,
+        chunk_size=chunk_size,
+        n_iter=n_iter,
+        support_rel=support_rel,
+    )
+    return pi
+
+
+def spectral_graph_n8_induced_impurity(
+    att: torch.Tensor,
+    features: torch.Tensor,
+    eps: float = 1e-6,
+    chunk_size: int = 32,
+    n_iter: int = 16,
+    support_rel: float = 0.25,
+    fiedler_tau: float = 0.05,
+) -> torch.Tensor:
+    """Live induced-n8 2-component impurity ρ = exp(-(λ1-λ2)/τ).
+
+    Two n8-components on the thresholded support → gap 0 → ρ=1.
+    One connected blob → gap>0 → ρ smaller. Empty/singleton → 0.
+    Z is detached (frozen DINO). a is live so the loss can split a merge.
+    """
+    _induced_n8_check_shapes(att, features, "spectral_graph_n8_induced_impurity")
+    tau = float(fiedler_tau)
+    if tau <= 0.0:
+        raise ValueError(f"fiedler_tau must be > 0, got {tau}")
+    amp_ctx = (
+        torch.cuda.amp.autocast(enabled=False) if att.is_cuda else nullcontext()
+    )
+    with amp_ctx:
+        z = torch.nn.functional.normalize(features.float(), dim=-1).detach()
+        a = att.float()
+        chunks = []
+        step = max(int(chunk_size), 1)
+        for i in range(0, a.shape[0], step):
+            (lam1, lam2), a_s = _top2_induced_n8(
+                z[i : i + step],
+                a[i : i + step],
+                n_iter,
+                eps,
+                support_rel,
+            )
+            gap = (lam1 - lam2.clamp_min(0.0)).clamp_min(0.0)
+            n_sup = (a_s > float(eps)).sum(dim=-1)
+            rho = torch.exp(-gap / tau)
+            rho = torch.where(n_sup <= 1, torch.zeros_like(rho), rho)
+            chunks.append(rho)
+    return torch.cat(chunks, dim=0).to(dtype=att.dtype)
 
 
 def ownership_confidence(att: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -598,16 +1182,23 @@ def ownership_confidence(att: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return ((n_slots * u - 1.0) / (n_slots - 1.0)).clamp(0.0, 1.0)
 
 
-def slot_confidence_entropy(c: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Normalized entropy of the slot-wise confidence distribution (v40).
+def slot_confidence_entropy(
+    c: torch.Tensor,
+    eps: float = 1e-6,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Entropy of the slot-wise confidence distribution.
 
-    q_s ∝ c_s + eps, H(q)/log K in [0, 1]. c (..., S) -> (...,).
-    One-hot c -> 0; all-zero / uniform c -> 1. Live.
+    q_s ∝ c_s + eps. c (..., S) -> (...,). One-hot c -> 0.
+    normalize=True (v40/v41): H(q)/log K in [0, 1]; uniform / all-zero -> 1.
+    normalize=False (v42): raw H(q) in nats; uniform -> log K. Live.
     """
     n_slots = c.shape[-1]
     q = (c + eps) / (c.sum(dim=-1, keepdim=True) + float(n_slots) * eps)
     ent = -(q * q.clamp_min(eps).log()).sum(dim=-1)
-    return ent / math.log(max(n_slots, 2))
+    if normalize:
+        return ent / math.log(max(n_slots, 2))
+    return ent
 
 
 def spectral_graph_n8_impurity(
@@ -657,6 +1248,86 @@ def spectral_graph_n8_impurity(
     return torch.cat(chunks, dim=0).to(dtype=att.dtype)
 
 
+class SlotUsageHead(nn.Module):
+    """Per-slot usage from the last-iter attention map.
+
+    Shared MLP over the flattened patch map, then one cross-slot Transformer
+    block, then a linear. Input is stop-grad by default so the head cannot
+    rewrite A to open its own gate.
+
+    normalize='sigmoid' (v41): independent z_s in (0, 1). Decoder renorm only
+    sees ratios, so the absolute scale of z is unidentified and can collapse.
+    normalize='softmax' (v42): z is a distribution over slots. Same object the
+    decoder mixture already uses; all-zero / scale drift is impossible.
+    normalize='sparsemax' (v43): simplex with exact zeros so unused slots can
+    be dropped and revived via logit-space L_gate.
+    """
+
+    def __init__(
+        self,
+        n_patches: int,
+        mlp_hidden: int = 256,
+        d_model: int = 64,
+        n_blocks: int = 1,
+        n_heads: int = 4,
+        stopgrad_attn: bool = True,
+        dropout: float = 0.0,
+        normalize: str = "sigmoid",
+    ):
+        super().__init__()
+        if n_patches <= 0:
+            raise ValueError(f"SlotUsageHead n_patches must be positive, got {n_patches}")
+        if d_model <= 0:
+            raise ValueError(f"SlotUsageHead d_model must be positive, got {d_model}")
+        norm = str(normalize).lower()
+        if norm not in ("sigmoid", "softmax", "sparsemax"):
+            raise ValueError(
+                f"SlotUsageHead normalize must be 'sigmoid', 'softmax' or "
+                f"'sparsemax', got {normalize!r}"
+            )
+        self.n_patches = int(n_patches)
+        self.stopgrad_attn = bool(stopgrad_attn)
+        self.normalize = norm
+        self.patch_mlp = MLP(
+            self.n_patches,
+            d_model,
+            [int(mlp_hidden)],
+            activation="gelu",
+        )
+        self.mixer = TransformerEncoder(
+            dim=d_model,
+            n_blocks=int(n_blocks),
+            n_heads=int(n_heads),
+            dropout=float(dropout),
+        )
+        self.out = nn.Linear(d_model, 1)
+        nn.init.zeros_(self.out.bias)
+
+    def logits_and_usage(self, att: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """att (B, S, N) -> (logits, z). z is sigmoid / softmax / sparsemax(ℓ)."""
+        if att.ndim != 3:
+            raise ValueError(f"SlotUsageHead expects att (B, S, N), got {tuple(att.shape)}")
+        if att.shape[-1] != self.n_patches:
+            raise ValueError(
+                f"SlotUsageHead n_patches={self.n_patches} vs att {tuple(att.shape)}"
+            )
+        x = att.detach() if self.stopgrad_attn else att
+        e = self.patch_mlp(x)
+        h = self.mixer(e)
+        logits = self.out(h).squeeze(-1)
+        if self.normalize == "softmax":
+            z = torch.softmax(logits, dim=-1)
+        elif self.normalize == "sparsemax":
+            z = sparsemax(logits, dim=-1)
+        else:
+            z = torch.sigmoid(logits)
+        return logits, z
+
+    def forward(self, att: torch.Tensor) -> torch.Tensor:
+        """att (B, S, N) -> z (B, S). softmax/sparsemax: sum_s z_s = 1."""
+        return self.logits_and_usage(att)[1]
+
+
 class LatentProcessor(nn.Module):
     """Updates latent state based on inputs and state and predicts next state."""
 
@@ -666,6 +1337,7 @@ class LatentProcessor(nn.Module):
         predictor: Optional[nn.Module] = None,
         state_key: str = "slots",
         first_step_corrector_args: Optional[Dict[str, Any]] = None,
+        usage_head: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.corrector = corrector # slot attention
@@ -675,6 +1347,7 @@ class LatentProcessor(nn.Module):
             self.first_step_corrector_args = first_step_corrector_args
         else:
             self.first_step_corrector_args = None
+        self.usage_head = usage_head
         # Velocity conditioning turns itself on when the predictor was built with vel_dim,
         # so a single config knob on the predictor controls the whole path.
         self.predictor_takes_vel = predictor is not None and any(
@@ -691,6 +1364,9 @@ class LatentProcessor(nn.Module):
         gate_p_state: Optional[float] = None,
         state_max_norm: bool = False,
         predictor_ungated: bool = False,
+        predictor_src_gate: bool = False,
+        predictor_src_max_norm: bool = False,
+        predictor_input_mix: bool = False,
         state_gate_ema: float = 1.0,
         state_gate_hold: float = 0.0,
         state_gate_prev: Optional[torch.Tensor] = None,
@@ -713,7 +1389,14 @@ class LatentProcessor(nn.Module):
         bind_features: Optional[torch.Tensor] = None,
         gate_hysteresis: float = 0.0,
         gate_conf_prev: Optional[torch.Tensor] = None,
+        decoder_gate_hysteresis: float = 0.0,
+        decoder_gate_prev: Optional[torch.Tensor] = None,
         state_identity_cos: bool = False,
+        state_conf_kind: Optional[str] = None,
+        n8_support_rel: float = 0.0,
+        spectral_proj_dim: int = 0,
+        eval_hard_thresh: float = 0.0,
+        eval_perron_readout: bool = False,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -754,6 +1437,9 @@ class LatentProcessor(nn.Module):
         gate_p_eff = None
         gate_delta = None
         gate_conf = None
+        gate_logits = None
+        n8_lam1 = None
+        n8_q1 = None
         # gate_form="purity_weight" has no threshold, so it activates on the form alone
         # (gate_p arrives as None from the model, every other form still requires it).
         # state_gate_form lets the temporal mix use a different statistic than the decoder
@@ -793,7 +1479,18 @@ class LatentProcessor(nn.Module):
                 "purity_weight",
             )
             if need_conf:
-                if ck in ("purity", "purity_sharp"):
+                if ck == "usage":
+                    # v41: z = sigmoid(head(sg(A))). v42: softmax. v43: sparsemax.
+                    # Stop-grad of A is inside the head. Logits stay live for L_gate.
+                    if self.usage_head is None:
+                        raise ValueError(
+                            "conf_kind='usage' requires LatentProcessor.usage_head"
+                        )
+                    if hasattr(self.usage_head, "logits_and_usage"):
+                        gate_logits, gate_conf = self.usage_head.logits_and_usage(att)
+                    else:
+                        gate_conf = self.usage_head(att)
+                elif ck in ("purity", "purity_sharp"):
                     # Ownership quality instead of spatial concentration (v29): the
                     # attention-weighted mean of the slot's own per-patch share,
                     #   c_s = sum_f A_{s,f}^2 / sum_f A_{s,f}  in (0, 1].
@@ -809,11 +1506,22 @@ class LatentProcessor(nn.Module):
                     gate_conf = (
                         (src * src).sum(dim=-1) / src.sum(dim=-1).clamp_min(1e-8)
                     ).clamp(min=0.0, max=1.0).detach()
-                elif ck == "spectral":
+                elif ck in ("spectral", "spectral_gap", "spectral_ratio"):
                     # v37: content-aware purity. Exclusive ownership of two feature
-                    # modes is no longer c~=1; λ2 rises and π drops. Uses raw A (a^2
-                    # in C_s is the sharpening) and the bind tokens, not att_sharp.
-                    gate_conf = spectral_slot_purity(att, bind_features)
+                    # modes is no longer c~=1; λ2 rises and π drops. Uses raw A
+                    # (a^2 in C_s is the within-slot moment) and bind tokens, not
+                    # att_sharp: gamma would ask "won patches" instead of "this
+                    # slot's mass". v37g (spectral_gap): same C_s, π = λ1-λ2 with
+                    # no /mass, so a one-color leftover no longer scores like a
+                    # full object. v37r (spectral_ratio): (λ1-λ2)/(λ1+λ2), the
+                    # bounded map of λ1/λ2. Size-free; isotropic ghosts → 0.
+                    gate_conf = spectral_slot_purity(
+                        att,
+                        bind_features,
+                        divide_by_mass=(ck == "spectral"),
+                        proj_dim=spectral_proj_dim,
+                        ratio=(ck == "spectral_ratio"),
+                    )
                 elif ck == "spectral_graph":
                     # v38: relation-graph spectral purity. Same ReLU-cosine R as the
                     # Key curriculum, then S = D^{-1/2} R D^{-1/2} and
@@ -824,16 +1532,36 @@ class LatentProcessor(nn.Module):
                     "spectral_graph_n8",
                     "spectral_graph_n8_rel",
                     "spectral_graph_n8_l1imp",
+                    "spectral_graph_n8_lam1",
                 ):
                     # v39: 8-neighbor R only. π = λ1 - max(λ2, 0) (same as v38).
                     # v39n (spectral_graph_n8_rel): that gap divided by λ1.
                     # v39s (spectral_graph_n8_l1imp): [λ1 - λ2⁺/(λ1+ε)]_+.
+                    # v39lam1 (spectral_graph_n8_lam1): π = max(λ1, 0); no λ2.
+                    # λ1, q1 are the Perron power pair (skip k=8 Ritz).
                     # Curriculum P stays global. Raw A, bind tokens, detached.
-                    gate_conf = spectral_graph_n8_slot_purity(
+                    # n8_lam1 is kept so a split temporal mix (v39l1) can use
+                    # scale while the decoder keeps the gap π. v39lam1 sets
+                    # gate_conf = λ1 so decoder and temporal share that scale.
+                    packed_eigs = spectral_graph_n8_eigs(
                         att,
                         bind_features,
                         divide_by_lambda1=(ck == "spectral_graph_n8_rel"),
                         l1_minus_imp=(ck == "spectral_graph_n8_l1imp"),
+                        use_lambda1=(ck == "spectral_graph_n8_lam1"),
+                        return_q1=bool(eval_perron_readout),
+                    )
+                    if eval_perron_readout:
+                        gate_conf, n8_lam1, _, n8_q1 = packed_eigs
+                    else:
+                        gate_conf, n8_lam1, _ = packed_eigs
+                elif ck == "spectral_graph_n8_ind":
+                    # v39ind: induced n8 S on thresholded support, re-normalized
+                    # there. π = λ1-λ2⁺; two components → 0, one blob → μ2.
+                    gate_conf, n8_lam1, _ = spectral_graph_n8_induced_eigs(
+                        att,
+                        bind_features,
+                        support_rel=n8_support_rel,
                     )
                 else:
                     p_feat = att_sharp / att_sharp.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -866,8 +1594,8 @@ class LatentProcessor(nn.Module):
                 and gate_conf_prev is not None
                 and float(gate_hysteresis) > 0.0
             ):
-                gate_conf = torch.maximum(
-                    gate_conf, float(gate_hysteresis) * gate_conf_prev.detach()
+                gate_conf = _leaky_max_gate(
+                    gate_conf, gate_conf_prev, gate_hysteresis
                 )
 
             # Threshold p:
@@ -1006,6 +1734,8 @@ class LatentProcessor(nn.Module):
                 #   p = clip((K c - 1)/(K - 1), 0, 1)
                 # so ghosts go to 0 while exclusive owners stay at 1. Decoder adds
                 # a floor on g so all-zero p recovers softmax(alpha) (ungated).
+                # v37 leaves this off: π ≤ 1/K (two-mode gaps, weak ghosts) must
+                # stay distinct instead of clipping to the same 0.
                 active_mask = _purity_weight_gate(gate_conf, purity_normalize, default_list)
             else:
                 active_mask = build_gate(p_use)
@@ -1062,6 +1792,34 @@ class LatentProcessor(nn.Module):
                     state_mask = active_mask
                 elif state_mask is not None and torch.is_floating_point(state_mask):
                     state_mask = state_mask.detach()
+            # Optional temporal statistic, decoder stays on π (v39 eval-only λ1 mix):
+            #   lambda1: n8 λ1 (visible scale; drops under cover occlusion)
+            #   mass:    attention-mass fraction
+            # Applied after the decoder mask is built so featrec/ghosts are unchanged.
+            sk = str(state_conf_kind or "").lower()
+            if sk in ("lambda1", "l1"):
+                if n8_lam1 is None:
+                    raise ValueError(
+                        "state_conf_kind='lambda1' requires conf_kind "
+                        "spectral_graph_n8 / spectral_graph_n8_rel / "
+                        "spectral_graph_n8_l1imp / spectral_graph_n8_lam1 / "
+                        "spectral_graph_n8_ind"
+                    )
+                state_mask = n8_lam1
+            elif sk == "mass":
+                state_mask = mass_frac
+            elif sk not in ("", "pi", "none"):
+                raise ValueError(
+                    f"state_conf_kind must be '', 'pi', 'lambda1' or 'mass', got {sk!r}"
+                )
+            # Eval-only hard gate (purity_weight ignores gate_mode). Applied after π is
+            # built and before Pred / mix, so decoder, temporal g, and src-gate agree.
+            # Training keeps the float π. thresh<=0 is a no-op.
+            ht = 0.0 if eval_hard_thresh is None else float(eval_hard_thresh)
+            if ht > 0.0:
+                aliased = state_mask is active_mask
+                active_mask = _eval_hard_threshold(active_mask, ht)
+                state_mask = active_mask if aliased else _eval_hard_threshold(state_mask, ht)
             # The corrector output is deliberately NOT gated here. Gating it as well as the
             # predictor output puts the gate twice on the same path, and because the predictor
             # is a residual block (Pred(x) = x + D) the observation then lands at g^2 while the
@@ -1087,14 +1845,35 @@ class LatentProcessor(nn.Module):
         if self.predictor_takes_vel and prev_state is not None:
             vel = updated_state - prev_state
 
-        if self.predictor:
-            if vel is not None:
-                predicted_state = self.predictor(updated_state, vel=vel)
-            else:
-                predicted_state = self.predictor(updated_state)
-        else:
-            # Just pass updated_state along as prediction
+        if predictor_input_mix and predictor_ungated:
+            raise ValueError(
+                "predictor_input_mix cannot be combined with predictor_ungated"
+            )
+
+        pred_kwargs: Dict[str, Any] = {}
+        if vel is not None:
+            pred_kwargs["vel"] = vel
+        # Source-gated self-attention (v39lam1g): keys/values of low-g slots
+        # are down-weighted inside Pred, before the temporal mix.
+        #   B_{i,j}^g = g_j exp(b_{i,j}) / sum_k g_k exp(b_{i,k})
+        # Uses the current-frame mix statistic (state_mask, else decoder g),
+        # detached. Max-norm is applied later on the mix, not here, unless
+        # predictor_src_max_norm (v43: g = z / max z for Pred and the mix).
+        if predictor_src_gate:
+            src_g = state_mask if state_mask is not None else active_mask
+            if src_g is not None:
+                if predictor_src_max_norm:
+                    src_g = _max_norm(src_g, True)
+                pred_kwargs["key_weights"] = src_g.detach().to(
+                    dtype=updated_state.dtype
+                )
+        # v39lam1gu_umix defers Pred until π̄ and u_t are known.
+        if self.predictor and not predictor_input_mix:
+            predicted_state = self.predictor(updated_state, **pred_kwargs)
+        elif not predictor_input_mix:
             predicted_state = updated_state
+        else:
+            predicted_state = None
         # Kept for the dynamics loss, which must supervise the predictor module itself rather
         # than the gated mix: reading the mix would scale the predictor's gradient by g, so
         # the throttled slots that most need a dynamics prior would learn one the slowest.
@@ -1107,6 +1886,29 @@ class LatentProcessor(nn.Module):
         # `state_max_norm` normalizes by max_s(g) here so the winning slot always advances
         # fully; the decoder keeps the raw gate, being scale-invariant after its renorm.
         #
+        # Optional decoder-only leaky max (v39d). Applied after the two masks are
+        # built, so the temporal mix keeps instantaneous π (a vanished object
+        # freezes its prior). Shared gate_hysteresis (v39h) already smoothed
+        # gate_conf before both paths; do not stack the two knobs.
+        #   decoder: π̃_t = max(π_t, γ π̃_{t-1})
+        #   temporal: π_t  (then max-norm / EMA below)
+        dec_g = (
+            0.0 if decoder_gate_hysteresis is None else float(decoder_gate_hysteresis)
+        )
+        if dec_g > 0.0 and float(gate_hysteresis or 0.0) > 0.0:
+            raise ValueError(
+                "decoder_gate_hysteresis and gate_hysteresis cannot both be > 0"
+            )
+        if (
+            active_mask is not None
+            and torch.is_floating_point(active_mask)
+            and dec_g > 0.0
+            and decoder_gate_prev is not None
+        ):
+            if state_mask is active_mask:
+                state_mask = active_mask.clone()
+            active_mask = _leaky_max_gate(active_mask, decoder_gate_prev, dec_g)
+
         # Optional EMA / hold on this mix gate only (decoder still sees instantaneous π):
         #   π̃_t = m π_t + (1-m) π̃_{t-1}, then π̃_t ← max(π̃_t, hold · π̃_{t-1}).
         # m=1 and hold=0 leave state_mask untouched (and still possibly aliased with
@@ -1127,7 +1929,9 @@ class LatentProcessor(nn.Module):
         # only reweight decoder masks. Only v18 sets it.
         identity_cos = None
         if state_mask is not None and not predictor_ungated:
-            a = _max_norm(state_mask, state_max_norm).unsqueeze(-1).to(predicted_state.dtype)
+            a = _max_norm(state_mask, state_max_norm).unsqueeze(-1).to(
+                updated_state.dtype
+            )
             # v39i: identity check on the mix only. Decoder keeps π.
             #   c = ReLU(cos(û_t, u_t)),  ρ = π̄ ⊙ c
             #   û_{t+1} = ρ Pred(u) + (1-ρ) û
@@ -1139,7 +1943,26 @@ class LatentProcessor(nn.Module):
                         dtype=a.dtype
                     )
                 a = a * identity_cos.unsqueeze(-1)
-            predicted_state = a * predicted_state + (1.0 - a) * state
+            if predictor_input_mix:
+                # Decoder still reads u^SA (`state` below). Pred / next prior
+                # use the occupancy mix so a vanished slot does not leak u^SA:
+                #   u_t = π̄ u^SA + (1-π̄) û_t
+                #   û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
+                mixed = a * updated_state + (1.0 - a) * state
+                if self.predictor:
+                    predicted_state = self.predictor(mixed, **pred_kwargs)
+                else:
+                    predicted_state = mixed
+                predicted_pregate = predicted_state
+                predicted_state = a * predicted_state + (1.0 - a) * mixed
+            else:
+                predicted_state = a * predicted_state + (1.0 - a) * state
+        elif predictor_input_mix:
+            if self.predictor:
+                predicted_state = self.predictor(updated_state, **pred_kwargs)
+            else:
+                predicted_state = updated_state
+            predicted_pregate = predicted_state
 
         if active_mask is None:
             # keep a consistent output tree; all slots are "active" when gating is off
@@ -1148,6 +1971,22 @@ class LatentProcessor(nn.Module):
             )
         if state_mask is None:
             state_mask = active_mask
+
+        # Perron readout: decoder sees π_s q̃_{1,s,i}; mix / Pred keep scalar π.
+        # Spatial gate is a separate tensor so losses / logging still read (B, S).
+        decoder_gate = None
+        if eval_perron_readout:
+            if n8_q1 is None:
+                raise ValueError(
+                    "eval_perron_readout requires conf_kind in the n8 family "
+                    "(needs G_s = diag(a) S diag(a) and its Perron vector)"
+                )
+            if active_mask is None or not torch.is_floating_point(active_mask):
+                raise ValueError(
+                    "eval_perron_readout needs a float decoder π; got "
+                    f"{None if active_mask is None else active_mask.dtype}"
+                )
+            decoder_gate = _perron_spatial_gate(active_mask, n8_q1)
 
         out = {
             "state": updated_state,
@@ -1160,11 +1999,16 @@ class LatentProcessor(nn.Module):
             # unless gate_p_state or state_gate_form gave the temporal mix its own gate.
             "state_gate": state_mask,
         }
+        if decoder_gate is not None:
+            out["decoder_gate"] = decoder_gate
         if gate_conf is not None:
-            # detached (B, S) assignment confidence. Logging, and when
-            # gate_hysteresis > 0 this is the smoothed π̃ that ScanOverTime carries
-            # into the next frame's `gate_conf_prev` (recursive leaky max).
+            # (B, S) assignment / usage score. Ownership and spectral kinds are
+            # detached; conf_kind='usage' is live z so featrec and L_ent reach the
+            # head. When gate_hysteresis > 0 this is the smoothed π̃ that
+            # ScanOverTime carries into the next frame's `gate_conf_prev`.
             out["gate_conf"] = gate_conf
+        if gate_logits is not None:
+            out["gate_logits"] = gate_logits
         if mass_median_ema is not None:
             out["mass_median_ema"] = mass_median_ema
         if gate_p_eff is not None and torch.is_tensor(gate_p_eff):
@@ -1174,6 +2018,9 @@ class LatentProcessor(nn.Module):
         if state_mask is not None and torch.is_floating_point(state_mask):
             # next-frame prev for temporal EMA / hold (already smoothed if enabled)
             out["state_gate_carry"] = state_mask.detach()
+        if active_mask is not None and torch.is_floating_point(active_mask):
+            # next-frame prev for decoder-only hysteresis (smoothed if enabled)
+            out["decoder_gate_carry"] = active_mask.detach()
         if identity_cos is not None:
             out["identity_cos"] = identity_cos
         return out
@@ -1189,7 +2036,7 @@ class MapOverTime(nn.Module):
         super().__init__()
         self.module = module
 
-    def forward(self, *args):
+    def forward(self, *args, **kwargs):
         batch_size = None
         seq_len = None
         flattened_args = []
@@ -1211,7 +2058,7 @@ class MapOverTime(nn.Module):
 
             flattened_args.append(arg.flatten(0, 1))
 
-        outputs = self.module(*flattened_args)
+        outputs = self.module(*flattened_args, **kwargs)
 
         if isinstance(outputs, Mapping):
             unflattened_outputs = {
@@ -1233,7 +2080,7 @@ class ScanOverTime(nn.Module):
         self.module = module
         self.next_state_key = next_state_key
         self.pass_step = pass_step
-        # Anchor frame chosen per sample by the last "evidence"/"random" cycle (diagnostics
+        # Anchor frame chosen per sample by the last "evidence*"/"random" cycle (diagnostics
         # for eval scripts; None when the last forward used another mode).
         self.last_anchor_frames: Optional[torch.Tensor] = None
 
@@ -1252,6 +2099,9 @@ class ScanOverTime(nn.Module):
         gate_p_state: Optional[float] = None,
         state_max_norm: bool = False,
         predictor_ungated: bool = False,
+        predictor_src_gate: bool = False,
+        predictor_src_max_norm: bool = False,
+        predictor_input_mix: bool = False,
         state_gate_ema: float = 1.0,
         state_gate_hold: float = 0.0,
         p_mode: str = "absolute",
@@ -1270,7 +2120,13 @@ class ScanOverTime(nn.Module):
         decoder_mul_state: bool = False,
         bind_inputs: Optional[torch.Tensor] = None,
         gate_hysteresis: float = 0.0,
+        decoder_gate_hysteresis: float = 0.0,
         state_identity_cos: bool = False,
+        state_conf_kind: Optional[str] = None,
+        n8_support_rel: float = 0.0,
+        spectral_proj_dim: int = 0,
+        eval_hard_thresh: float = 0.0,
+        eval_perron_readout: bool = False,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -1282,6 +2138,9 @@ class ScanOverTime(nn.Module):
             gate_p_state=gate_p_state,
             state_max_norm=state_max_norm,
             predictor_ungated=predictor_ungated,
+            predictor_src_gate=predictor_src_gate,
+            predictor_src_max_norm=predictor_src_max_norm,
+            predictor_input_mix=predictor_input_mix,
             state_gate_ema=state_gate_ema,
             state_gate_hold=state_gate_hold,
             p_mode=p_mode, median_ema_momentum=median_ema_momentum,
@@ -1293,7 +2152,13 @@ class ScanOverTime(nn.Module):
             state_mul_decoder=state_mul_decoder,
             decoder_mul_state=decoder_mul_state,
             gate_hysteresis=gate_hysteresis,
+            decoder_gate_hysteresis=decoder_gate_hysteresis,
             state_identity_cos=state_identity_cos,
+            state_conf_kind=state_conf_kind,
+            n8_support_rel=n8_support_rel,
+            spectral_proj_dim=spectral_proj_dim,
+            eval_hard_thresh=eval_hard_thresh,
+            eval_perron_readout=eval_perron_readout,
         )
 
         state = initial_state
@@ -1307,6 +2172,8 @@ class ScanOverTime(nn.Module):
         gate_conf_prev = None
         # Temporal-mix EMA / hold carry (decoder-instantaneous π). None on frame 0.
         state_gate_prev = None
+        # Decoder-only hysteresis carry (v39d). None on frame 0.
+        decoder_gate_prev = None
         outputs = []
         for t in range(seq_len):
             kwargs = dict(gate_kwargs)
@@ -1314,6 +2181,7 @@ class ScanOverTime(nn.Module):
             kwargs["prev_state"] = prev_state
             kwargs["gate_conf_prev"] = gate_conf_prev
             kwargs["state_gate_prev"] = state_gate_prev
+            kwargs["decoder_gate_prev"] = decoder_gate_prev
             if key_inputs is not None:
                 kwargs["key_features"] = key_inputs[:, t]
             if bind_inputs is not None:
@@ -1329,6 +2197,7 @@ class ScanOverTime(nn.Module):
                 median_ema = output["mass_median_ema"]
             gate_conf_prev = output.get("gate_conf", gate_conf_prev)
             state_gate_prev = output.get("state_gate_carry", state_gate_prev)
+            decoder_gate_prev = output.get("decoder_gate_carry", decoder_gate_prev)
 
         self.last_anchor_frames = None
         if cycle:
@@ -1345,19 +2214,28 @@ class ScanOverTime(nn.Module):
             #       (mass share owned by trusted slots) -- kept as an A/B variant; it
             #       ignores object COUNT, so a frame where one background slot owns
             #       everything can outscore a frame with five cleanly-bound objects.
+            #   "evidence_sum": EABI with E_t = sum_s g_{t,s} (gate occupancy only).
+            #       No extra ownership-purity c or mass m: for v39lam1gu, g is already
+            #       λ1, so c is nearly a monotone of the same peakiness.
             #   "random": EABI with a uniformly random anchor -- control run isolating
             #       the value of evidence-based anchor selection.
             mode = cycle.strip().lower() if isinstance(cycle, str) else "last"
-            if mode in ("evidence", "evidence_mass", "random"):
+            if mode in ("evidence", "evidence_mass", "evidence_sum", "random"):
                 if mode == "random":
                     anchors = torch.randint(
                         seq_len, (inputs.shape[0],), device=inputs.device
                     )
                 else:
+                    if mode == "evidence_mass":
+                        stat = "mass"
+                    elif mode == "evidence_sum":
+                        stat = "sum"
+                    else:
+                        stat = "count"
                     anchors = _evidence_anchors(
                         outputs,
                         gate_kwargs.get("mass_gamma") or 1.0,
-                        stat="mass" if mode == "evidence_mass" else "count",
+                        stat=stat,
                     )
                 self.last_anchor_frames = anchors.detach().to("cpu")
                 return self._cycle_from_anchors(
@@ -1377,6 +2255,7 @@ class ScanOverTime(nn.Module):
             # sweep's temporal memory runs in sweep order.
             gate_conf_prev = outputs[-1].get("gate_conf")
             state_gate_prev = outputs[-1].get("state_gate_carry")
+            decoder_gate_prev = outputs[-1].get("decoder_gate_carry")
             for t in range(seq_len - 1):
                 back_t = seq_len - t - 2
                 kwargs = dict(gate_kwargs)
@@ -1384,6 +2263,7 @@ class ScanOverTime(nn.Module):
                 kwargs["prev_state"] = prev_state
                 kwargs["gate_conf_prev"] = gate_conf_prev
                 kwargs["state_gate_prev"] = state_gate_prev
+                kwargs["decoder_gate_prev"] = decoder_gate_prev
                 if key_inputs is not None:
                     kwargs["key_features"] = key_inputs[:, back_t]
                 if bind_inputs is not None:
@@ -1396,6 +2276,7 @@ class ScanOverTime(nn.Module):
                     median_ema = out["mass_median_ema"]
                 gate_conf_prev = out.get("gate_conf", gate_conf_prev)
                 state_gate_prev = out.get("state_gate_carry", state_gate_prev)
+                decoder_gate_prev = out.get("decoder_gate_carry", decoder_gate_prev)
             new_outputs = new_outputs[::-1]  # reverse the order of outputs
             return merge_dict_trees(new_outputs, axis=1)
 
@@ -1447,8 +2328,10 @@ class ScanOverTime(nn.Module):
         # emitted gate_conf (hysteresis / conf gate off).
         anchor_conf = None
         anchor_carry = None
+        anchor_dec = None
         gate_conf_prev = None
         state_gate_prev = None
+        decoder_gate_prev = None
         if outputs and outputs[0].get("gate_conf") is not None:
             conf_states = torch.stack([o["gate_conf"] for o in outputs], dim=1)
             cidx = anchors.view(b, 1, 1).expand(-1, 1, conf_states.shape[-1])
@@ -1459,6 +2342,11 @@ class ScanOverTime(nn.Module):
             gidx = anchors.view(b, 1, 1).expand(-1, 1, carry_states.shape[-1])
             anchor_carry = carry_states.gather(1, gidx).squeeze(1)
             state_gate_prev = anchor_carry
+        if outputs and outputs[0].get("decoder_gate_carry") is not None:
+            dec_states = torch.stack([o["decoder_gate_carry"] for o in outputs], dim=1)
+            didx = anchors.view(b, 1, 1).expand(-1, 1, dec_states.shape[-1])
+            anchor_dec = dec_states.gather(1, didx).squeeze(1)
+            decoder_gate_prev = anchor_dec
 
         state = anchor_pred
         prev_state = anchor_post
@@ -1476,11 +2364,15 @@ class ScanOverTime(nn.Module):
                 # computed before its sweep began (matters only when EMA/hold is on).
                 gstarts = (anchors == t + 1).view(b, *([1] * (anchor_carry.ndim - 1)))
                 state_gate_prev = torch.where(gstarts, anchor_carry, state_gate_prev)
+            if anchor_dec is not None:
+                dstarts = (anchors == t + 1).view(b, *([1] * (anchor_dec.ndim - 1)))
+                decoder_gate_prev = torch.where(dstarts, anchor_dec, decoder_gate_prev)
             kwargs = dict(gate_kwargs)
             kwargs["median_ema_prev"] = median_ema
             kwargs["prev_state"] = prev_state
             kwargs["gate_conf_prev"] = gate_conf_prev
             kwargs["state_gate_prev"] = state_gate_prev
+            kwargs["decoder_gate_prev"] = decoder_gate_prev
             if key_inputs is not None:
                 kwargs["key_features"] = key_inputs[:, t]
             if bind_inputs is not None:
@@ -1495,6 +2387,7 @@ class ScanOverTime(nn.Module):
                 median_ema = out["mass_median_ema"]
             gate_conf_prev = out.get("gate_conf", gate_conf_prev)
             state_gate_prev = out.get("state_gate_carry", state_gate_prev)
+            decoder_gate_prev = out.get("decoder_gate_carry", decoder_gate_prev)
 
         backward_tree = merge_dict_trees(new_outputs, axis=1)
         use_backward = (
@@ -1523,6 +2416,10 @@ def _evidence_anchors(
     trusted background slot owning everything can outscore five cleanly-bound objects.
     Kept as an A/B variant for the eval.
 
+    stat="sum": E_t = sum_s g_{t,s}. Gate occupancy only; no extra c or m. For
+    v39lam1gu g is already λ1, so this is the EABI statistic that does not
+    introduce a second definition of "intactness".
+
     Both signals come from the forward sweep's outputs, so anchor selection costs no
     extra model evaluation. E_t is mean-smoothed over a `window`-frame neighborhood
     (replicate-padded) before the argmax so a single-frame noise spike cannot become
@@ -1531,16 +2428,22 @@ def _evidence_anchors(
     falls back to whatever the statistic sees.
     """
     gates = torch.stack([o["active_mask"].float() for o in outputs], dim=1)  # (B, T, S)
-    att = torch.stack([o["state_attn_mask"].float() for o in outputs], dim=1)  # (B,T,S,F)
-    gamma = float(mass_gamma or 1.0)
-    if gamma != 1.0:
-        att = att.pow(gamma)
-        att = att / att.sum(dim=2, keepdim=True).clamp_min(1e-8)
-    if stat == "mass":
-        per_slot = att.sum(dim=-1) / att.shape[-1]  # coverage m, (B, T, S)
+    stat_k = (stat or "count").strip().lower()
+    if stat_k in ("sum", "gate"):
+        evidence = gates.sum(dim=-1)  # (B, T)
     else:
-        per_slot = (att * att).sum(dim=-1) / att.sum(dim=-1).clamp_min(1e-8)  # purity c
-    evidence = (gates * per_slot).sum(dim=-1)  # (B, T)
+        att = torch.stack([o["state_attn_mask"].float() for o in outputs], dim=1)  # (B,T,S,F)
+        gamma = float(mass_gamma or 1.0)
+        if gamma != 1.0:
+            att = att.pow(gamma)
+            att = att / att.sum(dim=2, keepdim=True).clamp_min(1e-8)
+        if stat_k == "mass":
+            per_slot = att.sum(dim=-1) / att.shape[-1]  # coverage m, (B, T, S)
+        elif stat_k == "count":
+            per_slot = (att * att).sum(dim=-1) / att.sum(dim=-1).clamp_min(1e-8)  # purity c
+        else:
+            raise ValueError(f"unknown evidence stat {stat!r}")
+        evidence = (gates * per_slot).sum(dim=-1)  # (B, T)
 
     t_len = evidence.shape[1]
     k = min(window, t_len)

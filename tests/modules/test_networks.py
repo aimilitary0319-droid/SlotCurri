@@ -91,6 +91,29 @@ def test_attention(qdim, kdim, vdim, inner_dim, qkv_bias, same_qkv, same_kv):
     assert torch.allclose(attn[0, :, 0], torch.zeros_like(attn[0, :, 0]))
 
 
+def test_attention_key_weights_is_gated_softmax():
+    """B_{i,j}^g = g_j exp(b_{i,j}) / sum_k g_k exp(b_{i,k})."""
+    torch.manual_seed(0)
+    bs, n, dim, n_heads = 2, 4, 8, 2
+    attention = networks.Attention(dim=dim, num_heads=n_heads, qkv_bias=True)
+    q = torch.randn(bs, n, dim)
+    g = torch.tensor([[1.0, 0.5, 0.0, 0.2], [0.1, 1.0, 0.3, 0.0]])
+    with torch.no_grad():
+        _, attn_g = attention(q, key_weights=g, return_weights=True)
+        log_g = torch.where(g > 0, g.log(), torch.full_like(g, float("-inf")))
+        # Additive mask (B*H, N, N); Attention 3D mask is (B*H, n_queries, n_keys).
+        attn_mask = log_g.repeat_interleave(n_heads, dim=0).unsqueeze(1).expand(
+            bs * n_heads, n, n
+        )
+        _, attn_eq = attention(q, attn_mask=attn_mask, return_weights=True)
+    assert torch.allclose(attn_g, attn_eq, atol=1e-5)
+    assert torch.allclose(attn_g[0, :, 2], torch.zeros(n))
+    assert torch.allclose(attn_g[1, :, 3], torch.zeros(n))
+    _, attn_1 = attention(q, key_weights=torch.ones(bs, n), return_weights=True)
+    _, attn_u = attention(q, return_weights=True)
+    assert torch.allclose(attn_1, attn_u, atol=1e-5)
+
+
 @pytest.mark.parametrize("memory", [False, True])
 @pytest.mark.parametrize("initial_residual_scale", [None, 0.0])
 def test_transformer_encoder(memory, initial_residual_scale):
