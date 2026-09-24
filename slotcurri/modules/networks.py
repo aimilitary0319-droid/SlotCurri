@@ -518,21 +518,43 @@ class Attention(nn.Module):
         # g_j = 0 → log g_j = -inf so that key gets exactly zero mass. An all-zero
         # row is 0/0; treat it as uniform (ungated) rather than NaN.
         if key_weights is not None:
-            expected = (bs, n_keys)
-            if key_weights.shape != expected:
-                raise ValueError(
-                    f"`key_weights` should have shape {expected}, but has shape "
-                    f"{tuple(key_weights.shape)}"
-                )
             g = key_weights.to(dtype=attn.dtype).clamp_min(0.0)
-            alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
-            g = torch.where(alive, g, torch.ones_like(g))
-            log_g = torch.where(
-                g > 0, g.log(), torch.full_like(g, float("-inf"))
-            )
-            log_g = einops.repeat(
-                log_g, "b n -> (b h) 1 n", b=bs, h=self.num_heads, n=n_keys
-            )
+            if g.ndim == 2:
+                expected = (bs, n_keys)
+                if g.shape != expected:
+                    raise ValueError(
+                        f"`key_weights` should have shape {expected}, but has shape "
+                        f"{tuple(key_weights.shape)}"
+                    )
+                alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
+                g = torch.where(alive, g, torch.ones_like(g))
+                log_g = torch.where(
+                    g > 0, g.log(), torch.full_like(g, float("-inf"))
+                )
+                log_g = einops.repeat(
+                    log_g, "b n -> (b h) 1 n", b=bs, h=self.num_heads, n=n_keys
+                )
+            elif g.ndim == 3:
+                expected = (bs, n_queries, n_keys)
+                if g.shape != expected:
+                    raise ValueError(
+                        f"`key_weights` should have shape {expected}, but has shape "
+                        f"{tuple(key_weights.shape)}"
+                    )
+                # Per-query row: if a query is fully blocked, fall back to uniform
+                # rather than 0/0 NaN (same policy as the per-key src-gate).
+                alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
+                g = torch.where(alive, g, torch.ones_like(g))
+                log_g = torch.where(
+                    g > 0, g.log(), torch.full_like(g, float("-inf"))
+                )
+                log_g = einops.repeat(
+                    log_g, "b i j -> (b h) i j", b=bs, h=self.num_heads
+                )
+            else:
+                raise ValueError(
+                    f"`key_weights` should be (B, K) or (B, Q, K), got {tuple(g.shape)}"
+                )
             attn = attn + log_g
 
         attn = attn.softmax(dim=-1)  # (B x H) x N x M

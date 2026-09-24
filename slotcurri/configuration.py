@@ -56,7 +56,11 @@ class ModelConfig:
     # representation to raw patch features. v33 affinity-smooths the tokens themselves
     # (grouper + recon target). v36 (anneal=ncut, apply=key) levels Keys only via a
     # 2-way Ncut barrier. v37/v38 keep that Key-only mix/schedule with barrier=false
-    # (global ReLU-cosine P, no region cut). Train-time only; eval sees raw features.
+    # (global ReLU-cosine P, no region cut). anneal=n8 is the same mix / Key-only
+    # split on the 8-neighbor ReLU-cosine graph (gate R, not dense W).
+    # anneal=half: X^rel = 0.5 P_dense X + 0.5 P_n8 X (token average).
+    # anneal=rowcenter: W_ij = ReLU(cos_ij - (τ_i+τ_j)/2), P = row-normalize(W).
+    # Train-time only; eval sees raw features.
     feature_curriculum: Optional[Dict[str, Any]] = None
     # v40/v41: coupled slot-confidence entropy (early, concentrate) and a
     # two-mode impurity (late, split merged communities). Train-only aux.

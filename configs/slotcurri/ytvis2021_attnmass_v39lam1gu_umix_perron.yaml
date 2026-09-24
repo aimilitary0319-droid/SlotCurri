@@ -38,19 +38,18 @@ model:
   # extra backward sweep at eval.
   cyclic_inference: false
 
-  # --- v39lam1gu_umix_perron = umix + decoder Perron readout ---
+  # --- v39lam1gu_umix_perron = umix train, eval-only src-gate off + Perron ---
   #
-  # Temporal path is umix (scalar π̄). Decoder slots stay u^SA. Masks use the
-  # same G_s eigenpair as π: m_{s,i} = softmax(α) π_s q̃_{1,s,i} with
-  # q̃_1 = max-norm_i max(q_1, 0). Mix / Pred / source-gate stay on π̄.
-  # q_1 is detached (same as π). Train and eval.
-  #
-  # Instead of û_{t+1} = π̄ Pred(u^SA) + (1-π̄) û_t:
+  # Training is byte-identical to v39lam1gu_umix:
   #      u_t     = π̄ u^SA + (1-π̄) û_t
   #      û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
-  # so a vanished slot's next query does not leak u^SA. Residual Pred is
-  # û_{t+1} = u_t + π̄ D (observation once). No identity cosine.
-  # Same split L_featrec (gated 1.0 + ungated 0.5) and Pred source-gated SA.
+  # Pred SA: original src-gate A_ij = g_j (including A_ii = g_i).
+  # Decoder slots = u^SA, masks softmax(α) ⊙ π. No train-time perron_readout.
+  #
+  # Eval only (same knobs as v39lam1gu_perron):
+  #   eval_predictor_src_gate: false     → vanilla Pred SA (no key-only src-gate)
+  #   eval_perron_readout: true          → decoder m = softmax(α) ⊙ π ⊙ q̃_1
+  #   eval_predictor_pair_isolate: true  → Pred A_ij = π̄_i π̄_j + (1-π̄_i)(1-π̄_j)
   #
   # Feature curriculum is byte-identical to v39 (Key-only mix, barrier: false):
   #      Z = X/||X||,  W = ReLU(Z Z^T),  W_ii = 0
@@ -65,7 +64,7 @@ model:
   #      G_s = diag(a_s) S diag(a_s)
   #      π_s = max(λ1, 0)          # no λ2; not v39's gap, not v39l1's split
   #    Softmax a, no argmax. No /mass, no 1/K. π detached.
-  #    Decoder: softmax(α) ⊙ π ⊙ q̃_1; temporal: π/max(π).
+  #    Decoder: softmax(alpha + log(π+eps)); temporal: π/max(π). Eval adds Perron.
   feature_curriculum:
     enabled: true
     anneal: ncut       # same ReLU-cosine P X as v37
@@ -87,9 +86,11 @@ model:
     gate_l1: 0.0
     gate_div: 0.0
     state_max_norm: true    # temporal gate alpha = π / max_j(π)
-    predictor_src_gate: true  # Pred SA: B_ij = g_j exp(b_ij) / sum_k g_k exp(b_ik)
+    predictor_src_gate: true  # train: Pred SA B_ij = g_j exp(b_ij) / sum_k g_k exp(b_ik)
     predictor_input_mix: true  # u_t = π̄ u^SA+(1-π̄)û; û_{t+1}=π̄ Pred(u_t)+(1-π̄)u_t
-    perron_readout: true      # decoder m = softmax(α) ⊙ π ⊙ q̃_1 (train+eval)
+    eval_predictor_src_gate: false  # eval only: vanilla Pred SA
+    eval_perron_readout: true       # eval only: decoder m = softmax(α) ⊙ π ⊙ q̃_1
+    eval_predictor_pair_isolate: true  # eval only: live-live and ghost-ghost Pred SA
     contrastive_gate: false # loss_ss ignores the gate (baseline-style)
 
   losses:

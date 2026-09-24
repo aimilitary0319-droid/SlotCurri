@@ -41,17 +41,51 @@ def method_ckpt(root: Path, method: str, dataset: str = "ytvis") -> Path:
     if named.is_file():
         return named
     ckpts = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime)
-    if not ckpts:
-        raise FileNotFoundError(f"no checkpoint in {ckpt_dir}")
-    return ckpts[-1]
+    if ckpts:
+        return ckpts[-1]
+    # Eval-only overlays (v39lam1gu_perron): no own run dir; reuse parent 100k ckpt.
+    if method.endswith("_perron"):
+        parent = method[: -len("_perron")]
+        if parent:
+            return method_ckpt(root, parent, dataset)
+    raise FileNotFoundError(f"no checkpoint in {ckpt_dir}")
+
+
+def method_settings_path(root: Path, method: str, dataset: str) -> Path:
+    """Trained-run dump if present, else the source yaml (eval-only overlays)."""
+    prefix = "movi_c" if dataset == "movi_c" else "ytvis"
+    logged = root / f"logs/_{prefix}_attnmass_{method}" / "settings/slotcurri/settings.yaml"
+    if logged.is_file():
+        return logged
+    cfg_name = (
+        f"movi_c_attnmass_{method}.yaml"
+        if dataset == "movi_c"
+        else f"ytvis2021_attnmass_{method}.yaml"
+    )
+    cfg = root / "configs/slotcurri" / cfg_name
+    if cfg.is_file():
+        return cfg
+    raise FileNotFoundError(
+        f"no settings for method={method!r} dataset={dataset!r}: tried {logged} and {cfg}"
+    )
 
 
 def resolve_run(root: Path, method: str, dataset: str) -> dict:
     """SlotCurri is the baseline on both datasets (SOTA paper checkpoint / local run)."""
+    method_settings = method_settings_path(root, method, dataset)
     if dataset == "movi_c":
-        method_settings = (
+        data_settings = method_settings
+        logged = (
             root / f"logs/_movi_c_attnmass_{method}" / "settings/slotcurri/settings.yaml"
         )
+        if not logged.is_file() and method.endswith("_perron"):
+            parent_logged = (
+                root
+                / f"logs/_movi_c_attnmass_{method[: -len('_perron')]}"
+                / "settings/slotcurri/settings.yaml"
+            )
+            if parent_logged.is_file():
+                data_settings = parent_logged
         return {
             "dataset": dataset,
             "baseline_name": "slotcurri",
@@ -59,7 +93,7 @@ def resolve_run(root: Path, method: str, dataset: str) -> dict:
             "baseline_ckpt": root / "checkpoints/movi_c.ckpt",
             "method_settings": method_settings,
             "method_ckpt": method_ckpt(root, method, dataset),
-            "data_settings": method_settings,
+            "data_settings": data_settings,
             "ignore_background": True,
             "out_stem": f"{method}_movi_c",
         }
@@ -70,7 +104,7 @@ def resolve_run(root: Path, method: str, dataset: str) -> dict:
         "baseline_name": "slotcurri",
         "baseline_settings": root / "logs/_ytvis/settings/slotcurri/settings.yaml",
         "baseline_ckpt": root / "logs/_ytvis/checkpoints/slotcurri_step=step=100000-v1.ckpt",
-        "method_settings": root / f"logs/_ytvis_attnmass_{method}" / "settings/slotcurri/settings.yaml",
+        "method_settings": method_settings,
         "method_ckpt": method_ckpt(root, method, dataset),
         "data_settings": root / "logs/_ytvis/settings/slotcurri/settings.yaml",
         "ignore_background": False,
@@ -215,6 +249,11 @@ def main():
         help="also keep if baseline_mbo - method_mbo >= this",
     )
     ap.add_argument("--frame-stride", type=int, default=2)
+    ap.add_argument(
+        "--skip-viz",
+        action="store_true",
+        help="write all_val_metrics.csv / summary only; skip loser clip rendering",
+    )
     args = ap.parse_args()
 
     method = args.method
@@ -242,6 +281,13 @@ def main():
     print(
         f"  baseline cycle={getattr(base, 'cyclic_inference', True)}  "
         f"{method} cycle={getattr(meth, 'cyclic_inference', True)}"
+    )
+    print(
+        f"  {method} settings={spec['method_settings']}  "
+        f"src_gate={getattr(meth, 'amc_predictor_src_gate', None)}  "
+        f"eval_src_gate={getattr(meth, 'amc_eval_predictor_src_gate', None)}  "
+        f"eval_perron={getattr(meth, 'amc_eval_perron_readout', None)}  "
+        f"eval_pair_iso={getattr(meth, 'amc_eval_predictor_pair_isolate', None)}"
     )
 
     rows = []
@@ -323,51 +369,51 @@ def main():
     print(json.dumps(summary, indent=2))
 
     want = {r["sample"] for r in chosen}
-    print(f"Visualizing {len(want)} loser clips:", sorted(want))
+    if args.skip_viz:
+        print(f"skip viz; would have rendered {len(want)} loser clips:", sorted(want))
+    else:
+        print(f"Visualizing {len(want)} loser clips:", sorted(want))
+        for si, batch in enumerate(loader):
+            if args.max_samples and si >= args.max_samples:
+                break
+            if si not in want:
+                continue
+            meta = next(r for r in rows if r["sample"] == si)
+            print(
+                f"viz sample {si}: dARI={meta['d_ari']:+.3f} dMBO={meta['d_mbo']:+.3f} "
+                f"loss={meta['loss_score']:.3f}"
+            )
+            _, masks_b = score_and_masks(base, batch, device, ign_bg)
+            _, masks_v = score_and_masks(meth, batch, device, ign_bg)
+            video = to_uint8_video(batch["video"])
+            spatial = video.shape[-2:]
 
-    # second pass for viz
-    for si, batch in enumerate(loader):
-        if args.max_samples and si >= args.max_samples:
-            break
-        if si not in want:
-            continue
-        meta = next(r for r in rows if r["sample"] == si)
-        print(
-            f"viz sample {si}: dARI={meta['d_ari']:+.3f} dMBO={meta['d_mbo']:+.3f} "
-            f"loss={meta['loss_score']:.3f}"
-        )
-        _, masks_b = score_and_masks(base, batch, device, ign_bg)
-        _, masks_v = score_and_masks(meth, batch, device, ign_bg)
-        video = to_uint8_video(batch["video"])
-        spatial = video.shape[-2:]
+            overlays = {}
+            if "segmentations" in batch:
+                seg = batch["segmentations"].cpu()
+                if seg.ndim == 4:
+                    ncls = int(seg.max().item()) + 1
+                    gt = one_hot_segmentations(seg, max_classes=max(ncls, 2))
+                else:
+                    gt = seg.bool()
+                gt = prep_masks(gt.float(), spatial)
+                overlays["gt"] = overlay(video, gt)
 
-        overlays = {}
-        if "segmentations" in batch:
-            seg = batch["segmentations"].cpu()
-            if seg.ndim == 4:
-                ncls = int(seg.max().item()) + 1
-                gt = one_hot_segmentations(seg, max_classes=max(ncls, 2))
-            else:
-                gt = seg.bool()
-            gt = prep_masks(gt.float(), spatial)
-            overlays["gt"] = overlay(video, gt)
+            overlays["baseline"] = overlay(video, prep_masks(masks_b, spatial))
+            overlays[method] = overlay(video, prep_masks(masks_v, spatial))
 
-        overlays["baseline"] = overlay(video, prep_masks(masks_b, spatial))
-        overlays[method] = overlay(video, prep_masks(masks_v, spatial))
-
-        labels = [
-            "gt",
-            f"{spec['baseline_name']} ARI={meta['baseline_ari']:.3f} mBO={meta['baseline_mbo']:.3f}",
-            f"{method} ARI={meta[f'{method}_ari']:.3f} mBO={meta[f'{method}_mbo']:.3f}  "
-            f"dARI={meta['d_ari']:+.3f} dMBO={meta['d_mbo']:+.3f}",
-        ]
-        order = ["gt", "baseline", method]
-        frames = hstack_labeled([overlays[k] for k in order], labels)
-        frames = frames[:: max(args.frame_stride, 1)]
-        # rank by loss among chosen
-        rank_i = next(i for i, r in enumerate(chosen) if r["sample"] == si)
-        stem = f"rank{rank_i:02d}_sample{si:03d}_dARI{meta['d_ari']:+.3f}_dMBO{meta['d_mbo']:+.3f}"
-        save_clip(frames, out_dir / stem)
+            labels = [
+                "gt",
+                f"{spec['baseline_name']} ARI={meta['baseline_ari']:.3f} mBO={meta['baseline_mbo']:.3f}",
+                f"{method} ARI={meta[f'{method}_ari']:.3f} mBO={meta[f'{method}_mbo']:.3f}  "
+                f"dARI={meta['d_ari']:+.3f} dMBO={meta['d_mbo']:+.3f}",
+            ]
+            order = ["gt", "baseline", method]
+            frames = hstack_labeled([overlays[k] for k in order], labels)
+            frames = frames[:: max(args.frame_stride, 1)]
+            rank_i = next(i for i, r in enumerate(chosen) if r["sample"] == si)
+            stem = f"rank{rank_i:02d}_sample{si:03d}_dARI{meta['d_ari']:+.3f}_dMBO{meta['d_mbo']:+.3f}"
+            save_clip(frames, out_dir / stem)
 
     # compact table of chosen
     table_path = out_dir / "losers_table.csv"

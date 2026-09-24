@@ -1,3 +1,4 @@
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import einops
@@ -161,6 +162,55 @@ class FeatureSmoothing(nn.Module):
         return (1.0 - mix) * smoothed + mix * x
 
 
+# 8-neighbor offsets (no self). Same order as the occupancy-gate n8 graph.
+_N8_OFFSETS = (
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+)
+
+
+def _square_grid(n_tokens: int) -> int:
+    grid = int(math.sqrt(n_tokens))
+    if grid * grid != n_tokens:
+        raise ValueError(
+            f"n8 feature curriculum expects a square patch grid, got N={n_tokens}"
+        )
+    return grid
+
+
+def _n8_row_level(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """X^rel = P X, P = row-normalize of 8-neighbor ReLU-cosine R.
+
+    Same random-walk P as barrier=false Ncut, but R_ij is nonzero only for
+    Chebyshev-1 neighbors. Isolated patches (row sum 0) keep the original token.
+    x: (B, N, D) with N a square. Never forms N×N.
+    """
+    bsz, n_tokens, dim = x.shape
+    grid = _square_grid(n_tokens)
+    z = torch.nn.functional.normalize(x, dim=-1)
+    x_hw = x.view(bsz, grid, grid, dim)
+    z_hw = z.view(bsz, grid, grid, dim)
+    # (B, H, W, C): pad H and W by 1. Same layout as video._pad1_hw.
+    zp = torch.nn.functional.pad(z_hw, (0, 0, 1, 1, 1, 1))
+    xp = torch.nn.functional.pad(x_hw, (0, 0, 1, 1, 1, 1))
+    acc = x.new_zeros(bsz, grid, grid, dim)
+    deg = x.new_zeros(bsz, grid, grid, 1)
+    for dy, dx in _N8_OFFSETS:
+        nb_z = zp[:, 1 - dy : 1 - dy + grid, 1 - dx : 1 - dx + grid]
+        nb_x = xp[:, 1 - dy : 1 - dy + grid, 1 - dx : 1 - dx + grid]
+        r = (z_hw * nb_z).sum(dim=-1, keepdim=True).clamp_min(0.0)
+        acc = acc + r * nb_x
+        deg = deg + r
+    rel = torch.where(deg < eps, x_hw, acc / deg.clamp_min(eps))
+    return rel.view(bsz, n_tokens, dim)
+
+
 class NcutRelationalLeveling(nn.Module):
     """ReLU-cosine graph leveling, optionally with a 2-way Ncut region barrier.
 
@@ -174,12 +224,29 @@ class NcutRelationalLeveling(nn.Module):
     `barrier=False` (v37) skips that cut: P is global on W, same mix / Key-only
     schedule as v36.
 
+    `n8=True` (v39lam1gu_fcn8) keeps that mix / Key-only schedule but replaces
+    dense W with the occupancy-gate 8-neighbor R: R_ij = ReLU(z_i^T z_j) iff
+    j in N_8(i). P is still row-normalize(R). No Fiedler cut (barrier must be
+    false). Distant same-feature patches no longer mix.
+
+    `glob_n8_mix` in (0, 1] (anneal=half uses 0.5) blends after both P's:
+    X^rel = (1-m) P_dense X + m P_n8 X. Barrier must be false. This is a
+    token average, not a graph mix: the dense scene-mean is a shared offset
+    on top of local n8 residual.
+
+    `row_center=True` (anneal=rowcenter) keeps dense P but subtracts each
+    token's mean ReLU-cosine before the ReLU:
+        τ_i = mean_{k≠i} ReLU(z_i^T z_k)
+        W_ij = ReLU(z_i^T z_j - (τ_i+τ_j)/2),  W_ii = 0
+    No extra mix knob. Barrier / n8 / glob_n8_mix must be off.
+
     The Fiedler is batched subspace iteration (k=2) plus a 2x2 Rayleigh-Ritz, not
     a full `eigh`. Isolated rows keep the original token.
 
     Same mix convention as FeatureSmoothing: mix=0 is fully leveled (X^rel),
     mix=1 is raw (identity). P / Ncut run under no_grad; the module has no
-    parameters. `chunk_size` bounds the (N, N) work, not the math.
+    parameters. `chunk_size` bounds the (N, N) work, not the math (n8 never
+    forms N×N; chunk_size is then just a batch grouping).
     """
 
     def __init__(
@@ -188,12 +255,50 @@ class NcutRelationalLeveling(nn.Module):
         eps: float = 1e-6,
         n_iter: int = 16,
         barrier: bool = True,
+        n8: bool = False,
+        glob_n8_mix: float = 0.0,
+        row_center: bool = False,
     ):
         super().__init__()
         self.chunk_size = max(int(chunk_size), 1)
         self.eps = float(eps)
         self.n_iter = max(int(n_iter), 1)
+        self.n8 = bool(n8)
         self.barrier = bool(barrier)
+        self.glob_n8_mix = float(glob_n8_mix)
+        self.row_center = bool(row_center)
+        if self.glob_n8_mix < 0.0 or self.glob_n8_mix > 1.0:
+            raise ValueError(
+                "NcutRelationalLeveling: glob_n8_mix must be in [0, 1], "
+                f"got {self.glob_n8_mix}"
+            )
+        if self.n8 and self.barrier:
+            raise ValueError(
+                "NcutRelationalLeveling: n8=True cannot use barrier=True "
+                "(Fiedler/median cut is defined on the dense graph)"
+            )
+        if self.glob_n8_mix > 0.0 and self.n8:
+            raise ValueError(
+                "NcutRelationalLeveling: glob_n8_mix>0 is the dense+n8 blend; "
+                "use n8=False"
+            )
+        if self.glob_n8_mix > 0.0 and self.barrier:
+            raise ValueError(
+                "NcutRelationalLeveling: glob_n8_mix>0 cannot use barrier=True"
+            )
+        if self.row_center and self.n8:
+            raise ValueError(
+                "NcutRelationalLeveling: row_center=True is dense-graph; "
+                "use n8=False"
+            )
+        if self.row_center and self.barrier:
+            raise ValueError(
+                "NcutRelationalLeveling: row_center=True cannot use barrier=True"
+            )
+        if self.row_center and self.glob_n8_mix > 0.0:
+            raise ValueError(
+                "NcutRelationalLeveling: row_center=True cannot use glob_n8_mix>0"
+            )
 
     def _fiedler(self, w_norm: torch.Tensor) -> torch.Tensor:
         """2nd-largest eigenvector of W_norm (Fiedler of L = I - W_norm).
@@ -232,9 +337,24 @@ class NcutRelationalLeveling(nn.Module):
         # AMP would downcast bmm/qr to fp16; CUDA geqrf has no Half kernel.
         with torch.cuda.amp.autocast(enabled=False):
             x = x.float()
+            if self.n8:
+                rel = _n8_row_level(x, self.eps)
+                v2 = torch.zeros(x.shape[:2], device=x.device, dtype=x.dtype)
+                region = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+                return rel, region, v2
             z = torch.nn.functional.normalize(x, dim=-1)
             # fp32 ReLU-cosine P (AMP would downcast bmm). (W X)/row = P X.
-            w = torch.bmm(z, z.transpose(1, 2)).clamp_min(0.0)
+            cos = torch.bmm(z, z.transpose(1, 2))
+            if self.row_center:
+                relu_cos = cos.clamp_min(0.0)
+                relu_cos.diagonal(dim1=-2, dim2=-1).zero_()
+                n_tokens = x.shape[1]
+                tau = relu_cos.sum(dim=-1) / max(n_tokens - 1, 1)
+                w = (
+                    cos - 0.5 * (tau.unsqueeze(-1) + tau.unsqueeze(-2))
+                ).clamp_min(0.0)
+            else:
+                w = cos.clamp_min(0.0)
             w.diagonal(dim1=-2, dim2=-1).zero_()
 
             if self.barrier:
@@ -255,6 +375,10 @@ class NcutRelationalLeveling(nn.Module):
             row = w_tilde.sum(dim=-1, keepdim=True)
             rel = torch.bmm(w_tilde, x)
             rel = torch.where(row < self.eps, x, rel / row.clamp_min(self.eps))
+            if self.glob_n8_mix > 0.0:
+                n8_rel = _n8_row_level(x, self.eps)
+                m = self.glob_n8_mix
+                rel = (1.0 - m) * rel + m * n8_rel
             return rel, region, v2
 
     @torch.no_grad()
@@ -434,6 +558,9 @@ class FrameEncoder(nn.Module):
         # `feature_curriculum_apply == "key"` keeps the reconstruction target (and the
         # Value path) on the original tokens and only feeds the bind tensor to Keys.
         # v37 uses the same Key-only split with Ncut leveling, barrier=false.
+        # anneal=n8 keeps that split / mix but levels on 8-neighbor R, not dense W.
+        # anneal=half averages dense P X and n8 P X (glob_n8_mix=0.5).
+        # anneal=rowcenter: W_ij = ReLU(cos_ij - (τ_i+τ_j)/2), then dense P.
         self.feature_ncut: Optional[nn.Module] = None
         self.feature_ncut_mix: float = 1.0
         self.feature_curriculum_apply: str = "tokens"

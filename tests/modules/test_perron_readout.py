@@ -82,3 +82,42 @@ def test_processor_perron_is_decoder_only():
     expected = _perron_spatial_gate(off["active_mask"], q1)
     assert torch.allclose(on["decoder_gate"], expected, atol=1e-5)
     assert torch.allclose(on["state_gate"], pi, atol=1e-4)
+
+
+def test_pair_isolate_blocks_cross_and_keeps_same_group():
+    from slotcurri.modules.video import _pair_isolate_weights
+
+    g = torch.tensor([[1.0, 1.0, 0.0]])
+    a = _pair_isolate_weights(g)
+    assert a.shape == (1, 3, 3)
+    # live-live open
+    assert float(a[0, 0, 1]) == 1.0
+    assert float(a[0, 1, 0]) == 1.0
+    # live-ghost closed both ways
+    assert float(a[0, 0, 2]) == 0.0
+    assert float(a[0, 2, 0]) == 0.0
+    assert float(a[0, 1, 2]) == 0.0
+    assert float(a[0, 2, 1]) == 0.0
+    # ghost self open
+    assert float(a[0, 2, 2]) == 1.0
+
+
+def test_pair_isolate_soft_mid_pi():
+    from slotcurri.modules.video import _pair_isolate_weights
+
+    g = torch.tensor([[1.0, 0.3]])
+    a = _pair_isolate_weights(g)
+    # max-norm leaves [1, 0.3]
+    assert torch.allclose(a[0, 0, 0], torch.tensor(1.0))
+    assert a[0, 0, 1] < a[0, 0, 0]
+    assert a[0, 1, 0] == a[0, 0, 1]
+
+
+def test_pi_gamma_identity_and_pow2():
+    from slotcurri.modules.video import _pi_gamma
+
+    g = torch.tensor([[1.0, 0.5]])
+    assert _pi_gamma(g, 1.0) is g
+    sharp = _pi_gamma(g, 2.0)
+    assert torch.allclose(sharp, torch.tensor([[1.0, 0.25]]))
+    assert torch.equal(_pi_gamma(torch.tensor([[True, False]]), 2.0), torch.tensor([[True, False]]))

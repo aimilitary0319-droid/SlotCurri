@@ -36,20 +36,12 @@ model:
   visualize_every_n_steps: 10000
   cyclic_inference: false
 
-  # --- MOVi-C v39lam1gu_umix_perron = umix + decoder Perron readout ---
+  # --- MOVi-C v39lam1gu_umix_perron = umix train, eval-only Perron ---
   #
-  # Temporal path is umix (scalar π̄). Decoder slots stay u^SA. Masks use the
-  # same G_s eigenpair as π: m_{s,i} = softmax(α) π_s q̃_{1,s,i} with
-  # q̃_1 = max-norm_i max(q_1, 0). Mix / Pred / source-gate stay on π̄.
-  # q_1 is detached (same as π). Train and eval.
-  #
-  # Decoder is not byte-identical to v39lam1gu: featrec sees the Perron support.
-  # Occupancy mix:
-  #      u_t     = π̄ u^SA + (1-π̄) û_t
-  #      û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
-  # Same split L_featrec (gated 1.0 + ungated 0.5), λ1 gate, Pred source-gated
-  # SA. Dataset / encoder / slot-count / ignore_background follow
-  # movi_c_attnmass_v29.yaml.
+  # Training is byte-identical to movi_c_attnmass_v39lam1gu_umix.yaml.
+  # Eval only: vanilla Pred SA + decoder m = softmax(α) ⊙ π ⊙ q̃_1 + pair-isolate.
+  # Same official-val protocol as ytvis2021_attnmass_v39lam1gu_perron.yaml.
+  # Dataset / encoder / slot-count / ignore_background follow movi_c_attnmass_v29.yaml.
   feature_curriculum:
     enabled: true
     anneal: ncut       # same ReLU-cosine P X as v37
@@ -71,9 +63,11 @@ model:
     gate_l1: 0.0
     gate_div: 0.0
     state_max_norm: true    # temporal gate alpha = π / max_j(π)
-    predictor_src_gate: true  # Pred SA: B_ij = g_j exp(b_ij) / sum_k g_k exp(b_ik)
+    predictor_src_gate: true  # train: Pred SA B_ij = g_j exp(b_ij) / sum_k g_k exp(b_ik)
     predictor_input_mix: true  # u_t = π̄ u^SA+(1-π̄)û; û_{t+1}=π̄ Pred(u_t)+(1-π̄)u_t
-    perron_readout: true      # decoder m = softmax(α) ⊙ π ⊙ q̃_1 (train+eval)
+    eval_predictor_src_gate: false  # eval only: vanilla Pred SA
+    eval_perron_readout: true       # eval only: decoder m = softmax(α) ⊙ π ⊙ q̃_1
+    eval_predictor_pair_isolate: true  # eval only: live-live and ghost-ghost Pred SA
     contrastive_gate: false # loss_ss ignores the gate (baseline-style)
 
   losses:

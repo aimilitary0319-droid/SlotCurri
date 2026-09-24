@@ -486,10 +486,18 @@ class ObjectCentricModel(pl.LightningModule):
         if self.featcur_enabled and self.featcur_anneal_steps <= 0:
             raise ValueError("feature_curriculum.anneal_steps must be positive")
         self.featcur_anneal = str(fc.get("anneal", "mix")).lower()
-        if self.featcur_anneal not in ("mix", "window", "modes", "ncut"):
+        if self.featcur_anneal not in (
+            "mix",
+            "window",
+            "modes",
+            "ncut",
+            "n8",
+            "half",
+            "rowcenter",
+        ):
             raise ValueError(
-                "feature_curriculum.anneal must be 'mix', 'window', 'modes' or 'ncut', "
-                f"got {self.featcur_anneal!r}"
+                "feature_curriculum.anneal must be 'mix', 'window', 'modes', "
+                f"'ncut', 'n8', 'half' or 'rowcenter', got {self.featcur_anneal!r}"
             )
         # window-anneal (v34): the clock is the Chebyshev radius, not the raw blend.
         # w0 from window_start, else the static `window` field. 0 is illegal (that
@@ -516,7 +524,14 @@ class ObjectCentricModel(pl.LightningModule):
         self._featcur_window = None
         self._featcur_h = 0.0
         self._featcur_s = 0.0
-        self.featcur_apply = str(fc.get("apply", "key" if self.featcur_anneal == "ncut" else "tokens")).lower()
+        self.featcur_apply = str(
+            fc.get(
+                "apply",
+                "key"
+                if self.featcur_anneal in ("ncut", "n8", "half", "rowcenter")
+                else "tokens",
+            )
+        ).lower()
         if self.featcur_apply not in ("tokens", "key"):
             raise ValueError(
                 "feature_curriculum.apply must be 'tokens' or 'key', "
@@ -535,12 +550,31 @@ class ObjectCentricModel(pl.LightningModule):
                 )
                 inner.feature_modes.bandwidth = self.featcur_h_start
                 inner.feature_modes_mix = 0.0
-            elif self.featcur_anneal == "ncut":
+            elif self.featcur_anneal in ("ncut", "n8", "half", "rowcenter"):
+                if self.featcur_anneal in ("n8", "half", "rowcenter") and bool(
+                    fc.get("barrier", False)
+                ):
+                    raise ValueError(
+                        f"feature_curriculum.anneal={self.featcur_anneal!r} "
+                        "requires barrier=false (Fiedler/median cut is defined "
+                        "on the dense graph)"
+                    )
                 inner.feature_ncut = modules.NcutRelationalLeveling(
                     chunk_size=int(fc.get("chunk_size", 8)),
                     eps=float(fc.get("eps", 1e-6)),
                     n_iter=int(fc.get("ncut_iters", 16)),
-                    barrier=bool(fc.get("barrier", True)),
+                    barrier=(
+                        bool(fc.get("barrier", True))
+                        if self.featcur_anneal == "ncut"
+                        else False
+                    ),
+                    n8=self.featcur_anneal == "n8",
+                    glob_n8_mix=(
+                        float(fc.get("glob_n8_mix", 0.5))
+                        if self.featcur_anneal == "half"
+                        else 0.0
+                    ),
+                    row_center=self.featcur_anneal == "rowcenter",
                 )
                 inner.feature_ncut_mix = 0.0
             else:
@@ -685,6 +719,26 @@ class ObjectCentricModel(pl.LightningModule):
         # keep scalar π. perron_readout: train+eval. eval_perron_readout: eval only.
         self.amc_perron_readout = bool(amc.get("perron_readout", False))
         self.amc_eval_perron_readout = bool(amc.get("eval_perron_readout", False))
+        # Optional eval-only Pred source-gate. None = same as train
+        # (predictor_src_gate). False = vanilla Pred SA at eval only.
+        _eval_src = amc.get("eval_predictor_src_gate", None)
+        self.amc_eval_predictor_src_gate = (
+            None if _eval_src is None else bool(_eval_src)
+        )
+        self.amc_predictor_pair_isolate = bool(
+            amc.get("predictor_pair_isolate", False)
+        )
+        self.amc_eval_predictor_pair_isolate = bool(
+            amc.get("eval_predictor_pair_isolate", False)
+        )
+        # Eval-only π^γ after the occupancy is built. 1.0 = identity.
+        # Decoder, temporal max-norm mix, Perron, and pair-isolate all see π^γ.
+        self.amc_eval_pi_gamma = float(amc.get("eval_pi_gamma", 1.0))
+        if self.amc_eval_pi_gamma <= 0.0:
+            raise ValueError(
+                f"attn_mass_curriculum.eval_pi_gamma must be > 0, "
+                f"got {self.amc_eval_pi_gamma}"
+            )
         # π hysteresis (occlusion memory, v39h): the confidence statistic becomes the
         # leaky max π̃_t = max(π_t, γ π̃_{t-1}) with γ = gate_hysteresis in [0, 1).
         # A slot that was recently pure keeps its gate alive ~1/(1-γ) frames through a
@@ -754,6 +808,16 @@ class ObjectCentricModel(pl.LightningModule):
         # v43: Pred source gate uses g / max(g), matching the temporal mix.
         # Default False keeps v39lam1g (raw detached statistic, not max-normed).
         self.amc_predictor_src_max_norm = bool(amc.get("predictor_src_max_norm", False))
+        # Ungate the Pred SA diagonal: A_ii = 1, A_ij = g_j (i≠j). Ghost queries
+        # can stay on their own key (1-layer SA typically does). With
+        # predictor_src_max_norm, g_j is π̄_j so the winner key matches the
+        # mix scale. Default False keeps v39lam1g per-key g_j, including a
+        # closed diagonal for ghosts.
+        self.amc_predictor_src_self = bool(amc.get("predictor_src_self", False))
+        if self.amc_predictor_src_self and not self.amc_predictor_src_gate:
+            raise ValueError(
+                "attn_mass_curriculum.predictor_src_self requires predictor_src_gate"
+            )
         # v39lam1gu_umix: occupancy-mix the corrector output for Pred / next
         # prior only. Decoder still reads u^SA. Default False keeps
         #   û_{t+1} = π̄ Pred(u^SA) + (1-π̄) û_t
@@ -761,10 +825,20 @@ class ObjectCentricModel(pl.LightningModule):
         #   u_t = π̄ u^SA + (1-π̄) û_t
         #   û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
         self.amc_predictor_input_mix = bool(amc.get("predictor_input_mix", False))
+        # After Pred(u_t), hold the mixed state (umix) or take Pred as the
+        # next prior (umix_pred). Default True. False requires input_mix.
+        #   True:  û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t   = u_t + π̄ D
+        #   False: û_{t+1} = Pred(u_t)                   = u_t + D
+        self.amc_predictor_mix_hold = bool(amc.get("predictor_mix_hold", True))
         if self.amc_predictor_input_mix and self.amc_predictor_ungated:
             raise ValueError(
                 "attn_mass_curriculum.predictor_input_mix cannot be combined "
                 "with predictor_ungated"
+            )
+        if not self.amc_predictor_mix_hold and not self.amc_predictor_input_mix:
+            raise ValueError(
+                "attn_mass_curriculum.predictor_mix_hold=false requires "
+                "predictor_input_mix"
             )
         # Temporal-mix smoothing of the gate, decoder stays on instantaneous π.
         # π̃_t = m π_t + (1-m) π̃_{t-1}, then max(π̃_t, hold * π̃_{t-1}).
@@ -1458,9 +1532,19 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_p_state=self._state_gate_threshold(train),
                 state_max_norm=self.amc_state_max_norm,
                 predictor_ungated=self.amc_predictor_ungated,
-                predictor_src_gate=self.amc_predictor_src_gate,
+                predictor_src_gate=(
+                    bool(self.amc_predictor_src_gate)
+                    if train or self.amc_eval_predictor_src_gate is None
+                    else bool(self.amc_eval_predictor_src_gate)
+                ),
                 predictor_src_max_norm=self.amc_predictor_src_max_norm,
+                predictor_src_self=self.amc_predictor_src_self,
+                predictor_pair_isolate=(
+                    bool(self.amc_predictor_pair_isolate)
+                    or (not train and bool(self.amc_eval_predictor_pair_isolate))
+                ),
                 predictor_input_mix=self.amc_predictor_input_mix,
+                predictor_mix_hold=self.amc_predictor_mix_hold,
                 state_gate_ema=self.amc_state_gate_ema,
                 state_gate_hold=self.amc_state_gate_hold,
                 p_mode=self.amc_p_mode,
@@ -1486,6 +1570,9 @@ class ObjectCentricModel(pl.LightningModule):
                 eval_perron_readout=(
                     bool(self.amc_perron_readout)
                     or (not train and bool(self.amc_eval_perron_readout))
+                ),
+                pi_gamma=(
+                    1.0 if train else float(self.amc_eval_pi_gamma)
                 ),
                 **{k: v for k, v in processor_kwargs.items() if k != "cycle"},
             )
@@ -1658,14 +1745,24 @@ class ObjectCentricModel(pl.LightningModule):
 
                     self.slot_loss_scale[:len(slot_loss_per_slot)] = slot_loss_per_slot.detach() # 2
 
-            if (
-                name == 'loss_ss'
-                and self.attn_mass_enabled
-                and self.amc_contrastive_gate
-                and self._active_mask is not None
-            ):
-                # restrict the slot-slot contrastive loss to active slots
-                losses[name] = loss_fn(prediction, target, active_mask=self._active_mask)
+            if name == "loss_cc" and self.attn_mass_enabled and self._active_mask is not None:
+                losses[name] = loss_fn(
+                    prediction, target, occupancy=self._active_mask
+                )
+            elif name == "loss_ss" and self.attn_mass_enabled and self._active_mask is not None:
+                ss_kwargs = {}
+                if self.amc_contrastive_gate:
+                    # restrict L_ss to live anchors; loss max-norms to π̄ = π / max_s(π)
+                    ss_kwargs["active_mask"] = self._active_mask
+                if bool(getattr(loss_fn, "cand_neg", False)) or bool(
+                    getattr(loss_fn, "occ_kernel", False)
+                ):
+                    # occupancy → c=1-π̄ for cand_neg extras and/or occ_kernel blocks
+                    ss_kwargs["occupancy"] = self._active_mask
+                if ss_kwargs:
+                    losses[name] = loss_fn(prediction, target, **ss_kwargs)
+                else:
+                    losses[name] = loss_fn(prediction, target)
             else:
                 losses[name] = loss_fn(prediction, target)
 
@@ -2361,7 +2458,7 @@ class ObjectCentricModel(pl.LightningModule):
             inner.feature_modes_mix = 1.0 if h <= 0.0 else 0.0
             self._featcur_h = h
             self._featcur_window = None
-        elif self.featcur_anneal == "ncut":
+        elif self.featcur_anneal in ("ncut", "n8", "half", "rowcenter"):
             inner.feature_ncut_mix = self._featcur_s
             self._featcur_window = None
             self._featcur_h = 0.0
@@ -2396,7 +2493,7 @@ class ObjectCentricModel(pl.LightningModule):
                 if modes is not None and modes.last_c is not None:
                     to_log["train/featcur_C"] = modes.last_c.float().mean()
                     to_log["train/featcur_C_std"] = modes.last_c.float().std(unbiased=False)
-            elif self.featcur_anneal == "ncut":
+            elif self.featcur_anneal in ("ncut", "n8", "half", "rowcenter"):
                 to_log["train/featcur_mix"] = float(inner.feature_ncut_mix)
                 to_log["train/featcur_beta"] = 1.0 - float(inner.feature_ncut_mix)
             else:

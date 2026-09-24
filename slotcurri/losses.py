@@ -258,6 +258,17 @@ class CrossEntropyLoss(TorchLoss):
     def __init__(self, pred_key: str, target_key: str, **kwargs):
         super().__init__(pred_key, target_key, loss="CrossEntropyLoss", **kwargs)
 
+def _batch_cat_slots(tensor: torch.Tensor) -> torch.Tensor:
+    """(B, T, K, ...) -> (1, T, B*K, ...); matches Slot_Slot batch_contrast layout."""
+    if tensor.ndim == 3:
+        return einops.rearrange(tensor, "b t k -> t (b k)").unsqueeze(0)
+    if tensor.ndim == 4:
+        return einops.rearrange(tensor, "b t k d -> t (b k) d").unsqueeze(0)
+    raise ValueError(
+        f"batch_contrast layout expects 3D or 4D (B, T, K, [D]), got {tuple(tensor.shape)}"
+    )
+
+
 class Slot_Slot_Contrastive_Loss(Loss):
     def __init__(
         self,
@@ -266,6 +277,8 @@ class Slot_Slot_Contrastive_Loss(Loss):
         temperature: float = 0.1,
         batch_contrast: bool = True,
         gate_negatives: bool = False,
+        cand_neg: bool = False,
+        occ_kernel: bool = False,
         **kwargs,
     ):
         super().__init__(pred_key, target_key, **kwargs)
@@ -277,25 +290,78 @@ class Slot_Slot_Contrastive_Loss(Loss):
         # at full strength. Only affects the active-mask path; default False keeps the
         # original (baseline-aligned) behavior where all slots are full-strength negatives.
         self.gate_negatives = gate_negatives
+        # Same-frame extras: other *candidate* slots (c=1-π̄) as extra CE classes.
+        # Identity positive u_i^(t) ↔ u_i^(t+1) is unchanged. Live columns get
+        # -inf extras so their softmax stays the original S-way. Default False.
+        self.cand_neg = bool(cand_neg)
+        # Identity CE unchanged. Logit bias log(π̄_i π̄_j + c_i c_j) splits the
+        # softmax into a live pool and a candidate pool (c=1-π̄). Cross terms
+        # drop out, so candidates may match live (challenge) while remaining
+        # unique among themselves. Default False is original S-way CE.
+        self.occ_kernel = bool(occ_kernel)
 
-    def forward(self, slots, _, active_mask=None):
+    def forward(self, slots, _, active_mask=None, occupancy=None):
         # slots: (B, T, S, D); active_mask (optional): (B, T, S) bool.
         slots = nn.functional.normalize(slots, p=2.0, dim=-1)
+        # Live weights are π̄ = π / max_s(π), same as L_cc / occ_kernel.
+        # Must happen before batch_contrast so the max is per (B, T), not B*K.
+        if active_mask is not None and active_mask.dtype != torch.bool:
+            g = active_mask.float().detach()
+            active_mask = g / g.amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        pi_bar = None
+        if occupancy is not None and occupancy.dtype != torch.bool:
+            if self.cand_neg or self.occ_kernel:
+                g = occupancy.float().detach()
+                pi_bar = g / g.amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        cand = None
+        if self.cand_neg and pi_bar is not None:
+            cand = (1.0 - pi_bar).clamp(0.0, 1.0)
         if self.batch_contrast:
-            slots = slots.split(1)  # [1xTxKxD]
-            slots = torch.cat(slots, dim=-2)  # 1xTxK*BxD
+            slots = _batch_cat_slots(slots)
             if active_mask is not None:
                 # match the (batch-concatenated) slot layout: (1, T, B*K)
-                active_mask = einops.rearrange(active_mask, "b t k -> t (b k)").unsqueeze(0)
+                active_mask = _batch_cat_slots(active_mask)
+            if cand is not None:
+                cand = _batch_cat_slots(cand)
+            if pi_bar is not None:
+                pi_bar = _batch_cat_slots(pi_bar)
         s1 = slots[:, :-1, :, :]
         s2 = slots[:, 1:, :, :]
         ss = torch.matmul(s1, s2.transpose(-2, -1)) / self.temperature
         B, T, S, D = ss.shape
         ss = ss.reshape(B * T, S, S)
+        if self.occ_kernel and pi_bar is not None:
+            # w_ij = π̄_i^t π̄_j^{t+1} + c_i^t c_j^{t+1}; diagonal forced to 1
+            # so identity stays in the softmax if occupancy flips across t.
+            p1 = pi_bar[:, :-1].reshape(B * T, S)
+            p2 = pi_bar[:, 1:].reshape(B * T, S)
+            c1 = (1.0 - p1).clamp(0.0, 1.0)
+            c2 = (1.0 - p2).clamp(0.0, 1.0)
+            w = p1.unsqueeze(-1) * p2.unsqueeze(-2) + c1.unsqueeze(-1) * c2.unsqueeze(-2)
+            w = w.clone()
+            w.diagonal(dim1=-2, dim2=-1).fill_(1.0)
+            ss = ss + w.clamp_min(1e-8).log()
+        if cand is not None:
+            # Extra CE classes (concat on dim=1, the original softmax axis):
+            #   extra_{k,j} = <u_k^(t), u_j^(t)>/τ  if both k,j are candidates, k≠j
+            # Live columns (c_j=0) keep all extras at -inf → original S-way CE.
+            c1 = cand[:, :-1].reshape(B * T, S)
+            ff = torch.matmul(s1, s1.transpose(-2, -1)) / self.temperature
+            ff = ff.reshape(B * T, S, S)
+            pair_c = c1.unsqueeze(-1) * c1.unsqueeze(-2)
+            pair_c = pair_c * (
+                1.0 - torch.eye(S, device=ss.device, dtype=pair_c.dtype)
+            )
+            extra = ff + pair_c.clamp_min(1e-8).log()
+            extra = extra.masked_fill(pair_c <= 0, float("-inf"))
+            ss = torch.cat([ss, extra], dim=1)  # (B*T, 2S, S)
         if active_mask is None:
-            target = torch.eye(S).expand(B * T, S, S).to(ss.device)
-            loss = self.criterion(ss, target)
-            return loss
+            if ss.shape[1] == S:
+                target = torch.eye(S).expand(B * T, S, S).to(ss.device)
+                return self.criterion(ss, target)
+            # Identity class is still row i of the time block (first S rows).
+            target = torch.arange(S, device=ss.device).unsqueeze(0).expand(B * T, S)
+            return self.criterion(ss, target)
 
         # active-only: only slots active at both frame t and t+1 count as anchors.
         # Works for hard (bool) and soft (float gate in [0, 1]) masks: the product is a
@@ -316,9 +382,57 @@ class Slot_Slot_Contrastive_Loss(Loss):
             # gate. Hard/STE gates in {0, 1} -> log(1)=0 keep, log(0)=-inf drop (mask dormant
             # negatives); soft gates in (0, 1) -> continuous down-weighting. Unifies all modes.
             log_a1 = torch.log(a1.reshape(B * T, S).clamp_min(1e-8))  # (B*T, S)
-            ss = ss + log_a1.unsqueeze(-1)  # broadcast over the frame-(t+1) axis (dim=2)
+            time_bias = log_a1.unsqueeze(-1)  # (B*T, S, 1) over the t+1 axis
+            if ss.shape[1] == S:
+                ss = ss + time_bias
+            else:
+                ss = ss.clone()
+                ss[:, :S] = ss[:, :S] + time_bias
         # CrossEntropy with identity target == -log_softmax over candidate rows at the diagonal.
+        # First S rows are the time block; extra cand-neg rows (if any) sit at S:2S.
         logp = torch.log_softmax(ss, dim=1)
-        diag = torch.diagonal(logp, dim1=1, dim2=2)  # (B*T, S)
+        diag = torch.diagonal(logp[:, :S], dim1=1, dim2=2)  # (B*T, S)
         loss = -(diag * pair).sum() / pair.sum().clamp(min=1.0)
         return loss
+
+
+class Slot_Candidate_Repel_Loss(Loss):
+    """Same-frame candidate-candidate repulsion. Live is not a negative.
+
+    For L2-unit slots and detached occupancy, leftover vs live is relative
+    but only after something is actually occupied:
+
+        π̄ = π / max_s(π),   c = sg(1-π̄) sg(π_max)
+
+        L = mean_{b,t} log(1 + sum_{k≠j} c_k c_j [u_k^T u_j]_+^2)
+
+    Early π_max≈0 → no candidates. The inner sum is stricter as more
+    cands overlap. log1p keeps it auxiliary to L_ss (weight 0.1 vs 0.5).
+    Mean only over batch and time.
+    """
+
+    def __init__(self, pred_key: str, target_key: str, eps: float = 1e-8, **kwargs):
+        super().__init__(pred_key, target_key, **kwargs)
+        self.eps = float(eps)
+
+    def forward(self, slots, _, occupancy=None):
+        # slots: (B, T, S, D) or (B, S, D)
+        u = nn.functional.normalize(slots, p=2.0, dim=-1)
+        if u.ndim == 3:
+            u = u.unsqueeze(1)
+        if occupancy is None:
+            c = torch.ones(u.shape[:-1], dtype=u.dtype, device=u.device)
+        else:
+            g = occupancy.float().detach()
+            if g.ndim == 2:
+                g = g.unsqueeze(1)
+            pi_max = g.amax(dim=-1, keepdim=True)
+            pi_bar = g / pi_max.clamp_min(self.eps)
+            c = ((1.0 - pi_bar) * pi_max).clamp(0.0, 1.0)
+        # (B, T, S, S)
+        cos = torch.matmul(u, u.transpose(-2, -1))
+        s = cos.shape[-1]
+        off = 1.0 - torch.eye(s, device=cos.device, dtype=cos.dtype)
+        w = c.unsqueeze(-1) * c.unsqueeze(-2) * off
+        pair = w * cos.clamp_min(0.0).square()
+        return torch.log1p(pair.sum(dim=(-1, -2))).mean()

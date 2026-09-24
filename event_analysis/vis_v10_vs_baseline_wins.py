@@ -149,6 +149,12 @@ def main():
     print(f"  dataset={spec['dataset']} baseline={spec['baseline_name']} {spec['baseline_ckpt']}")
     base = load_model(str(spec["baseline_settings"]), str(spec["baseline_ckpt"]), device)
     meth = load_model(str(spec["method_settings"]), str(spec["method_ckpt"]), device)
+    print(
+        f"  {method} src_gate={getattr(meth, 'amc_predictor_src_gate', None)}  "
+        f"eval_src_gate={getattr(meth, 'amc_eval_predictor_src_gate', None)}  "
+        f"eval_perron={getattr(meth, 'amc_eval_perron_readout', None)}  "
+        f"eval_pair_iso={getattr(meth, 'amc_eval_predictor_pair_isolate', None)}"
+    )
 
     print(f"Visualizing {len(want)} winner clips:", sorted(want))
     for si, batch in enumerate(loader):

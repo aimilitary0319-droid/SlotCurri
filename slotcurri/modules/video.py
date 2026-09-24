@@ -27,6 +27,57 @@ def _max_norm(gate: Optional[torch.Tensor], enabled: bool) -> Optional[torch.Ten
     return gate / gate.amax(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
+def _src_gate_self_weights(gate: torch.Tensor) -> torch.Tensor:
+    """Src-gate with ungated diagonal: A_ij = g_j (i≠j), A_ii = 1.
+
+    Ghost queries can attend to their own key; live off-diagonal still uses g_j.
+    (B, S) -> (B, S, S). Detached. Bool gates become 0/1 floats first.
+    """
+    g = gate.detach()
+    if g.dtype == torch.bool:
+        g = g.to(dtype=torch.float32)
+    n_slots = g.shape[-1]
+    # A[b, i, j] = g[b, j]
+    a = g.unsqueeze(-2).expand(g.shape[0], n_slots, n_slots).clone()
+    eye = torch.eye(n_slots, device=g.device, dtype=a.dtype)
+    return a * (1.0 - eye) + eye
+
+
+def _pair_isolate_weights(gate: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Same-group Pred SA: A_ij = π̄_i π̄_j + (1-π̄_i)(1-π̄_j).
+
+    Live queries see live keys, ghost queries see ghost keys, cross terms 0.
+    Detached. Bool gates are already 0/1 so they skip max-norm.
+    """
+    g = gate.detach()
+    if g.dtype == torch.bool:
+        gbar = g.to(dtype=torch.float32)
+    else:
+        gbar = g.float()
+        gbar = gbar / gbar.amax(dim=-1, keepdim=True).clamp_min(float(eps))
+    live = gbar.unsqueeze(-1) * gbar.unsqueeze(-2)
+    dead = (1.0 - gbar).unsqueeze(-1) * (1.0 - gbar).unsqueeze(-2)
+    return live + dead
+
+
+def _pi_gamma(gate: Optional[torch.Tensor], gamma: float) -> Optional[torch.Tensor]:
+    """Eval-only π^γ. 1.0 is a no-op. Bool gates stay 0/1.
+
+    Applied to the scalar occupancy before decoder / mix / Pred. With
+    state_max_norm, mix uses (π^γ)/max(π^γ) = (π/max π)^γ.
+    """
+    if gate is None:
+        return None
+    g = 1.0 if gamma is None else float(gamma)
+    if g == 1.0:
+        return gate
+    if g <= 0.0:
+        raise ValueError(f"pi_gamma must be > 0, got {g}")
+    if gate.dtype == torch.bool:
+        return gate
+    return gate.clamp_min(0.0).pow(g)
+
+
 def _eval_hard_threshold(gate: Optional[torch.Tensor], thresh: float) -> Optional[torch.Tensor]:
     """Eval-only binarize: float π -> bool 1{π >= thresh}. Bool / None / thresh<=0 pass through.
 
@@ -1366,7 +1417,10 @@ class LatentProcessor(nn.Module):
         predictor_ungated: bool = False,
         predictor_src_gate: bool = False,
         predictor_src_max_norm: bool = False,
+        predictor_src_self: bool = False,
+        predictor_pair_isolate: bool = False,
         predictor_input_mix: bool = False,
+        predictor_mix_hold: bool = True,
         state_gate_ema: float = 1.0,
         state_gate_hold: float = 0.0,
         state_gate_prev: Optional[torch.Tensor] = None,
@@ -1397,6 +1451,7 @@ class LatentProcessor(nn.Module):
         spectral_proj_dim: int = 0,
         eval_hard_thresh: float = 0.0,
         eval_perron_readout: bool = False,
+        pi_gamma: float = 1.0,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -1407,6 +1462,14 @@ class LatentProcessor(nn.Module):
             assert state.ndim == 3
         # inputs: batch x n_inputs x input_dim (1 30 1369 64)
         assert inputs.ndim == 3
+        if predictor_input_mix and predictor_ungated:
+            raise ValueError(
+                "predictor_input_mix cannot be combined with predictor_ungated"
+            )
+        if not predictor_mix_hold and not predictor_input_mix:
+            raise ValueError(
+                "predictor_mix_hold=False requires predictor_input_mix"
+            )
         if inputs is not None:
             corr_kwargs: Dict[str, Any] = {}
             if time_step == 0 and self.first_step_corrector_args:
@@ -1820,6 +1883,13 @@ class LatentProcessor(nn.Module):
                 aliased = state_mask is active_mask
                 active_mask = _eval_hard_threshold(active_mask, ht)
                 state_mask = active_mask if aliased else _eval_hard_threshold(state_mask, ht)
+            # Eval-only π^γ. After hard thresh, before Pred / mix / decoder
+            # (Perron and pair-isolate read these masks).
+            pg = 1.0 if pi_gamma is None else float(pi_gamma)
+            if pg != 1.0:
+                aliased = state_mask is active_mask
+                active_mask = _pi_gamma(active_mask, pg)
+                state_mask = active_mask if aliased else _pi_gamma(state_mask, pg)
             # The corrector output is deliberately NOT gated here. Gating it as well as the
             # predictor output puts the gate twice on the same path, and because the predictor
             # is a residual block (Pred(x) = x + D) the observation then lands at g^2 while the
@@ -1845,26 +1915,32 @@ class LatentProcessor(nn.Module):
         if self.predictor_takes_vel and prev_state is not None:
             vel = updated_state - prev_state
 
-        if predictor_input_mix and predictor_ungated:
-            raise ValueError(
-                "predictor_input_mix cannot be combined with predictor_ungated"
-            )
-
         pred_kwargs: Dict[str, Any] = {}
         if vel is not None:
             pred_kwargs["vel"] = vel
         # Source-gated self-attention (v39lam1g): keys/values of low-g slots
         # are down-weighted inside Pred, before the temporal mix.
-        #   B_{i,j}^g = g_j exp(b_{i,j}) / sum_k g_k exp(b_{i,k})
+        #   B_{i,j}^g = A_{i,j} exp(b_{i,j}) / sum_k A_{i,k} exp(b_{i,k})
         # Uses the current-frame mix statistic (state_mask, else decoder g),
         # detached. Max-norm is applied later on the mix, not here, unless
-        # predictor_src_max_norm (v43: g = z / max z for Pred and the mix).
+        # predictor_src_max_norm (g = π̄ so Pred SA matches the mix). With
+        # predictor_src_self, A_ii = 1 and A_ij = g_j (i≠j).
         if predictor_src_gate:
             src_g = state_mask if state_mask is not None else active_mask
             if src_g is not None:
                 if predictor_src_max_norm:
                     src_g = _max_norm(src_g, True)
-                pred_kwargs["key_weights"] = src_g.detach().to(
+                src_w = src_g.detach()
+                if predictor_src_self:
+                    src_w = _src_gate_self_weights(src_w)
+                pred_kwargs["key_weights"] = src_w.to(dtype=updated_state.dtype)
+        # Same-group Pred SA (eval isolate): live-live and ghost-ghost only.
+        # Overwrites per-key src-gate when both are on (pairwise is the stricter
+        # mask; src-gate softmax would re-open ghost→live).
+        if predictor_pair_isolate:
+            src_g = state_mask if state_mask is not None else active_mask
+            if src_g is not None:
+                pred_kwargs["key_weights"] = _pair_isolate_weights(src_g).to(
                     dtype=updated_state.dtype
                 )
         # v39lam1gu_umix defers Pred until π̄ and u_t are known.
@@ -1944,17 +2020,19 @@ class LatentProcessor(nn.Module):
                     )
                 a = a * identity_cos.unsqueeze(-1)
             if predictor_input_mix:
-                # Decoder still reads u^SA (`state` below). Pred / next prior
-                # use the occupancy mix so a vanished slot does not leak u^SA:
+                # Decoder still reads u^SA (`state` below). Pred input is the
+                # occupancy mix so a vanished slot does not leak u^SA:
                 #   u_t = π̄ u^SA + (1-π̄) û_t
-                #   û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
+                # umix (mix_hold True):  û_{t+1} = π̄ Pred(u_t) + (1-π̄) u_t
+                # umix_pred (False):     û_{t+1} = Pred(u_t)
                 mixed = a * updated_state + (1.0 - a) * state
                 if self.predictor:
                     predicted_state = self.predictor(mixed, **pred_kwargs)
                 else:
                     predicted_state = mixed
                 predicted_pregate = predicted_state
-                predicted_state = a * predicted_state + (1.0 - a) * mixed
+                if predictor_mix_hold:
+                    predicted_state = a * predicted_state + (1.0 - a) * mixed
             else:
                 predicted_state = a * predicted_state + (1.0 - a) * state
         elif predictor_input_mix:
@@ -2101,7 +2179,10 @@ class ScanOverTime(nn.Module):
         predictor_ungated: bool = False,
         predictor_src_gate: bool = False,
         predictor_src_max_norm: bool = False,
+        predictor_src_self: bool = False,
+        predictor_pair_isolate: bool = False,
         predictor_input_mix: bool = False,
+        predictor_mix_hold: bool = True,
         state_gate_ema: float = 1.0,
         state_gate_hold: float = 0.0,
         p_mode: str = "absolute",
@@ -2127,6 +2208,7 @@ class ScanOverTime(nn.Module):
         spectral_proj_dim: int = 0,
         eval_hard_thresh: float = 0.0,
         eval_perron_readout: bool = False,
+        pi_gamma: float = 1.0,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -2140,7 +2222,10 @@ class ScanOverTime(nn.Module):
             predictor_ungated=predictor_ungated,
             predictor_src_gate=predictor_src_gate,
             predictor_src_max_norm=predictor_src_max_norm,
+            predictor_src_self=predictor_src_self,
+            predictor_pair_isolate=predictor_pair_isolate,
             predictor_input_mix=predictor_input_mix,
+            predictor_mix_hold=predictor_mix_hold,
             state_gate_ema=state_gate_ema,
             state_gate_hold=state_gate_hold,
             p_mode=p_mode, median_ema_momentum=median_ema_momentum,
@@ -2159,6 +2244,7 @@ class ScanOverTime(nn.Module):
             spectral_proj_dim=spectral_proj_dim,
             eval_hard_thresh=eval_hard_thresh,
             eval_perron_readout=eval_perron_readout,
+            pi_gamma=pi_gamma,
         )
 
         state = initial_state

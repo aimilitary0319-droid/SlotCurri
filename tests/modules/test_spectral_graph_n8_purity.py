@@ -684,6 +684,69 @@ def test_v39lam1gu_umix_configs_predictor_input_mix():
         assert parent.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8_lam1"
 
 
+def test_v39lam1gu_umix_pred_configs_no_output_hold():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_pred.yaml",
+            "ytvis_attnmass_v39lam1gu_umix_pred",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_pred.yaml",
+            "movi_c_attnmass_v39lam1gu_umix_pred",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert bool(amc["predictor_src_max_norm"]) is True
+        assert bool(amc["predictor_src_self"]) is False
+        assert bool(amc["predictor_input_mix"]) is True
+        assert bool(amc["predictor_mix_hold"]) is False
+        assert bool(amc["state_max_norm"]) is True
+        parent = configuration.load_config(path.replace("_pred", ""))
+        assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+        assert bool(parent.model.attn_mass_curriculum.get("predictor_mix_hold", True)) is True
+        assert bool(parent.model.attn_mass_curriculum.get("predictor_src_self", False)) is False
+        assert bool(parent.model.attn_mass_curriculum.get("predictor_src_max_norm", False)) is False
+
+
+def test_v39lam1gu_umix_pred_perron_eval_only():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_pred_perron.yaml",
+            "ytvis_attnmass_v39lam1gu_umix_pred_perron",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_pred_perron.yaml",
+            "movi_c_attnmass_v39lam1gu_umix_pred_perron",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert bool(amc["predictor_src_max_norm"]) is True
+        assert bool(amc["predictor_src_self"]) is False
+        assert bool(amc["predictor_input_mix"]) is True
+        assert bool(amc["predictor_mix_hold"]) is False
+        assert bool(amc["eval_predictor_src_gate"]) is False
+        assert bool(amc["eval_perron_readout"]) is True
+        assert bool(amc["eval_predictor_pair_isolate"]) is True
+        assert bool(amc.get("perron_readout", False)) is False
+        parent = configuration.load_config(path.replace("_perron", ""))
+        assert bool(parent.model.attn_mass_curriculum["predictor_mix_hold"]) is False
+        assert parent.model.attn_mass_curriculum.get("eval_predictor_src_gate") is None
+        assert bool(parent.model.attn_mass_curriculum.get("eval_perron_readout", False)) is False
+        assert bool(parent.model.attn_mass_curriculum.get("eval_predictor_pair_isolate", False)) is False
+
+
 def test_v39lam1gu_umix_perron_configs():
     from slotcurri import configuration
 
@@ -701,12 +764,559 @@ def test_v39lam1gu_umix_perron_configs():
         assert cfg.experiment_name == name
         amc = cfg.model.attn_mass_curriculum
         assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
         assert bool(amc["predictor_input_mix"]) is True
-        assert bool(amc["perron_readout"]) is True
-        assert bool(amc.get("eval_perron_readout", False)) is False
+        assert bool(amc["eval_predictor_src_gate"]) is False
+        assert bool(amc["eval_perron_readout"]) is True
+        assert bool(amc["eval_predictor_pair_isolate"]) is True
+        assert bool(amc.get("perron_readout", False)) is False
         parent = configuration.load_config(path.replace("_perron", ""))
         assert bool(parent.model.attn_mass_curriculum.get("perron_readout", False)) is False
+        assert bool(parent.model.attn_mass_curriculum.get("eval_perron_readout", False)) is False
         assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+        assert parent.model.attn_mass_curriculum.get("eval_predictor_src_gate") is None
+
+
+def test_v39lam1gu_perron_eval_only_src_gate_off():
+    from slotcurri import configuration
+
+    for path, name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron.yaml",
+            "ytvis_attnmass_v39lam1gu_perron",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron.yaml",
+            "movi_c_attnmass_v39lam1gu_perron",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert bool(amc["eval_predictor_src_gate"]) is False
+        assert bool(amc["eval_perron_readout"]) is True
+        assert bool(amc["eval_predictor_pair_isolate"]) is True
+        assert bool(amc.get("perron_readout", False)) is False
+        assert bool(amc.get("predictor_input_mix", False)) is False
+        parent = configuration.load_config(path.replace("_perron", ""))
+        assert parent.experiment_name == name.replace("_perron", "")
+        assert bool(parent.model.attn_mass_curriculum["predictor_src_gate"]) is True
+        assert parent.model.attn_mass_curriculum.get("eval_predictor_src_gate") is None
+        assert bool(parent.model.attn_mass_curriculum.get("eval_perron_readout", False)) is False
+        assert abs(float(cfg.model.loss_weights["loss_featrec"]) - 1.0) < 1e-9
+        assert abs(float(cfg.model.loss_weights["loss_featrec_ungated"]) - 0.5) < 1e-9
+        assert abs(float(cfg.model.loss_weights["loss_ss"]) - 0.5) < 1e-9
+
+
+def test_v39lam1gu_fcn8_configs_n8_curriculum():
+    from slotcurri import configuration
+
+    for train_path, train_name, parent_path, perron_path, dense_perron_path in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_fcn8.yaml",
+            "ytvis_attnmass_v39lam1gu_fcn8",
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu.yaml",
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_fcn8_perron.yaml",
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron.yaml",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_fcn8.yaml",
+            "movi_c_attnmass_v39lam1gu_fcn8",
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu.yaml",
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_fcn8_perron.yaml",
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron.yaml",
+        ),
+    ):
+        train = configuration.load_config(train_path)
+        assert train.experiment_name == train_name
+        fc = train.model.feature_curriculum
+        assert fc["anneal"] == "n8"
+        assert fc["apply"] == "key"
+        assert bool(fc["barrier"]) is False
+        assert int(fc["anneal_steps"]) == 50000
+        amc = train.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert amc.get("eval_predictor_src_gate") is None
+        assert bool(amc.get("eval_perron_readout", False)) is False
+        parent = configuration.load_config(parent_path)
+        assert parent.model.feature_curriculum["anneal"] == "ncut"
+        assert parent.model.attn_mass_curriculum["conf_kind"] == "spectral_graph_n8_lam1"
+
+        perron = configuration.load_config(perron_path)
+        assert perron.experiment_name == train_name + "_perron"
+        assert perron.model.feature_curriculum["anneal"] == "n8"
+        pamc = perron.model.attn_mass_curriculum
+        assert bool(pamc["predictor_src_gate"]) is True
+        assert bool(pamc["eval_predictor_src_gate"]) is False
+        assert bool(pamc["eval_perron_readout"]) is True
+        assert bool(pamc["eval_predictor_pair_isolate"]) is True
+        dense_perron = configuration.load_config(dense_perron_path)
+        assert dense_perron.model.feature_curriculum["anneal"] == "ncut"
+
+
+def test_v39lam1gu_fchalf_yaml_is_half_blend_not_n8():
+    from slotcurri import configuration
+
+    for train_path, train_name, parent_path, perron_path, dense_perron_path in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_fchalf.yaml",
+            "ytvis_attnmass_v39lam1gu_fchalf",
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu.yaml",
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_fchalf_perron.yaml",
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron.yaml",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_fchalf.yaml",
+            "movi_c_attnmass_v39lam1gu_fchalf",
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu.yaml",
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_fchalf_perron.yaml",
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron.yaml",
+        ),
+    ):
+        train = configuration.load_config(train_path)
+        assert train.experiment_name == train_name
+        fc = train.model.feature_curriculum
+        assert fc["anneal"] == "half"
+        assert float(fc["glob_n8_mix"]) == 0.5
+        assert fc["apply"] == "key"
+        assert bool(fc["barrier"]) is False
+        parent = configuration.load_config(parent_path)
+        assert parent.model.feature_curriculum["anneal"] == "ncut"
+        perron = configuration.load_config(perron_path)
+        assert perron.experiment_name == train_name + "_perron"
+        assert perron.model.feature_curriculum["anneal"] == "half"
+        assert float(perron.model.feature_curriculum["glob_n8_mix"]) == 0.5
+        pamc = perron.model.attn_mass_curriculum
+        assert bool(pamc["predictor_src_gate"]) is True
+        assert bool(pamc["eval_predictor_src_gate"]) is False
+        assert bool(pamc["eval_perron_readout"]) is True
+        assert bool(pamc["eval_predictor_pair_isolate"]) is True
+        dense_perron = configuration.load_config(dense_perron_path)
+        assert dense_perron.model.feature_curriculum["anneal"] == "ncut"
+
+    s18 = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_fchalf_perron_s18.yaml"
+    )
+    assert s18.experiment_name == "movi_c_attnmass_v39lam1gu_fchalf_perron_s18"
+    assert s18.model.feature_curriculum["anneal"] == "half"
+    assert float(s18.model.feature_curriculum["glob_n8_mix"]) == 0.5
+    assert int(s18.globals["NUM_SLOTS"]) == 18
+    assert int(s18.model.initializer["n_slots"]) == 18
+    assert bool(s18.model.attn_mass_curriculum["eval_perron_readout"]) is True
+
+
+def test_v39lam1gu_rowcenter_yaml():
+    from slotcurri import configuration
+
+    train = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_rowcenter.yaml"
+    )
+    assert train.experiment_name == "ytvis_attnmass_v39lam1gu_rowcenter"
+    fc = train.model.feature_curriculum
+    assert fc["anneal"] == "rowcenter"
+    assert fc["apply"] == "key"
+    assert bool(fc["barrier"]) is False
+    assert "glob_n8_mix" not in fc
+    parent = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu.yaml"
+    )
+    assert parent.model.feature_curriculum["anneal"] == "ncut"
+    perron = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_rowcenter_perron.yaml"
+    )
+    assert perron.experiment_name == "ytvis_attnmass_v39lam1gu_rowcenter_perron"
+    assert perron.model.feature_curriculum["anneal"] == "rowcenter"
+    pamc = perron.model.attn_mass_curriculum
+    assert bool(pamc["predictor_src_gate"]) is True
+    assert bool(pamc["eval_predictor_src_gate"]) is False
+    assert bool(pamc["eval_perron_readout"]) is True
+    assert bool(pamc["eval_predictor_pair_isolate"]) is True
+
+
+def test_v39lam1gu_perron_s12_s18_slot_counts():
+    from slotcurri import configuration
+
+    for path, name, n_slots, parent_name in (
+        (
+            "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron_s12.yaml",
+            "ytvis_attnmass_v39lam1gu_perron_s12",
+            12,
+            "ytvis_attnmass_v39lam1gu_perron",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_s18.yaml",
+            "movi_c_attnmass_v39lam1gu_perron_s18",
+            18,
+            "movi_c_attnmass_v39lam1gu_perron",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_fcn8_perron_s18.yaml",
+            "movi_c_attnmass_v39lam1gu_fcn8_perron_s18",
+            18,
+            "movi_c_attnmass_v39lam1gu_fcn8_perron",
+        ),
+        (
+            "configs/slotcurri/movi_c_attnmass_v39lam1gu_fchalf_perron_s18.yaml",
+            "movi_c_attnmass_v39lam1gu_fchalf_perron_s18",
+            18,
+            "movi_c_attnmass_v39lam1gu_fchalf_perron",
+        ),
+    ):
+        cfg = configuration.load_config(path)
+        assert cfg.experiment_name == name
+        assert int(cfg.globals["NUM_SLOTS"]) == n_slots
+        amc = cfg.model.attn_mass_curriculum
+        assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+        assert bool(amc["predictor_src_gate"]) is True
+        assert bool(amc["eval_predictor_src_gate"]) is False
+        assert bool(amc["eval_perron_readout"]) is True
+        assert bool(amc["eval_predictor_pair_isolate"]) is True
+        assert bool(amc.get("perron_readout", False)) is False
+        parent = configuration.load_config(path.replace("_s12", "").replace("_s18", ""))
+        assert parent.experiment_name == parent_name
+        assert int(parent.globals["NUM_SLOTS"]) != n_slots
+        assert int(cfg.globals["BATCH_SIZE_PER_GPU"]) == int(parent.globals["BATCH_SIZE_PER_GPU"])
+        if "fchalf" in path:
+            assert cfg.model.feature_curriculum["anneal"] == "half"
+            assert parent.model.feature_curriculum["anneal"] == "half"
+            assert float(cfg.model.feature_curriculum["glob_n8_mix"]) == 0.5
+        elif "fcn8" in path:
+            assert cfg.model.feature_curriculum["anneal"] == "n8"
+            assert parent.model.feature_curriculum["anneal"] == "n8"
+        else:
+            assert cfg.model.feature_curriculum["anneal"] == "ncut"
+
+
+def test_v39lam1gu_perron_ytvis_candrep_configs():
+    from slotcurri import configuration
+
+    cfg7 = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron_candrep.yaml"
+    )
+    parent7 = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron.yaml"
+    )
+    cfg12 = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron_s12_candrep.yaml"
+    )
+    parent12 = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron_s12.yaml"
+    )
+    assert cfg7.experiment_name == "ytvis_attnmass_v39lam1gu_perron_candrep"
+    assert cfg12.experiment_name == "ytvis_attnmass_v39lam1gu_perron_s12_candrep"
+    assert int(cfg7.globals["NUM_SLOTS"]) == 7
+    assert int(cfg12.globals["NUM_SLOTS"]) == 12
+    assert cfg7.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert cfg12.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg7.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert abs(float(cfg12.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert "loss_cc" not in parent7.model.losses
+    assert "loss_cc" not in parent12.model.losses
+    assert bool(cfg7.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg12.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg7.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg12.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg7.model.losses["loss_ss"].get("gate_negatives", False)) is False
+    assert bool(cfg12.model.losses["loss_ss"].get("gate_negatives", False)) is False
+
+
+def test_v39lam1gu_umix_perron_ytvis_candrep_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron_candrep.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron.yaml"
+    )
+    plain = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron_candrep.yaml"
+    )
+    assert cfg.experiment_name == "ytvis_attnmass_v39lam1gu_umix_perron_candrep"
+    assert int(cfg.globals["NUM_SLOTS"]) == 7
+    assert int(parent.globals["NUM_SLOTS"]) == 7
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(plain.model.attn_mass_curriculum.get("predictor_input_mix", False)) is False
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert "loss_cc" not in parent.model.losses
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("perron_readout", False)) is False
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(cfg.model.losses["loss_ss"].get("gate_negatives", False)) is False
+
+
+def test_v39lam1gu_umix_perron_ytvis_candrep_nogate_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron_candrep_nogate.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron_candrep.yaml"
+    )
+    assert cfg.experiment_name == "ytvis_attnmass_v39lam1gu_umix_perron_candrep_nogate"
+    assert int(cfg.globals["NUM_SLOTS"]) == int(parent.globals["NUM_SLOTS"]) == 7
+    assert cfg.globals["DINO_MODEL"] == parent.globals["DINO_MODEL"] == "vit_base_patch14_dinov2"
+    assert int(cfg.globals["BATCH_SIZE_PER_GPU"]) == 32
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["predictor_src_gate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("perron_readout", False)) is False
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert cfg.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert cfg.model.losses["loss_ss"].get("cand_neg", False) is False
+    assert bool(cfg.model.losses["loss_ss"]["gate_negatives"]) is False
+
+
+def test_v39lam1gu_umix_perron_ytvis_occkernel_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron_occkernel.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_umix_perron.yaml"
+    )
+    plain = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_perron.yaml"
+    )
+    assert cfg.experiment_name == "ytvis_attnmass_v39lam1gu_umix_perron_occkernel"
+    assert int(cfg.globals["NUM_SLOTS"]) == 7
+    assert int(parent.globals["NUM_SLOTS"]) == 7
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(plain.model.attn_mass_curriculum.get("predictor_input_mix", False)) is False
+    assert bool(cfg.model.losses["loss_ss"]["occ_kernel"]) is True
+    assert parent.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert cfg.model.losses["loss_ss"].get("cand_neg", False) is False
+    assert bool(cfg.model.losses["loss_ss"]["gate_negatives"]) is False
+    assert "loss_cc" not in cfg.model.losses
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("perron_readout", False)) is False
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_src_gate"]) is False
+
+
+def test_v39lam1gu_perron_s18_candrep_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_s18_candrep.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_candrep.yaml"
+    )
+    s18 = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_s18.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_perron_s18_candrep"
+    assert int(cfg.globals["NUM_SLOTS"]) == 18
+    assert int(parent.globals["NUM_SLOTS"]) == 11
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert "loss_cc" not in s18.model.losses
+    assert cfg.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg.model.losses["loss_ss"].get("gate_negatives", False)) is False
+
+
+def test_v39lam1gu_umix_perron_s18_candrep_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron.yaml"
+    )
+    s18 = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_s18_candrep.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep"
+    assert int(cfg.globals["NUM_SLOTS"]) == 18
+    assert int(parent.globals["NUM_SLOTS"]) == 11
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(s18.model.attn_mass_curriculum.get("predictor_input_mix", False)) is False
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert "loss_cc" not in parent.model.losses
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("perron_readout", False)) is False
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is False
+
+
+def test_v39lam1gu_umix_perron_s18_candrep_nogate_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep_nogate.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep_nogate"
+    assert int(cfg.globals["NUM_SLOTS"]) == int(parent.globals["NUM_SLOTS"]) == 18
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["predictor_src_gate"]) is True
+    assert bool(parent.model.attn_mass_curriculum["predictor_src_gate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("perron_readout", False)) is False
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert cfg.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert cfg.model.losses["loss_ss"].get("cand_neg", False) is False
+    assert bool(cfg.model.losses["loss_ss"]["gate_negatives"]) is False
+
+
+def test_v39lam1gu_perron_candrep_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_candrep.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_perron_candrep"
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron.yaml"
+    )
+    assert int(cfg.globals["NUM_SLOTS"]) == int(parent.globals["NUM_SLOTS"])
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+    assert "loss_cc" not in parent.model.losses
+    assert abs(float(cfg.model.loss_weights["loss_ss"]) - 0.5) < 1e-9
+    assert cfg.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg.model.losses["loss_ss"].get("gate_negatives", False)) is False
+
+
+def test_v39lam1gu_umix_perron_s18_candrep_nosrc_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep_nosrc.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_umix_perron_s18_candrep_nosrc"
+    assert int(cfg.globals["NUM_SLOTS"]) == int(parent.globals["NUM_SLOTS"]) == 18
+    assert bool(cfg.model.attn_mass_curriculum["predictor_src_gate"]) is False
+    assert bool(parent.model.attn_mass_curriculum["predictor_src_gate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_src_gate"]) is False
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("predictor_pair_isolate", False)) is False
+    assert cfg.model.losses["loss_cc"]["name"] == "Slot_Candidate_Repel_Loss"
+    assert abs(float(cfg.model.loss_weights["loss_cc"]) - 0.1) < 1e-9
+
+
+def test_v39lam1gu_umix_perron_s18_occkernel_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron_s18_occkernel.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_umix_perron.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_umix_perron_s18_occkernel"
+    assert int(cfg.globals["NUM_SLOTS"]) == 18
+    assert int(parent.globals["NUM_SLOTS"]) == 11
+    assert bool(cfg.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(parent.model.attn_mass_curriculum["predictor_input_mix"]) is True
+    assert bool(cfg.model.losses["loss_ss"]["occ_kernel"]) is True
+    assert parent.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert cfg.model.losses["loss_ss"].get("cand_neg", False) is False
+    assert bool(cfg.model.losses["loss_ss"]["gate_negatives"]) is False
+    assert "loss_cc" not in cfg.model.losses
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(parent.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_pair_isolate"]) is True
+    assert bool(cfg.model.attn_mass_curriculum.get("perron_readout", False)) is False
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_src_gate"]) is False
+
+
+def test_v39lam1gu_perron_occkernel_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_occkernel.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_perron_occkernel"
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron.yaml"
+    )
+    assert int(cfg.globals["NUM_SLOTS"]) == int(parent.globals["NUM_SLOTS"])
+    assert bool(cfg.model.losses["loss_ss"]["occ_kernel"]) is True
+    assert bool(cfg.model.losses["loss_ss"]["gate_negatives"]) is False
+    assert cfg.model.losses["loss_ss"].get("cand_neg", False) is False
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is False
+    assert parent.model.losses["loss_ss"].get("occ_kernel", False) is False
+    assert bool(parent.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_perron_readout"]) is True
+    assert bool(cfg.model.attn_mass_curriculum["eval_predictor_src_gate"]) is False
+
+
+def test_v39lam1gu_perron_s18_candneg_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_s18_candneg.yaml"
+    )
+    assert cfg.experiment_name == "movi_c_attnmass_v39lam1gu_perron_s18_candneg"
+    assert int(cfg.globals["NUM_SLOTS"]) == 18
+    assert bool(cfg.model.losses["loss_ss"]["cand_neg"]) is True
+    assert bool(cfg.model.losses["loss_ss"]["gate_negatives"]) is False
+    assert bool(cfg.model.attn_mass_curriculum["contrastive_gate"]) is False
+    parent = configuration.load_config(
+        "configs/slotcurri/movi_c_attnmass_v39lam1gu_perron_s18.yaml"
+    )
+    assert parent.model.losses["loss_ss"].get("cand_neg", False) is False
+    assert bool(parent.model.attn_mass_curriculum["eval_perron_readout"]) is True
+
+
+def test_resolve_run_v39lam1gu_perron_eval_overlay():
+    from pathlib import Path
+
+    from event_analysis.vis_v10_vs_baseline_losses import resolve_run
+
+    root = Path("/mnt/ssd2/hmlee/SlotCurri")
+    yt = resolve_run(root, "v39lam1gu_perron", "ytvis")
+    assert yt["out_stem"] == "v39lam1gu_perron"
+    assert yt["method_settings"].name == "ytvis2021_attnmass_v39lam1gu_perron.yaml"
+    assert "v39lam1gu/" in str(yt["method_ckpt"])
+    assert "v39lam1gu_perron" not in str(yt["method_ckpt"])
+    movi = resolve_run(root, "v39lam1gu_perron", "movi_c")
+    assert movi["out_stem"] == "v39lam1gu_perron_movi_c"
+    assert movi["method_settings"].name == "movi_c_attnmass_v39lam1gu_perron.yaml"
+    assert "v39lam1gu/" in str(movi["method_ckpt"])
+    assert movi["data_settings"].as_posix().endswith(
+        "_movi_c_attnmass_v39lam1gu/settings/slotcurri/settings.yaml"
+    )
 
 
 def test_v39lam1u_configs_split_featrec_no_src_gate():

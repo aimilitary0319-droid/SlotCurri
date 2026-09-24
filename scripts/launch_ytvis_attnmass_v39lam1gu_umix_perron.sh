@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch YTVIS attn-mass v39lam1gu_umix_perron
-# (umix temporal path + decoder Perron readout on train and eval).
+# (umix train; eval-only src-gate off + Perron + pair-isolate).
 #
 # Usage:
 #   GPUS=4,5 bash scripts/launch_ytvis_attnmass_v39lam1gu_umix_perron.sh
