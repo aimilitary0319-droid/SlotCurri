@@ -236,6 +236,7 @@ def build(
         slot_utility=model_config.get("slot_utility", None),
         cyclic_inference=model_config.get("cyclic_inference", True),
         slot_expansion=model_config.get("slot_expansion", True),
+        slotcontrast_steps=model_config.get("slotcontrast_steps", 0),
         feature_curriculum=model_config.get("feature_curriculum", None),
         slot_ent_impurity=model_config.get("slot_ent_impurity", None),
         usage_head_config=model_config.get("usage_head", None),
@@ -278,6 +279,7 @@ class ObjectCentricModel(pl.LightningModule):
         slot_utility: Optional[Dict[str, Any]] = None,
         cyclic_inference: Union[bool, str] = True,
         slot_expansion: bool = True,
+        slotcontrast_steps: int = 0,
         feature_curriculum: Optional[Dict[str, Any]] = None,
         slot_ent_impurity: Optional[Dict[str, Any]] = None,
         usage_head_config: Optional[Dict[str, Any]] = None,
@@ -292,6 +294,11 @@ class ObjectCentricModel(pl.LightningModule):
             cyclic_inference if isinstance(cyclic_inference, str) else bool(cyclic_inference)
         )
         self.slot_expansion = bool(slot_expansion)
+        self.slotcontrast_steps = int(slotcontrast_steps)
+        if self.slotcontrast_steps < 0:
+            raise ValueError(
+                f"slotcontrast_steps must be >= 0, got {self.slotcontrast_steps}"
+            )
         self.experiment_name = experiment_name
         self.experiment_group = experiment_group
         self.optimizer_builder = optimizer_builder
@@ -778,6 +785,9 @@ class ObjectCentricModel(pl.LightningModule):
         # Decoder still sees π. SlotAttention / Pred unchanged. Default False
         # keeps the v39 forward pass byte-identical.
         self.amc_state_identity_cos = bool(amc.get("state_identity_cos", False))
+        # Temporal-mix write purity. Decoder / Pred input stay on u^SA and raw π.
+        # a_s = sg(r_s) * π̄_s, r_s = sum_n A^2 / sum_n A. Default False is v39lam1gu.
+        self.amc_state_write_purity = bool(amc.get("state_write_purity", False))
         # Temporal mix statistic, decoder stays on π (v39). Empty / 'pi' is v39.
         # 'lambda1' uses n8 λ1 (scale); 'mass' uses attention-mass fraction.
         sk = str(amc.get("state_conf_kind", "") or "").lower()
@@ -805,6 +815,10 @@ class ObjectCentricModel(pl.LightningModule):
         # so low-g slots do not contribute as keys/values. Decoder and the
         # temporal mix are unchanged. Default False keeps Pred as vanilla SA.
         self.amc_predictor_src_gate = bool(amc.get("predictor_src_gate", False))
+        # v39lam1gu_revgate: loss_featrec_ungated mixes with (π_max - π)
+        # instead of softmax(α). Gated featrec, masks_ungated, and Pred
+        # src-gate stay as v39lam1gu. Default False keeps the plain ungated mix.
+        self.amc_ungated_complement = bool(amc.get("ungated_complement", False))
         # v43: Pred source gate uses g / max(g), matching the temporal mix.
         # Default False keeps v39lam1g (raw detached statistic, not max-normed).
         self.amc_predictor_src_max_norm = bool(amc.get("predictor_src_max_norm", False))
@@ -989,6 +1003,14 @@ class ObjectCentricModel(pl.LightningModule):
         #              π_s = max(λ1, 0) from the +ones Perron power pair
         #              (q1^T G q1, q1). Occupancy/scale only; no λ2 / k=8 Ritz.
         #              Decoder and temporal mix both see λ1 (unlike v39l1).
+        #              sqrt_a (v39lam1gu_asqrt): G_s = diag(sqrt(a)) S diag(sqrt(a)).
+        #              pi_slot_gamma (v39lam1gu_gsharp2_asqrt): a <- a^γ / sum_s a^γ
+        #              per patch before G (then sqrt_a, if on). π only.
+        #              sqrt_pi (v39lam1gu_sqrtpi): G stays diag(a) S diag(a),
+        #              π_s = sqrt(max(λ1, 0)).
+        #              pi_rival (v39lam1gu_rival): diagonal is
+        #              w = r/(r+K_0-1), r = a(K-1)/(1-a). K_0=K recovers a.
+        #              pi_rival_k0 is that size, or "auto" for (K+1)/2. π only.
         #   "spectral_graph_n8_ind": v39ind. Induced n8 graph on support
         #              Ω = {a ≥ support_rel * max a}, S re-normalized there.
         #              π_s = λ1 - max(λ2, 0). Two n8-components → π=0.
@@ -1053,6 +1075,106 @@ class ObjectCentricModel(pl.LightningModule):
                 f"'spectral_graph_n8_ind' or 'usage', "
                 f"got {self.amc_conf_kind!r}"
             )
+        # v39lam1gu_asqrt: G_s = diag(sqrt(a)) S diag(sqrt(a)). Default False
+        # keeps diag(a) S diag(a). Only the n8 matvec family uses this G.
+        self.amc_sqrt_a = bool(amc.get("sqrt_a", False))
+        if self.amc_sqrt_a and self.amc_conf_kind not in (
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.sqrt_a requires conf_kind "
+                "'spectral_graph_n8', 'spectral_graph_n8_rel', "
+                "'spectral_graph_n8_l1imp' or 'spectral_graph_n8_lam1' "
+                f"(G_s = diag(sqrt(a)) S diag(sqrt(a))), got {self.amc_conf_kind!r}"
+            )
+        # v39lam1gu_gsharp2_asqrt: slot-axis γ-sharpened a, read only by the n8
+        # spectrum. Slot update / decoder keep the softmax attention. 1.0 is a no-op.
+        self.amc_pi_slot_gamma = float(amc.get("pi_slot_gamma", 1.0))
+        if self.amc_pi_slot_gamma <= 0.0:
+            raise ValueError(
+                "attn_mass_curriculum.pi_slot_gamma must be > 0, "
+                f"got {self.amc_pi_slot_gamma}"
+            )
+        if self.amc_pi_slot_gamma != 1.0 and self.amc_conf_kind not in (
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.pi_slot_gamma requires conf_kind "
+                "'spectral_graph_n8', 'spectral_graph_n8_rel', "
+                "'spectral_graph_n8_l1imp' or 'spectral_graph_n8_lam1', "
+                f"got {self.amc_conf_kind!r}"
+            )
+        # v39lam1gu_rival: G diagonal is w = r/(r+K_0-1),
+        # r = a(K-1)/(1-a). K_0 = pi_rival_k0. K_0=K recovers a.
+        # Default 2 is r/(r+1). pi_rival_k0: auto sets K_0 = (K+1)/2
+        # from the slot axis. A tie is 1/K_0. Exclusive ownership is 1.
+        self.amc_pi_rival = bool(amc.get("pi_rival", False))
+        raw_k0 = amc.get("pi_rival_k0", 2.0)
+        if isinstance(raw_k0, str) and raw_k0.strip().lower() == "auto":
+            self.amc_pi_rival_k0 = "auto"
+        elif isinstance(raw_k0, str):
+            raise ValueError(
+                "attn_mass_curriculum.pi_rival_k0 must be a number or 'auto', "
+                f"got {raw_k0!r}"
+            )
+        else:
+            self.amc_pi_rival_k0 = float(raw_k0)
+            if self.amc_pi_rival and self.amc_pi_rival_k0 <= 1.0:
+                raise ValueError(
+                    "attn_mass_curriculum.pi_rival_k0 must be > 1, "
+                    f"got {self.amc_pi_rival_k0}"
+                )
+        if self.amc_pi_rival and self.amc_conf_kind not in (
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.pi_rival requires conf_kind "
+                "'spectral_graph_n8', 'spectral_graph_n8_rel', "
+                "'spectral_graph_n8_l1imp' or 'spectral_graph_n8_lam1', "
+                f"got {self.amc_conf_kind!r}"
+            )
+        # v39lam1gu_sqrtpi: π = sqrt(max(λ1, 0)) on the original G. Not sqrt_a.
+        self.amc_sqrt_pi = bool(amc.get("sqrt_pi", False))
+        if self.amc_pi_rival and (
+            self.amc_sqrt_a or self.amc_sqrt_pi or self.amc_pi_slot_gamma != 1.0
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.pi_rival replaces a inside G; "
+                "do not combine with sqrt_a, sqrt_pi, or pi_slot_gamma"
+            )
+        if self.amc_sqrt_pi and self.amc_sqrt_a:
+            raise ValueError(
+                "attn_mass_curriculum.sqrt_pi keeps G_s = diag(a) S diag(a); "
+                "do not combine with sqrt_a"
+            )
+        if self.amc_sqrt_pi and self.amc_conf_kind != "spectral_graph_n8_lam1":
+            raise ValueError(
+                "attn_mass_curriculum.sqrt_pi requires conf_kind "
+                "'spectral_graph_n8_lam1' (π = sqrt(max(λ1, 0))), "
+                f"got {self.amc_conf_kind!r}"
+            )
+        # v39lam1gu_gap: decoder / temporal mix / Pred src-gate use
+        # π̃ = 1 - (π_max - π) instead of π. Logged gate stats stay on raw π.
+        self.amc_pi_gap = bool(amc.get("pi_gap", False))
+        if self.amc_pi_gap and (
+            self.amc_gate_form != "purity_weight"
+            or self.amc_state_gate_form not in (None, "purity_weight")
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.pi_gap needs float π gates "
+                "(gate_form='purity_weight' and no other state_gate_form), "
+                f"got gate_form={self.amc_gate_form!r}, "
+                f"state_gate_form={self.amc_state_gate_form!r}"
+            )
         # Coupled confidence weight: beta_t = 1 - lambda_t (1 - beta_final), i.e. the
         # confidence contribution 1-beta_t ramps 0 -> 1-beta_final with the SAME lambda that
         # relaxes the threshold. As the activity criterion is relaxed to accommodate smaller
@@ -1085,6 +1207,7 @@ class ObjectCentricModel(pl.LightningModule):
                 f"attn_mass_curriculum.tau_anneal must be 'linear' or 'log', got {self.amc_tau_anneal!r}"
             )
         self._active_mask = None  # stashed per forward for loss/logging
+        self._gate_log = None  # raw π when pi_gap feeds π̃ to the model (logging only)
         # Val scalars for loggers. Lightning 1.9 + max_epochs=-1 keeps one eval
         # ResultCollection for the whole run; self.log(..., on_epoch=True) of live
         # CUDA tensors (v41 usage z in featrec) can pin the first val's _computed
@@ -1183,6 +1306,14 @@ class ObjectCentricModel(pl.LightningModule):
         self._usage_d_rms = None
         self._usage_v_rms = None
         self._usage_n_support = None
+        if self.amc_ungated_complement and (
+            self.usage_redist_enabled or self.util_weight > 0.0
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.ungated_complement rewrites "
+                "reconstruction_ungated; it cannot be combined with "
+                "slot_utility or slot_usage_redistribute"
+            )
         if self.usage_redist_enabled:
             if not self.usage_head_enabled:
                 raise ValueError(
@@ -1563,9 +1694,16 @@ class ObjectCentricModel(pl.LightningModule):
                 gate_hysteresis=self.amc_gate_hysteresis,
                 decoder_gate_hysteresis=self.amc_decoder_gate_hysteresis,
                 state_identity_cos=self.amc_state_identity_cos,
+                state_write_purity=self.amc_state_write_purity,
                 state_conf_kind=self.amc_state_conf_kind,
                 n8_support_rel=self.amc_n8_support_rel,
                 spectral_proj_dim=self.amc_spectral_proj_dim,
+                sqrt_a=self.amc_sqrt_a,
+                sqrt_pi=self.amc_sqrt_pi,
+                pi_slot_gamma=self.amc_pi_slot_gamma,
+                pi_rival=self.amc_pi_rival,
+                pi_rival_k0=self.amc_pi_rival_k0,
+                pi_gap=self.amc_pi_gap,
                 eval_hard_thresh=(self.amc_eval_hard_thresh if not train else 0.0),
                 eval_perron_readout=(
                     bool(self.amc_perron_readout)
@@ -1574,11 +1712,13 @@ class ObjectCentricModel(pl.LightningModule):
                 pi_gamma=(
                     1.0 if train else float(self.amc_eval_pi_gamma)
                 ),
+                uniform_gate=self._slotcontrast_warmup(train),
                 **{k: v for k, v in processor_kwargs.items() if k != "cycle"},
             )
             slots = processor_output["state"]
             active_mask = processor_output.get("active_mask")
             self._active_mask = active_mask
+            self._gate_log = processor_output.get("gate_raw")
             gate_conf = processor_output.get("gate_conf")
             self._gate_conf_mean = (
                 float(gate_conf.float().mean().detach()) if gate_conf is not None else None
@@ -1616,9 +1756,11 @@ class ObjectCentricModel(pl.LightningModule):
                 processor_output.get("decoder_gate", active_mask),
                 return_slot_recons=need_slot_recons,
                 return_ungated=need_ungated,
+                ungated_complement=self.amc_ungated_complement and self.featrec_ungated,
             )
         else:
             self._active_mask = None
+            self._gate_log = None
             self._gate_p_eff_mean = None
             self._gate_delta = None
             self._state_gate_mean = None
@@ -1635,6 +1777,11 @@ class ObjectCentricModel(pl.LightningModule):
                 ),
             )
         if self.featrec_ungated and "reconstruction_ungated" not in decoder_output:
+            if self.amc_ungated_complement:
+                raise RuntimeError(
+                    "ungated_complement requires the decoder to return "
+                    "reconstruction_ungated from the gated forward"
+                )
             decoder_output["reconstruction_ungated"] = self.decoder(slots)["reconstruction"]
         # feat_orig, feat_recon: (B, C, H, W)
         # 1) compute sobel gradients
@@ -1746,9 +1893,15 @@ class ObjectCentricModel(pl.LightningModule):
                     self.slot_loss_scale[:len(slot_loss_per_slot)] = slot_loss_per_slot.detach() # 2
 
             if name == "loss_cc" and self.attn_mass_enabled and self._active_mask is not None:
-                losses[name] = loss_fn(
-                    prediction, target, occupancy=self._active_mask
-                )
+                cc_kwargs = {"occupancy": self._active_mask}
+                if getattr(loss_fn, "mode", "cosine") == "attn":
+                    att = (outputs.get("processor") or {}).get("state_attn_mask")
+                    if att is None:
+                        raise ValueError(
+                            "loss_cc mode=attn requires processor.state_attn_mask"
+                        )
+                    cc_kwargs["attention"] = att
+                losses[name] = loss_fn(prediction, target, **cc_kwargs)
             elif name == "loss_ss" and self.attn_mass_enabled and self._active_mask is not None:
                 ss_kwargs = {}
                 if self.amc_contrastive_gate:
@@ -2422,6 +2575,14 @@ class ObjectCentricModel(pl.LightningModule):
         """The inner FrameEncoder (unwraps MapOverTime for video input)."""
         return self.encoder.module if hasattr(self.encoder, "module") else self.encoder
 
+    def _slotcontrast_warmup(self, train: bool) -> bool:
+        """True while training still uses the ungated SlotContrast phase."""
+        if not train or self.slotcontrast_steps <= 0:
+            return False
+        trainer = getattr(self, "trainer", None)
+        step = 0 if trainer is None else int(trainer.global_step)
+        return step < self.slotcontrast_steps
+
     def _apply_feature_curriculum(self) -> None:
         """Write this step's mix / window / bandwidth onto the frame encoder (train only)."""
         inner = self._frame_encoder()
@@ -2484,6 +2645,11 @@ class ObjectCentricModel(pl.LightningModule):
             to_log = {f"train/{name}": loss for name, loss in losses.items()}
             to_log["train/loss"] = total_loss
 
+        if self.slotcontrast_steps > 0:
+            to_log["train/slotcontrast_warmup"] = float(
+                int(self.trainer.global_step) < self.slotcontrast_steps
+            )
+
         if self.featcur_enabled:
             inner = self._frame_encoder()
             if self.featcur_anneal == "modes":
@@ -2504,7 +2670,8 @@ class ObjectCentricModel(pl.LightningModule):
 
         if self.attn_mass_enabled and self._active_mask is not None:
             # for soft gating this is the effective (summed-gate) active slot count
-            gate = self._active_mask.float()  # (B, T, S) or (B, S)
+            gate_src = self._gate_log if self._gate_log is not None else self._active_mask
+            gate = gate_src.float()  # (B, T, S) or (B, S)
             to_log["train/active_slots"] = (
                 gate.mean(dim=-1).sum(dim=-1).mean()
                 if gate.ndim >= 4

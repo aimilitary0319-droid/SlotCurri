@@ -27,6 +27,51 @@ def _max_norm(gate: Optional[torch.Tensor], enabled: bool) -> Optional[torch.Ten
     return gate / gate.amax(dim=-1, keepdim=True).clamp_min(1e-8)
 
 
+def _pi_gap(gate: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """π̃_s = 1 - (max_j π_j - π_s): slots compared by gap to the leader, not ratio.
+
+    All-small π (structureless masks, λ1 ~ h²) gives π̃ ≈ 1 for every slot, so
+    decoder renorm, max-norm and src-gate see an ungated frame. A coherent leader
+    (max π → 1) gives π̃ → π. max π̃ = 1, so max-norm is the identity afterwards.
+    Bool gates pass through.
+    """
+    if gate is None or gate.dtype == torch.bool:
+        return gate
+    return gate + (1.0 - gate.amax(dim=-1, keepdim=True))
+
+
+def _attn_write_purity(att: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Detached per-slot attention purity r_s = sum_n A_{s,n}^2 / sum_n A_{s,n}.
+
+    att is (B, S, F), softmax over slots. Uniform A=1/S gives r_s=1/S.
+    A slot that owns its patches (A in {0, 1}) gives r_s=1. Zero mass gives 0.
+    """
+    att_f = att.float()
+    mass = att_f.sum(dim=-1)
+    sq = att_f.square().sum(dim=-1)
+    r = sq / mass.clamp_min(eps)
+    r = torch.where(mass > eps, r, torch.zeros_like(r))
+    return r.detach()
+
+
+def apply_uniform_gate(
+    active_mask: Optional[torch.Tensor], state_mask: Optional[torch.Tensor]
+):
+    """Replace float gates with ones so decoder, temporal mix, and source-gate are ungated.
+
+    A uniform gate is cancelled by the decoder log-π renorm and by max-norm, which is
+    the SlotContrast path. Bool masks (gating already off) are left alone.
+    """
+    aliased = state_mask is active_mask
+    if active_mask is not None and torch.is_floating_point(active_mask):
+        active_mask = torch.ones_like(active_mask)
+    if aliased:
+        state_mask = active_mask
+    elif state_mask is not None and torch.is_floating_point(state_mask):
+        state_mask = torch.ones_like(state_mask)
+    return active_mask, state_mask
+
+
 def _src_gate_self_weights(gate: torch.Tensor) -> torch.Tensor:
     """Src-gate with ungated diagonal: A_ij = g_j (i≠j), A_ii = 1.
 
@@ -877,15 +922,18 @@ def _top2_algebraic_n8(
     eps: float,
     return_q1: bool = False,
     lam1_only: bool = False,
+    sqrt_a: bool = False,
 ):
     """Algebraic λ1 ≥ λ2 of G_s on the 8-neighbor ReLU-cosine S (v39).
 
     lam1_only is v39lam1: Perron power pair, no k=8 Ritz / λ2.
+    sqrt_a (v39lam1gu_asqrt): G_s = diag(sqrt(a)) S diag(sqrt(a)).
     """
     d_inv, weights = _n8_affinity(z, eps)
+    gate_a = a.clamp_min(0.0).sqrt() if sqrt_a else a
 
     def apply_g(basis: torch.Tensor) -> torch.Tensor:
-        return _apply_g_n8(d_inv, weights, a, basis)
+        return _apply_g_n8(d_inv, weights, gate_a, basis)
 
     return _top2_algebraic_g(
         apply_g, a, n_iter, eps, return_q1=return_q1, lam1_only=lam1_only
@@ -947,6 +995,24 @@ def spectral_graph_slot_purity(
     return pi.detach().to(dtype=att.dtype)
 
 
+def _rival_share(a: torch.Tensor, k0: float = 2.0) -> torch.Tensor:
+    """Gate diagonal for a reference competition of size K_0.
+
+    r = a(K-1)/(1-a) is this slot over one typical other. Then
+    w = r / (r + K_0 - 1). K_0 = K recovers a. K_0 = 2 is r/(r+1).
+    A tie a=1/K gives w=1/K_0. Exclusive ownership gives 1.
+    Slot axis is -2. K=1 is already exclusive.
+    """
+    k = a.shape[-2]
+    a_c = a.clamp(0.0, 1.0)
+    if k <= 1:
+        return a_c
+    rival_count = float(k0) - 1.0
+    numer = a_c * (k - 1)
+    denom = numer + (1.0 - a_c) * rival_count
+    return numer / denom.clamp_min(1e-8)
+
+
 def spectral_graph_n8_eigs(
     att: torch.Tensor,
     features: torch.Tensor,
@@ -957,8 +1023,47 @@ def spectral_graph_n8_eigs(
     l1_minus_imp: bool = False,
     use_lambda1: bool = False,
     return_q1: bool = False,
+    sqrt_a: bool = False,
+    sqrt_pi: bool = False,
+    slot_gamma: float = 1.0,
+    rival: bool = False,
+    rival_k0: float = 2.0,
 ):
-    """Detached n8 spectrum: π, λ1, λ2 each (B, S). π is the v39 / v39n / v39s / v39lam1 gate."""
+    """Detached n8 spectrum: π, λ1, λ2 each (B, S). π is the v39 / v39n / v39s / v39lam1 gate.
+
+    slot_gamma (v39lam1gu_gsharp2_asqrt): a <- a^γ / sum_s a^γ per patch before G.
+    sqrt_a replaces a with sqrt(a) in G_s = diag(a) S diag(a).
+    sqrt_pi keeps that G and sets π = sqrt(max(λ1, 0)). λ1 itself stays raw.
+    rival (v39lam1gu_rival): the diagonal of G is w = r/(r+K_0-1) instead of a.
+    rival_k0 "auto" sets K_0 = (K+1)/2 from the slot axis of att.
+    """
+    slot_gamma = 1.0 if slot_gamma is None else float(slot_gamma)
+    if slot_gamma <= 0.0:
+        raise ValueError(f"slot_gamma must be > 0, got {slot_gamma}")
+    if sqrt_pi and not use_lambda1:
+        raise ValueError(
+            "sqrt_pi requires use_lambda1 so π = sqrt(max(λ1, 0))"
+        )
+    if sqrt_pi and sqrt_a:
+        raise ValueError(
+            "sqrt_pi keeps G_s = diag(a) S diag(a); do not combine with sqrt_a"
+        )
+    if rival and (sqrt_a or sqrt_pi or slot_gamma != 1.0):
+        raise ValueError(
+            "rival replaces a with w = r/(r+K_0-1) inside G; do not combine "
+            "with sqrt_a, sqrt_pi, or slot_gamma"
+        )
+    rival_k0_auto = isinstance(rival_k0, str) and rival_k0.strip().lower() == "auto"
+    if isinstance(rival_k0, str) and not rival_k0_auto:
+        raise ValueError(
+            f"rival_k0 must be a number or 'auto', got {rival_k0!r}"
+        )
+    if not rival_k0_auto:
+        rival_k0 = 2.0 if rival_k0 is None else float(rival_k0)
+        if rival and rival_k0 <= 1.0:
+            raise ValueError(
+                f"rival_k0 must be > 1 so K_0-1 rivals is positive, got {rival_k0}"
+            )
     if sum(bool(x) for x in (divide_by_lambda1, l1_minus_imp, use_lambda1)) > 1:
         raise ValueError(
             "spectral_graph_n8_eigs: divide_by_lambda1, "
@@ -987,6 +1092,19 @@ def spectral_graph_n8_eigs(
     with torch.no_grad(), amp_ctx:
         z = torch.nn.functional.normalize(features.float(), dim=-1)
         a = att.float()
+        if slot_gamma != 1.0:
+            a = a.clamp_min(0.0).pow(slot_gamma)
+            a = a / a.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        if rival:
+            k0 = rival_k0
+            if rival_k0_auto:
+                k0 = (int(a.shape[-2]) + 1) / 2.0
+                if k0 <= 1.0:
+                    raise ValueError(
+                        "rival_k0 auto is (K+1)/2 and must be > 1, "
+                        f"got K={int(a.shape[-2])}"
+                    )
+            a = _rival_share(a, k0)
         bsz = a.shape[0]
         pi = a.new_empty(bsz, a.shape[1])
         lam1_out = a.new_empty(bsz, a.shape[1])
@@ -1003,6 +1121,7 @@ def spectral_graph_n8_eigs(
                 eps,
                 return_q1=return_q1,
                 lam1_only=use_lambda1,
+                sqrt_a=sqrt_a,
             )
             if return_q1:
                 lam1, lam2, q1 = packed
@@ -1013,7 +1132,10 @@ def spectral_graph_n8_eigs(
             lam1_out[i : i + step] = lam1
             lam2_out[i : i + step] = lam2
             if use_lambda1:
-                pi[i : i + step] = lam1.clamp_min(0.0)
+                pi_step = lam1.clamp_min(0.0)
+                if sqrt_pi:
+                    pi_step = pi_step.sqrt()
+                pi[i : i + step] = pi_step
             elif l1_minus_imp:
                 pi[i : i + step] = (lam1 - lam2p / (lam1 + float(eps))).clamp_min(0.0)
             elif divide_by_lambda1:
@@ -1446,12 +1568,20 @@ class LatentProcessor(nn.Module):
         decoder_gate_hysteresis: float = 0.0,
         decoder_gate_prev: Optional[torch.Tensor] = None,
         state_identity_cos: bool = False,
+        state_write_purity: bool = False,
         state_conf_kind: Optional[str] = None,
         n8_support_rel: float = 0.0,
         spectral_proj_dim: int = 0,
         eval_hard_thresh: float = 0.0,
         eval_perron_readout: bool = False,
         pi_gamma: float = 1.0,
+        sqrt_a: bool = False,
+        sqrt_pi: bool = False,
+        pi_slot_gamma: float = 1.0,
+        pi_rival: bool = False,
+        pi_rival_k0: float = 2.0,
+        pi_gap: bool = False,
+        uniform_gate: bool = False,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -1503,6 +1633,7 @@ class LatentProcessor(nn.Module):
         gate_logits = None
         n8_lam1 = None
         n8_q1 = None
+        gate_raw = None
         # gate_form="purity_weight" has no threshold, so it activates on the form alone
         # (gate_p arrives as None from the model, every other form still requires it).
         # state_gate_form lets the temporal mix use a different statistic than the decoder
@@ -1541,6 +1672,28 @@ class LatentProcessor(nn.Module):
                 "logratio",
                 "purity_weight",
             )
+            # Optional π-only map of the same dots (v39lam1gu_asqrt_pientmax15).
+            # The slot update still uses softmax masks. Only the n8 spectrum reads this.
+            pi_att = att
+            pi_masks = (
+                corrector_output.get("pi_masks")
+                if corrector_output is not None
+                else None
+            )
+            if pi_masks is not None:
+                n8_pi_kinds = (
+                    "spectral_graph_n8",
+                    "spectral_graph_n8_rel",
+                    "spectral_graph_n8_l1imp",
+                    "spectral_graph_n8_lam1",
+                )
+                if ck not in n8_pi_kinds:
+                    raise ValueError(
+                        "SlotAttention pi_masks is the attention for π only, "
+                        "and only spectral_graph_n8* reads it; "
+                        f"got conf_kind={ck!r}"
+                    )
+                pi_att = pi_masks
             if need_conf:
                 if ck == "usage":
                     # v41: z = sigmoid(head(sg(A))). v42: softmax. v43: sparsemax.
@@ -1606,13 +1759,20 @@ class LatentProcessor(nn.Module):
                     # n8_lam1 is kept so a split temporal mix (v39l1) can use
                     # scale while the decoder keeps the gap π. v39lam1 sets
                     # gate_conf = λ1 so decoder and temporal share that scale.
+                    # sqrt_pi (v39lam1gu_sqrtpi): same G, π = sqrt(max(λ1, 0)).
+                    # n8_lam1 stays the raw eigenvalue.
                     packed_eigs = spectral_graph_n8_eigs(
-                        att,
+                        pi_att,
                         bind_features,
                         divide_by_lambda1=(ck == "spectral_graph_n8_rel"),
                         l1_minus_imp=(ck == "spectral_graph_n8_l1imp"),
                         use_lambda1=(ck == "spectral_graph_n8_lam1"),
                         return_q1=bool(eval_perron_readout),
+                        sqrt_a=bool(sqrt_a),
+                        sqrt_pi=bool(sqrt_pi),
+                        slot_gamma=pi_slot_gamma,
+                        rival=bool(pi_rival),
+                        rival_k0=pi_rival_k0,
                     )
                     if eval_perron_readout:
                         gate_conf, n8_lam1, _, n8_q1 = packed_eigs
@@ -1875,6 +2035,13 @@ class LatentProcessor(nn.Module):
                 raise ValueError(
                     f"state_conf_kind must be '', 'pi', 'lambda1' or 'mass', got {sk!r}"
                 )
+            # v39lam1gu_gap: decoder, temporal mix and Pred src-gate read π̃ = 1 - (π_max - π).
+            # gate_raw keeps π for logging.
+            if pi_gap:
+                gate_raw = active_mask
+                aliased = state_mask is active_mask
+                active_mask = _pi_gap(active_mask)
+                state_mask = active_mask if aliased else _pi_gap(state_mask)
             # Eval-only hard gate (purity_weight ignores gate_mode). Applied after π is
             # built and before Pred / mix, so decoder, temporal g, and src-gate agree.
             # Training keeps the float π. thresh<=0 is a no-op.
@@ -1890,6 +2057,10 @@ class LatentProcessor(nn.Module):
                 aliased = state_mask is active_mask
                 active_mask = _pi_gamma(active_mask, pg)
                 state_mask = active_mask if aliased else _pi_gamma(state_mask, pg)
+            # SlotContrast warmup: π is still computed above, then replaced by ones so
+            # decoder, temporal mix, and Pred source-gate all see g = 1.
+            if uniform_gate:
+                active_mask, state_mask = apply_uniform_gate(active_mask, state_mask)
             # The corrector output is deliberately NOT gated here. Gating it as well as the
             # predictor output puts the gate twice on the same path, and because the predictor
             # is a residual block (Pred(x) = x + D) the observation then lands at g^2 while the
@@ -2004,6 +2175,9 @@ class LatentProcessor(nn.Module):
         # gated either that leaves the gate out of the temporal path entirely -- it would then
         # only reweight decoder masks. Only v18 sets it.
         identity_cos = None
+        # u_t = π̄ u^SA + (1-π̄) û_t. Emitted so L_ss can supervise this mix
+        # instead of u^SA. None unless predictor_input_mix builds it.
+        mixed = None
         if state_mask is not None and not predictor_ungated:
             a = _max_norm(state_mask, state_max_norm).unsqueeze(-1).to(
                 updated_state.dtype
@@ -2019,6 +2193,14 @@ class LatentProcessor(nn.Module):
                         dtype=a.dtype
                     )
                 a = a * identity_cos.unsqueeze(-1)
+            # Write purity (temporal mix only). Decoder keeps u^SA and raw π.
+            #   r_s = sg( sum_n A_{s,n}^2 / sum_n A_{s,n} )
+            #   a_s ← r_s * π̄_s
+            # Uniform attention => r_s = 1/S, so a tie does not write K full
+            # updates. Exclusive attention => r_s = 1, same mix as v39lam1gu.
+            if state_write_purity and state_attn_mask is not None:
+                r = _attn_write_purity(state_attn_mask).to(dtype=a.dtype)
+                a = a * r.unsqueeze(-1)
             if predictor_input_mix:
                 # Decoder still reads u^SA (`state` below). Pred input is the
                 # occupancy mix so a vanished slot does not leak u^SA:
@@ -2077,6 +2259,8 @@ class LatentProcessor(nn.Module):
             # unless gate_p_state or state_gate_form gave the temporal mix its own gate.
             "state_gate": state_mask,
         }
+        if mixed is not None:
+            out["state_mix"] = mixed
         if decoder_gate is not None:
             out["decoder_gate"] = decoder_gate
         if gate_conf is not None:
@@ -2085,6 +2269,8 @@ class LatentProcessor(nn.Module):
             # head. When gate_hysteresis > 0 this is the smoothed π̃ that
             # ScanOverTime carries into the next frame's `gate_conf_prev`.
             out["gate_conf"] = gate_conf
+        if gate_raw is not None and torch.is_floating_point(gate_raw):
+            out["gate_raw"] = gate_raw
         if gate_logits is not None:
             out["gate_logits"] = gate_logits
         if mass_median_ema is not None:
@@ -2203,12 +2389,20 @@ class ScanOverTime(nn.Module):
         gate_hysteresis: float = 0.0,
         decoder_gate_hysteresis: float = 0.0,
         state_identity_cos: bool = False,
+        state_write_purity: bool = False,
         state_conf_kind: Optional[str] = None,
         n8_support_rel: float = 0.0,
         spectral_proj_dim: int = 0,
         eval_hard_thresh: float = 0.0,
         eval_perron_readout: bool = False,
         pi_gamma: float = 1.0,
+        sqrt_a: bool = False,
+        sqrt_pi: bool = False,
+        pi_slot_gamma: float = 1.0,
+        pi_rival: bool = False,
+        pi_rival_k0: float = 2.0,
+        pi_gap: bool = False,
+        uniform_gate: bool = False,
     ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
@@ -2239,12 +2433,20 @@ class ScanOverTime(nn.Module):
             gate_hysteresis=gate_hysteresis,
             decoder_gate_hysteresis=decoder_gate_hysteresis,
             state_identity_cos=state_identity_cos,
+            state_write_purity=state_write_purity,
             state_conf_kind=state_conf_kind,
             n8_support_rel=n8_support_rel,
             spectral_proj_dim=spectral_proj_dim,
             eval_hard_thresh=eval_hard_thresh,
             eval_perron_readout=eval_perron_readout,
             pi_gamma=pi_gamma,
+            sqrt_a=sqrt_a,
+            sqrt_pi=sqrt_pi,
+            pi_slot_gamma=pi_slot_gamma,
+            pi_rival=pi_rival,
+            pi_rival_k0=pi_rival_k0,
+            pi_gap=pi_gap,
+            uniform_gate=uniform_gate,
         )
 
         state = initial_state

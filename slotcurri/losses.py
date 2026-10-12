@@ -411,11 +411,68 @@ class Slot_Candidate_Repel_Loss(Loss):
     Mean only over batch and time.
     """
 
-    def __init__(self, pred_key: str, target_key: str, eps: float = 1e-8, **kwargs):
+    def __init__(
+        self,
+        pred_key: str,
+        target_key: str,
+        eps: float = 1e-8,
+        mode: str = "cosine",
+        **kwargs,
+    ):
         super().__init__(pred_key, target_key, **kwargs)
         self.eps = float(eps)
+        # "cosine": candidate slot-vector repulsion (original L_cc).
+        # "attn": same u_s and log1p reduction, pair term is attention-map cosine
+        #   u_s = sg(1-π̄_s) sg(π_max)
+        #   c_ss' = <A_s, A_s'> / (||A_s|| ||A_s'||)
+        #   L = mean log(1 + sum_{s≠s'} u_s u_s' [c_ss']_+^2)
+        # Scale-invariant in A, so emptying candidate attention does not zero it.
+        # π_max keeps the term quiet until a slot is actually occupied.
+        # One loss either way. Default stays the cosine path.
+        if mode not in ("cosine", "attn"):
+            raise ValueError(
+                f"Slot_Candidate_Repel_Loss mode must be 'cosine' or 'attn', got {mode!r}"
+            )
+        self.mode = mode
 
-    def forward(self, slots, _, occupancy=None):
+    def _candidate_u(self, occupancy, like: torch.Tensor) -> torch.Tensor:
+        """Detached u_s = (1-π̄) π_max. Tie and unoccupied frames stay at 0."""
+        if occupancy is None:
+            return torch.ones(like.shape[:-1], dtype=like.dtype, device=like.device)
+        g = occupancy.float().detach()
+        if g.ndim == 2:
+            g = g.unsqueeze(1)
+        pi_max = g.amax(dim=-1, keepdim=True)
+        # All-equal including all-zero is a tie: π̄=1, so u=0.
+        # π_max scales the rest down until a slot is actually occupied.
+        pi_bar = torch.where(
+            pi_max > self.eps,
+            g / pi_max.clamp_min(self.eps),
+            torch.ones_like(g),
+        )
+        return ((1.0 - pi_bar) * pi_max).clamp(0.0, 1.0)
+
+    def _attn_overlap(self, attention: torch.Tensor, occupancy) -> torch.Tensor:
+        # attention: (B, T, S, F) or (B, S, F), softmax over slots.
+        # Cosine of per-slot maps. A flat leftover still overlaps; scaling a
+        # map does not. An exact-zero row has direction 0, so its pairs are 0.
+        att = attention.float()
+        if att.ndim == 3:
+            att = att.unsqueeze(1)
+        u = self._candidate_u(occupancy, att)
+        direction = att / att.norm(p=2, dim=-1, keepdim=True).clamp_min(self.eps)
+        cos = torch.matmul(direction, direction.transpose(-2, -1))
+        s = cos.shape[-1]
+        off = 1.0 - torch.eye(s, device=cos.device, dtype=cos.dtype)
+        w = u.unsqueeze(-1) * u.unsqueeze(-2) * off
+        pair = w * cos.clamp_min(0.0).square()
+        return torch.log1p(pair.sum(dim=(-1, -2))).mean()
+
+    def forward(self, slots, _, occupancy=None, attention=None):
+        if self.mode == "attn":
+            if attention is None:
+                raise ValueError("loss_cc mode=attn requires attention")
+            return self._attn_overlap(attention, occupancy)
         # slots: (B, T, S, D) or (B, S, D)
         u = nn.functional.normalize(slots, p=2.0, dim=-1)
         if u.ndim == 3:

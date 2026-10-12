@@ -39,6 +39,32 @@ def build(config, name: str):
         return None
 
 
+def _complement_slot_mix(
+    softmax_masks: torch.Tensor, gate: Optional[torch.Tensor], eps: float = 1e-8
+) -> torch.Tensor:
+    """softmax(α) ⊙ (π_max - π), renormalized over slots.
+
+    softmax_masks: (B, S, N, 1). gate: float (B, S), the same π the gated
+    mix uses. π_max is the per-example max over slots. A uniform gate is
+    all zeros before eps, so the mix falls back to softmax(α).
+    """
+    if gate is None or not torch.is_floating_point(gate) or gate.dim() != 2:
+        raise ValueError(
+            "ungated_complement requires a float per-slot gate (B, S), "
+            f"got {None if gate is None else (gate.dtype, tuple(gate.shape))}"
+        )
+    if gate.shape[0] != softmax_masks.shape[0] or gate.shape[1] != softmax_masks.shape[1]:
+        raise ValueError(
+            f"ungated_complement gate {tuple(gate.shape)} vs softmax "
+            f"{tuple(softmax_masks.shape)}"
+        )
+    pi = gate.to(dtype=softmax_masks.dtype)
+    gap = pi.amax(dim=1, keepdim=True) - pi
+    g = gap.clamp_min(0.0)[:, :, None, None]
+    mix = softmax_masks * (g + float(eps))
+    return mix / mix.sum(dim=1, keepdim=True).clamp_min(float(eps))
+
+
 class MLPDecoder(nn.Module):
     """Decoder that reconstructs independently for every position and slot."""
 
@@ -65,6 +91,7 @@ class MLPDecoder(nn.Module):
         active_mask: Optional[torch.Tensor] = None,
         return_slot_recons: bool = False,
         return_ungated: bool = False,
+        ungated_complement: bool = False,
     ) -> Dict[str, torch.Tensor]:
         bs, n_slots, dims = slots.shape
 
@@ -121,7 +148,14 @@ class MLPDecoder(nn.Module):
         if return_slot_recons:
             out["slot_recons"] = recons
         if return_ungated:
-            out["reconstruction_ungated"] = torch.sum(recons * masks_ungated, dim=1)
+            # masks_ungated stays softmax(α). Slot utility drop reads that
+            # tensor as a gate-free mix. The featrec auxiliary can still
+            # reweight the reconstruction with (π_max - π).
+            if ungated_complement:
+                mix_w = _complement_slot_mix(masks_ungated, active_mask)
+            else:
+                mix_w = masks_ungated
+            out["reconstruction_ungated"] = torch.sum(recons * mix_w, dim=1)
             out["masks_ungated"] = masks_ungated.squeeze(-1)
         return out
 

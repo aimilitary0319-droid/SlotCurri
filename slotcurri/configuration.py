@@ -37,6 +37,9 @@ class ModelConfig:
     # at max_steps//10 and max_steps//4). Only applies when attn_mass_curriculum is off;
     # set False to train with the full slot budget from step 0 (SlotContrast baseline).
     slot_expansion: bool = True
+    # First N training steps replace the λ1 gate with ones (decoder, temporal
+    # mix, Pred source gate). Key curriculum keeps its own clock. 0 disables.
+    slotcontrast_steps: int = 0
     attn_mass_curriculum: Optional[Dict[str, Any]] = None
     # Direction-only supervision on the predictor's residual step. Requires the predictor to
     # be built with vel_dim, since without the velocity input there is little for it to fit.

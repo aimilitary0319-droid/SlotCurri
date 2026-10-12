@@ -81,6 +81,8 @@ def test_next_prior_holds_mixed_state():
     expected = pi_bar * pred + (1.0 - pi_bar) * mixed
     assert torch.allclose(out["state_predicted"], expected, atol=1e-5)
     assert torch.allclose(out["state_predicted_pregate"], pred, atol=1e-5)
+    assert torch.allclose(out["state_mix"], mixed, atol=1e-5)
+    assert torch.allclose(out["state"], u_sa, atol=1e-6)
 
 
 def test_default_mix_is_pred_usa_hold_prior():
@@ -99,6 +101,7 @@ def test_default_mix_is_pred_usa_hold_prior():
     expected = pi_bar * pred + (1.0 - pi_bar) * prior
     assert torch.allclose(out["state_predicted"], expected, atol=1e-5)
     assert not torch.allclose(out["state_predicted"], pred, atol=1e-3)
+    assert "state_mix" not in out
 
 
 def test_umix_differs_from_default_when_pred_depends_on_input():

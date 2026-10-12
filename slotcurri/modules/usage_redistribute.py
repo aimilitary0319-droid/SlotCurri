@@ -36,6 +36,65 @@ def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return out
 
 
+def _entmax15_flat(logits: torch.Tensor) -> torch.Tensor:
+    """1.5-entmax on the last dim. logits (N, K) -> weights (N, K)."""
+    flat = logits * 0.5
+    dim_size = flat.shape[-1]
+    zs = torch.sort(flat, dim=-1, descending=True).values
+    rho = torch.arange(1, dim_size + 1, device=flat.device, dtype=flat.dtype)
+    mean = zs.cumsum(dim=-1) / rho
+    mean_sq = zs.square().cumsum(dim=-1) / rho
+    ss = rho * (mean_sq - mean.square())
+    delta = (1.0 - ss) / rho
+    tau = mean - delta.clamp_min(0.0).sqrt()
+    support = tau <= zs
+    k = support.sum(dim=-1, keepdim=True).clamp_min(1)
+    tau_star = tau.gather(-1, k.long() - 1)
+    return (flat - tau_star).clamp_min(0.0).square()
+
+
+class _Entmax15(torch.autograd.Function):
+    """1.5-entmax with its Jacobian.
+
+    Forward p_i = relu(z_i / 2 - τ)^2. Backward, with s = sqrt(p),
+    dp_i = s_i (dz_i - dτ) and dτ = Σ s_j dz_j / Σ s_j. Entries with p_i = 0
+    get zero gradient. The support index is discrete, so this is not autograd
+    through the sort.
+    """
+
+    @staticmethod
+    def forward(ctx, logits: torch.Tensor, dim: int) -> torch.Tensor:
+        dim = int(dim)
+        moved = logits if dim == -1 else logits.transpose(dim, -1)
+        out = _entmax15_flat(moved.reshape(-1, moved.shape[-1]))
+        out = out.reshape(moved.shape)
+        if dim != -1:
+            out = out.transpose(dim, -1)
+        ctx.dim = dim
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (weights,) = ctx.saved_tensors
+        scale = weights.clamp_min(0.0).sqrt()
+        grad = grad_out * scale
+        denom = scale.sum(dim=ctx.dim, keepdim=True).clamp_min(1e-12)
+        shift = grad.sum(dim=ctx.dim, keepdim=True) / denom
+        grad = grad - shift * scale
+        return grad, None
+
+
+def entmax15(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """1.5-entmax (Peters, Niculae, Martins, 2019). Output sums to 1.
+
+    Between softmax and sparsemax. A logit gap of 1 still leaves the loser
+    positive; a gap of 2 zeros it. Gradient is the entmax Jacobian: a slot
+    with weight 0 receives none from that row.
+    """
+    return _Entmax15.apply(logits, dim)
+
+
 def reconstruction_usage_grad(
     mix: torch.Tensor,
     slot_recons: torch.Tensor,

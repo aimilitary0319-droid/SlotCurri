@@ -13,6 +13,7 @@ from slotcurri.models import (
     feature_curriculum_mix,
     feature_curriculum_window,
 )
+from slotcurri.modules.video import apply_uniform_gate
 from slotcurri.modules.encoders import FeatureModeCollapse, FeatureSmoothing, FrameEncoder
 
 
@@ -38,6 +39,21 @@ def test_mix_schedule_endpoints_and_monotonicity():
     # cosine passes through 1/2 at the midpoint; linear is the identity ramp
     assert abs(feature_curriculum_mix(15000, 30000, "cosine") - 0.5) < 1e-9
     assert abs(feature_curriculum_mix(7500, 30000, "linear") - 0.25) < 1e-9
+
+
+def test_uniform_gate_replaces_float_masks_and_keeps_alias():
+    active = torch.tensor([[0.2, 0.9]])
+    state = active
+    out_a, out_s = apply_uniform_gate(active, state)
+    assert torch.equal(out_a, torch.ones_like(active))
+    assert out_s is out_a
+    other = torch.tensor([[0.1, 0.4]])
+    out_a, out_s = apply_uniform_gate(active, other)
+    assert torch.equal(out_s, torch.ones_like(other))
+    assert out_s is not out_a
+    flag = torch.tensor([[True, False]])
+    out_a, out_s = apply_uniform_gate(flag, flag)
+    assert out_a is flag and out_s is flag
 
 
 def test_window_schedule_endpoints_and_midpoint():

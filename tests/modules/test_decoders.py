@@ -66,6 +66,41 @@ def test_mlp_decoder_return_ungated_matches_no_gate():
     assert torch.allclose(both["masks_ungated"], plain["masks"], atol=1e-5)
 
 
+def test_mlp_decoder_ungated_complement_uses_pi_gap():
+    """Aux reconstruction uses softmax(α) ⊙ (π_max - π), then renorms.
+
+    masks_ungated stays plain softmax. The gated reconstruction is unchanged.
+    A uniform gate falls back to that softmax mix.
+    """
+    torch.manual_seed(0)
+    decoder = decoders.MLPDecoder(
+        inp_dim=5, outp_dim=8, hidden_dims=[10], n_patches=4
+    )
+    inp = torch.randn(2, 3, 5)
+    gate = torch.tensor([[1.0, 0.2, 0.0], [0.5, 0.5, 0.5]])
+    with torch.no_grad():
+        out = decoder(inp, gate, return_ungated=True, ungated_complement=True)
+        plain = decoder(inp, return_ungated=True)
+        gated = decoder(inp, gate, return_ungated=True)
+    assert torch.allclose(out["masks"], gated["masks"], atol=1e-5)
+    assert torch.allclose(out["reconstruction"], gated["reconstruction"], atol=1e-5)
+    assert torch.allclose(out["masks_ungated"], plain["masks_ungated"], atol=1e-5)
+    soft = plain["masks_ungated"].unsqueeze(-1)
+    recons = decoder(inp, return_slot_recons=True)["slot_recons"]
+    gap = gate.amax(dim=1, keepdim=True) - gate
+    mix = soft * (gap.clamp_min(0.0)[:, :, None, None] + 1e-8)
+    mix = mix / mix.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    expected = (recons * mix).sum(dim=1)
+    assert torch.allclose(out["reconstruction_ungated"], expected, atol=1e-5)
+    # Second row is uniform, so the complement mix matches softmax(α).
+    assert torch.allclose(
+        out["reconstruction_ungated"][1], plain["reconstruction_ungated"][1], atol=1e-5
+    )
+    assert not torch.allclose(
+        out["reconstruction_ungated"][0], plain["reconstruction_ungated"][0], atol=1e-4
+    )
+
+
 def test_mlp_decoder_zero_soft_gate_recovers_ungated():
     """All-zero normalized purity must not zero the reconstruction.
 
