@@ -63,6 +63,43 @@ def dot_ktemp_logits(
     return torch.einsum("bsd, bfd -> bsf", queries, keys) * coeff
 
 
+def break_slot_ties(
+    dots: torch.Tensor,
+    steps: int = 3,
+    lr: float = 0.1,
+    noise_std: float = 1e-6,
+) -> torch.Tensor:
+    """Push tied slot scores apart. dots is (B, S, F), softmax over slots.
+
+    Adds N(0, noise_std^2) once, then for a few steps
+    scores <- scores - lr * dH/dscores / ||dH/dscores||_slots,
+    where H is the mean entropy of softmax over slots. The offset is
+    detached and added back onto dots, so queries still get the softmax
+    gradient. The assignment itself stays softmax.
+    """
+    if dots.ndim != 3:
+        raise ValueError(
+            f"break_slot_ties expects dots (B, S, F), got {tuple(dots.shape)}"
+        )
+    if int(steps) < 1:
+        raise ValueError(f"break_slot_ties steps must be positive, got {steps}")
+    if float(lr) <= 0:
+        raise ValueError(f"break_slot_ties lr must be positive, got {lr}")
+    scores = dots.detach()
+    if float(noise_std) > 0:
+        scores = scores + torch.randn_like(scores) * float(noise_std)
+    for _ in range(int(steps)):
+        scores = scores.detach().requires_grad_(True)
+        probs = torch.softmax(scores, dim=1)
+        entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1).mean()
+        grad, = torch.autograd.grad(entropy, scores)
+        # Per patch, not over the whole image: a global norm would shrink
+        # each tied patch by the patch count.
+        step = grad / grad.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        scores = (scores - float(lr) * step).detach()
+    return dots + (scores - dots.detach())
+
+
 def attention_over_slots(dots: torch.Tensor, attn_norm: str) -> torch.Tensor:
     """Per-patch competition over slots. dots is (B, S, F).
 
@@ -131,6 +168,12 @@ class SlotAttention(nn.Module):
         dot_ktemp: bool = False,
         dot_ktemp_odds: float = 1.0,
         dot_ktemp_sqrt: bool = False,
+        logit_div: float = 1.0,
+        pi_logit_center: bool = False,
+        tie_break: bool = False,
+        tie_break_steps: int = 3,
+        tie_break_lr: float = 0.1,
+        tie_break_noise: float = 1e-6,
     ):
         super().__init__()
         assert n_iters >= 1
@@ -183,6 +226,9 @@ class SlotAttention(nn.Module):
         self.dot_ktemp = bool(dot_ktemp)
         self.dot_ktemp_odds = float(dot_ktemp_odds)
         self.dot_ktemp_sqrt = bool(dot_ktemp_sqrt)
+        self.logit_div = float(logit_div)
+        if self.logit_div <= 0:
+            raise ValueError(f"logit_div must be positive, got {self.logit_div}")
         if self.dot_ktemp_sqrt and not self.dot_ktemp:
             raise ValueError("dot_ktemp_sqrt applies only when dot_ktemp is true")
         if self.dot_ktemp_odds <= 0:
@@ -200,6 +246,32 @@ class SlotAttention(nn.Module):
             raise ValueError(
                 "dot_ktemp uses one softmax for the update and π, "
                 f"got pi_attn_norm={pi_attn_norm!r}"
+            )
+        # π reads softmax_s(z_si - mean_i z_si): a per-slot offset shared by every
+        # patch moves the absolute attention but not the patch-normalized update.
+        self.pi_logit_center = bool(pi_logit_center)
+        if self.pi_logit_center and (
+            attn_norm != "softmax" or pi_attn_norm or margin_gate_slot_norm
+        ):
+            raise ValueError(
+                "pi_logit_center needs attn_norm='softmax' and no other π attention"
+            )
+        self.tie_break = bool(tie_break)
+        self.tie_break_steps = int(tie_break_steps)
+        self.tie_break_lr = float(tie_break_lr)
+        self.tie_break_noise = float(tie_break_noise)
+        if self.tie_break and attn_norm != "softmax":
+            raise ValueError(
+                "tie_break lowers the entropy of a softmax over slots, "
+                f"got attn_norm={attn_norm!r}"
+            )
+        if self.tie_break and self.tie_break_steps < 1:
+            raise ValueError(
+                f"tie_break_steps must be positive, got {self.tie_break_steps}"
+            )
+        if self.tie_break and self.tie_break_lr <= 0:
+            raise ValueError(
+                f"tie_break_lr must be positive, got {self.tie_break_lr}"
             )
         self.attn_norm = attn_norm
         self.pi_attn_norm = pi_attn_norm
@@ -235,6 +307,13 @@ class SlotAttention(nn.Module):
         self.n_iters = n_iters
         self.eps = eps
         self.scale = kvq_dim**-0.5
+        # feature_curriculum.key_center: the model writes 1 - s here every train step.
+        # Keys lose this fraction of their per-frame patch mean, so q_s · mean(k) -- a
+        # bonus slot s gets on every patch of the frame -- drops out of the competition.
+        # Train only; 0 is standard Slot Attention.
+        self.key_center: float = 0.0
+        # feature_curriculum.key_mix=post_ln writes the curriculum s here.
+        self.key_mix_s: float = 1.0
 
     def step(
         self, slots: torch.Tensor, keys: torch.Tensor, values: torch.Tensor
@@ -257,6 +336,14 @@ class SlotAttention(nn.Module):
                 )
             else:
                 dots = torch.einsum("bsd, bfd -> bsf", q, k) * self.scale
+            dots = dots / self.logit_div
+            if self.tie_break and self.training:
+                dots = break_slot_ties(
+                    dots,
+                    steps=self.tie_break_steps,
+                    lr=self.tie_break_lr,
+                    noise_std=self.tie_break_noise,
+                )
             pre_norm_attn = attention_over_slots(dots, self.attn_norm)  # b slot patch
             attn = margin_update_weights(
                 pre_norm_attn,
@@ -278,8 +365,15 @@ class SlotAttention(nn.Module):
                     pre_norm_attn
                     / pre_norm_attn.sum(dim=1, keepdim=True).clamp_min(float(self.eps))
                 ).detach()
+            elif self.pi_logit_center:
+                pi_attn = torch.softmax(
+                    dots - dots.mean(dim=-1, keepdim=True), dim=1
+                ).detach()
         updates = updates.to(dtype=slots.dtype)
         pre_norm_attn = pre_norm_attn.to(dtype=slots.dtype)
+        # Last-iteration pre-softmax logits. SSync reads these; the slot update
+        # above stays on pre_norm_attn.
+        self._last_dots = dots.to(dtype=slots.dtype)
         if pi_attn is not None:
             pi_attn = pi_attn.to(dtype=slots.dtype)
 
@@ -300,12 +394,23 @@ class SlotAttention(nn.Module):
         features: torch.Tensor,
         n_iters: Optional[int] = None,
         key_features: Optional[torch.Tensor] = None,
+        key_rel_features: Optional[torch.Tensor] = None,
     ):
         # Value always comes from `features` (original / recon-aligned tokens).
         # Key may come from a separately projected bind tensor (v36 Key-only leveling).
+        # key_rel_features is the s=0 endpoint; the blend is after LN and W_k.
         values_in = self.norm_features(features)
-        keys_in = values_in if key_features is None else self.norm_features(key_features)
-        keys = self.to_k(keys_in)
+        if key_rel_features is not None:
+            s = float(self.key_mix_s)
+            raw_in = features if key_features is None else key_features
+            k_rel = self.to_k(self.norm_features(key_rel_features))
+            k_raw = self.to_k(self.norm_features(raw_in))
+            keys = (1.0 - s) * k_rel + s * k_raw
+        else:
+            keys_in = values_in if key_features is None else self.norm_features(key_features)
+            keys = self.to_k(keys_in)
+        if self.training and self.key_center > 0.0:
+            keys = keys - self.key_center * keys.mean(dim=1, keepdim=True)
         values = self.to_v(values_in)
 
         if n_iters is None:
@@ -315,7 +420,7 @@ class SlotAttention(nn.Module):
         for _ in range(n_iters):
             slots, pre_norm_attn, pi_masks = self.step(slots, keys, values)
 
-        out = {"slots": slots, "masks": pre_norm_attn}
+        out = {"slots": slots, "masks": pre_norm_attn, "dots": self._last_dots}
         if pi_masks is not None:
             out["pi_masks"] = pi_masks
         return out

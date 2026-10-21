@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -17,6 +19,10 @@ def test_slot_attention(use_mlp):
 
     assert outp["slots"].shape == (1, n_slots, slot_dim)
     assert outp["masks"].shape == (1, n_slots, n_patches)
+    assert outp["dots"].shape == outp["masks"].shape
+    # Default attention is softmax over the exported pre-softmax dots.
+    # The slot MLP runs after that map and does not change it.
+    assert torch.allclose(torch.softmax(outp["dots"], dim=1), outp["masks"])
 
 
 def test_sparsemax_ste_forward_and_softmax_grad():
@@ -345,3 +351,55 @@ def test_dot_ktemp_step_softmax_sums_over_slots():
     _, masks_99, _ = module_99.step(slots, keys, values)
     expected_99 = torch.softmax(groupers.dot_ktemp_logits(slots, keys, odds=99), dim=1)
     assert torch.allclose(masks_99, expected_99)
+
+
+def test_logit_div_halves_default_slot_logits():
+    module = groupers.SlotAttention(
+        8, 8, n_iters=1, use_mlp=False, use_gru=False, logit_div=2
+    )
+    module.norm_slots = torch.nn.Identity()
+    module.to_q = torch.nn.Identity()
+    slots = torch.randn(2, 7, 8)
+    keys = torch.randn(2, 5, 8)
+    values = torch.randn(2, 5, 8)
+    _, masks, pi_attn = module.step(slots, keys, values)
+    dots = torch.einsum("bsd,bfd->bsf", slots, keys) * module.scale
+    assert torch.allclose(masks, torch.softmax(dots / 2, dim=1))
+    assert pi_attn is None
+
+
+def test_post_ln_key_mix_blends_after_wk():
+    torch.manual_seed(0)
+    module = groupers.SlotAttention(4, 4, n_iters=1, use_mlp=False, use_gru=False)
+    module.norm_slots = torch.nn.Identity()
+    module.norm_features = torch.nn.Identity()
+    module.to_q = torch.nn.Identity()
+    module.to_k = torch.nn.Identity()
+    module.to_v = torch.nn.Identity()
+    module.key_mix_s = 0.25
+    slots = torch.randn(2, 3, 4)
+    raw = torch.randn(2, 5, 4)
+    rel = torch.randn(2, 5, 4)
+    out = module(slots, raw, key_features=raw, key_rel_features=rel)
+    mixed = 0.75 * rel + 0.25 * raw
+    expect = torch.einsum("bsd,bfd->bsf", slots, mixed) * module.scale
+    assert torch.allclose(out["dots"], expect, atol=1e-5)
+
+
+def test_tie_break_splits_equal_slot_scores_and_keeps_a_winner():
+    torch.manual_seed(0)
+    tied = torch.zeros(2, 5, 16)
+    split = groupers.break_slot_ties(tied, steps=4, lr=0.5, noise_std=1e-4)
+    probs = torch.softmax(split, dim=1)
+    entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1).mean()
+    assert float(entropy) < math.log(5) - 0.2
+
+    ahead = torch.zeros(1, 4, 8)
+    ahead[:, 0] = 4
+    kept = groupers.break_slot_ties(ahead, steps=3, lr=0.1, noise_std=1e-6)
+    assert torch.softmax(kept, dim=1)[:, 0].mean() > 0.9
+
+    base = torch.randn(2, 3, 4, requires_grad=True)
+    out = groupers.break_slot_ties(base, steps=2, lr=0.1, noise_std=1e-6)
+    out.sum().backward()
+    assert torch.allclose(base.grad, torch.ones_like(base))

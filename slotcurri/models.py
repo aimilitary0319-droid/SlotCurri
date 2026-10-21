@@ -8,10 +8,11 @@ import torchmetrics
 from torch import nn
 from torchvision.utils import make_grid
 
-from slotcurri import configuration, losses, modules, optimizers, utils, visualizations
+from slotcurri import configuration, losses, modules, optimizers, ssync, utils, visualizations
 from slotcurri.data.transforms import Denormalize
 from slotcurri.modules.gate_p_residual import GatePResidualNet
 from slotcurri.modules.decoders import algebraic_slot_utility_loss
+from slotcurri.modules.groupers import SlotAttention
 from slotcurri.modules.usage_redistribute import usage_redistribute_direction
 from slotcurri.modules.video import (
     SlotUsageHead,
@@ -29,18 +30,33 @@ import shutil
 import matplotlib.pyplot as plt
 
 
-def feature_curriculum_mix(step: int, anneal_steps: int, schedule: str = "cosine") -> float:
+def feature_curriculum_mix(
+    step: int,
+    anneal_steps: int,
+    schedule: str = "cosine",
+    mix_start: float = 0.0,
+) -> float:
     """Blend factor for the v33 feature curriculum.
 
     0 = fully affinity-smoothed (object-level) backbone tokens, 1 = raw patch tokens.
     Monotone in step, reaches 1 at `anneal_steps` and stays there; after the anneal the
     encoder is byte-identical to the uncurriculumed model. Module-level so the schedule
     is unit-testable without building a model.
+
+    `mix_start` s0 in [0, 1] shifts the path to s0 + (1 - s0) * u(t), so training
+    begins at s0 and still ends at raw keys. s0 = 0 is the original schedule.
     """
+    s0 = float(mix_start)
+    if s0 < 0.0 or s0 > 1.0:
+        raise ValueError(
+            f"feature_curriculum.mix_start must be in [0, 1], got {s0}"
+        )
     t = min(max(float(step), 0.0) / float(max(int(anneal_steps), 1)), 1.0)
     if str(schedule).lower() == "linear":
-        return t
-    return 0.5 * (1.0 - math.cos(math.pi * t))
+        u = t
+    else:
+        u = 0.5 * (1.0 - math.cos(math.pi * t))
+    return s0 + (1.0 - s0) * u
 
 
 def feature_curriculum_window(
@@ -241,7 +257,14 @@ def build(
         slot_ent_impurity=model_config.get("slot_ent_impurity", None),
         usage_head_config=model_config.get("usage_head", None),
         slot_usage_redistribute=model_config.get("slot_usage_redistribute", None),
+        dif_n_bd=model_config.get("dif_n_bd", 1),
+        dif_n_nbd=model_config.get("dif_n_nbd", 1),
+        dif_n_bd_noise=model_config.get("dif_n_bd_noise", 1),
+        merge_iou_threshold=model_config.get("merge_iou_threshold", 0.7),
+        synergistic_start_step=model_config.get("synergistic_start_step", None),
     )
+
+    model.diag_log = bool(model_config.get("diag_log", False))
 
     if model_config.load_weights:
         model.load_weights_from_checkpoint(model_config.load_weights, model_config.modules_to_load)
@@ -284,6 +307,11 @@ class ObjectCentricModel(pl.LightningModule):
         slot_ent_impurity: Optional[Dict[str, Any]] = None,
         usage_head_config: Optional[Dict[str, Any]] = None,
         slot_usage_redistribute: Optional[Dict[str, Any]] = None,
+        dif_n_bd: int = 1,
+        dif_n_nbd: int = 1,
+        dif_n_bd_noise: int = 1,
+        merge_iou_threshold: float = 0.7,
+        synergistic_start_step: Optional[int] = None,
     ):
         super().__init__()
         # bool: legacy on/off (backward sweep anchored at the last frame). A string
@@ -327,6 +355,22 @@ class ObjectCentricModel(pl.LightningModule):
         # v39lam1gu: second featrec on the ungated softmax mix. Decoder
         # computes both mixes in one MLP pass when this loss is present.
         self.featrec_ungated = "loss_featrec_ungated" in self.loss_fns
+        self.ssync_enabled = any(
+            name in self.loss_fns for name in ("loss_grp2deccls", "loss_dec2grpcls")
+        )
+        self.dif_n_bd = int(dif_n_bd)
+        self.dif_n_nbd = int(dif_n_nbd)
+        self.dif_n_bd_noise = int(dif_n_bd_noise)
+        self.merge_iou_threshold = float(merge_iou_threshold)
+        if synergistic_start_step is None:
+            self.synergistic_start_step = None
+        else:
+            self.synergistic_start_step = int(synergistic_start_step)
+        if self.ssync_enabled and self.synergistic_start_step is None:
+            raise ValueError(
+                "synergistic_start_step is required when loss_grp2deccls or "
+                "loss_dec2grpcls is set"
+            )
 
         self.mask_resizers = mask_resizers if mask_resizers else {}
         self.mask_resizers["segmentation"] = modules.Resizer(
@@ -485,6 +529,20 @@ class ObjectCentricModel(pl.LightningModule):
         self.featcur_enabled = bool(fc.get("enabled", False))
         self.featcur_anneal_steps = int(fc.get("anneal_steps", 30000))
         self.featcur_schedule = str(fc.get("schedule", "cosine")).lower()
+        mix_start = fc.get("mix_start", 0.0)
+        self.featcur_mix_start_auto = (
+            isinstance(mix_start, str) and mix_start.strip().lower() == "auto"
+        )
+        if self.featcur_mix_start_auto:
+            # Filled before the first training step by the dataset median.
+            self.featcur_mix_start = 0.0
+        else:
+            self.featcur_mix_start = float(mix_start)
+            if self.featcur_mix_start < 0.0 or self.featcur_mix_start > 1.0:
+                raise ValueError(
+                    "feature_curriculum.mix_start must be in [0, 1] or 'auto', "
+                    f"got {self.featcur_mix_start}"
+                )
         if self.featcur_schedule not in ("cosine", "linear"):
             raise ValueError(
                 "feature_curriculum.schedule must be 'cosine' or 'linear', "
@@ -544,9 +602,45 @@ class ObjectCentricModel(pl.LightningModule):
                 "feature_curriculum.apply must be 'tokens' or 'key', "
                 f"got {self.featcur_apply!r}"
             )
+        # gate_features: which DINO tokens build the π graph.
+        # bind (default) is X^bind, the same mix the Keys see.
+        # raw is the original X from step 0; Keys still read X^bind.
+        self.featcur_gate_features = str(fc.get("gate_features", "bind")).lower()
+        if self.featcur_gate_features not in ("bind", "raw"):
+            raise ValueError(
+                "feature_curriculum.gate_features must be 'bind' or 'raw', "
+                f"got {self.featcur_gate_features!r}"
+            )
+        # key_center: every Slot Attention drops (1 - s) of its per-frame mean key
+        # (see SlotAttention.key_center). s is the curriculum clock, so no extra knob.
+        self.featcur_key_center = bool(fc.get("key_center", False))
+        if self.featcur_key_center and not self.featcur_enabled:
+            raise ValueError("feature_curriculum.key_center requires enabled: true")
+        self._key_center_modules: Optional[List[SlotAttention]] = None
+        # bind mixes in DINO space. post_ln blends the slot keys after LN and W_k.
+        self.featcur_key_mix = str(fc.get("key_mix", "bind")).lower()
+        if self.featcur_key_mix not in ("bind", "post_ln"):
+            raise ValueError(
+                "feature_curriculum.key_mix must be 'bind' or 'post_ln', "
+                f"got {self.featcur_key_mix!r}"
+            )
+        if self.featcur_key_mix == "post_ln" and self.featcur_apply != "key":
+            raise ValueError("feature_curriculum.key_mix=post_ln requires apply: key")
+        if self.featcur_key_mix == "post_ln" and self.featcur_anneal not in (
+            "ncut",
+            "n8",
+            "half",
+            "rowcenter",
+        ):
+            raise ValueError(
+                "feature_curriculum.key_mix=post_ln requires an ncut anneal, "
+                f"got {self.featcur_anneal!r}"
+            )
+        self._key_mix_modules: Optional[List[SlotAttention]] = None
         if self.featcur_enabled:
             inner = self._frame_encoder()
             inner.feature_curriculum_apply = self.featcur_apply
+            inner.key_mix = self.featcur_key_mix
             if self.featcur_anneal == "modes":
                 inner.feature_modes = modules.FeatureModeCollapse(
                     n_iter=int(fc.get("n_iter", 8)),
@@ -582,6 +676,9 @@ class ObjectCentricModel(pl.LightningModule):
                         else 0.0
                     ),
                     row_center=self.featcur_anneal == "rowcenter",
+                    xvid_energy=fc.get("xvid_energy", False),
+                    xvid_power=float(fc.get("xvid_power", 1.0)),
+                    fiedler_cut=str(fc.get("fiedler_cut", "sym_median")),
                 )
                 inner.feature_ncut_mix = 0.0
             else:
@@ -1006,11 +1103,17 @@ class ObjectCentricModel(pl.LightningModule):
         #              sqrt_a (v39lam1gu_asqrt): G_s = diag(sqrt(a)) S diag(sqrt(a)).
         #              pi_slot_gamma (v39lam1gu_gsharp2_asqrt): a <- a^γ / sum_s a^γ
         #              per patch before G (then sqrt_a, if on). π only.
+        #              a_slot_max (v39lam1gu_nomaxnorm_amax): a <- a / max_s a
+        #              per patch before G. Winner on each patch is 1. π only.
         #              sqrt_pi (v39lam1gu_sqrtpi): G stays diag(a) S diag(a),
         #              π_s = sqrt(max(λ1, 0)).
         #              pi_rival (v39lam1gu_rival): diagonal is
         #              w = r/(r+K_0-1), r = a(K-1)/(1-a). K_0=K recovers a.
         #              pi_rival_k0 is that size, or "auto" for (K+1)/2. π only.
+        #              s_form "dinv_rr" (rwmean): square the 8-neighbor
+        #              cosine, then the same symmetric normalization.
+        #              S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}, D̃_ii = sum_j R_ij^2.
+        #              Default "sym" is D^{-1/2} R D^{-1/2}.
         #   "spectral_graph_n8_ind": v39ind. Induced n8 graph on support
         #              Ω = {a ≥ support_rel * max a}, S re-normalized there.
         #              π_s = λ1 - max(λ2, 0). Two n8-components → π=0.
@@ -1090,6 +1193,22 @@ class ObjectCentricModel(pl.LightningModule):
                 "'spectral_graph_n8_l1imp' or 'spectral_graph_n8_lam1' "
                 f"(G_s = diag(sqrt(a)) S diag(sqrt(a))), got {self.amc_conf_kind!r}"
             )
+        # v39lam1gu_nomaxnorm_amax: slot-axis a / max_s a, read only by the n8
+        # spectrum. Per patch the winner is 1. Slot update stays on softmax a.
+        self.amc_a_slot_max = bool(amc.get("a_slot_max", False))
+        if self.amc_a_slot_max and self.amc_conf_kind not in (
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.a_slot_max requires conf_kind "
+                "'spectral_graph_n8', 'spectral_graph_n8_rel', "
+                "'spectral_graph_n8_l1imp' or 'spectral_graph_n8_lam1' "
+                "(a <- a / max_s a per patch before G), "
+                f"got {self.amc_conf_kind!r}"
+            )
         # v39lam1gu_gsharp2_asqrt: slot-axis γ-sharpened a, read only by the n8
         # spectrum. Slot update / decoder keep the softmax attention. 1.0 is a no-op.
         self.amc_pi_slot_gamma = float(amc.get("pi_slot_gamma", 1.0))
@@ -1145,11 +1264,14 @@ class ObjectCentricModel(pl.LightningModule):
         # v39lam1gu_sqrtpi: π = sqrt(max(λ1, 0)) on the original G. Not sqrt_a.
         self.amc_sqrt_pi = bool(amc.get("sqrt_pi", False))
         if self.amc_pi_rival and (
-            self.amc_sqrt_a or self.amc_sqrt_pi or self.amc_pi_slot_gamma != 1.0
+            self.amc_sqrt_a
+            or self.amc_sqrt_pi
+            or self.amc_pi_slot_gamma != 1.0
+            or self.amc_a_slot_max
         ):
             raise ValueError(
                 "attn_mass_curriculum.pi_rival replaces a inside G; "
-                "do not combine with sqrt_a, sqrt_pi, or pi_slot_gamma"
+                "do not combine with sqrt_a, sqrt_pi, pi_slot_gamma, or a_slot_max"
             )
         if self.amc_sqrt_pi and self.amc_sqrt_a:
             raise ValueError(
@@ -1162,8 +1284,58 @@ class ObjectCentricModel(pl.LightningModule):
                 "'spectral_graph_n8_lam1' (π = sqrt(max(λ1, 0))), "
                 f"got {self.amc_conf_kind!r}"
             )
+        # rwmean: square R, then S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}. "sym" is v39.
+        self.amc_s_form = str(amc.get("s_form", "sym")).lower()
+        if self.amc_s_form not in ("sym", "dinv_rr"):
+            raise ValueError(
+                "attn_mass_curriculum.s_form must be 'sym' or 'dinv_rr', "
+                f"got {self.amc_s_form!r}"
+            )
+        if self.amc_s_form != "sym" and self.amc_conf_kind not in (
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.s_form is the gate graph, "
+                "requires conf_kind 'spectral_graph_n8', "
+                "'spectral_graph_n8_rel', 'spectral_graph_n8_l1imp' or "
+                f"'spectral_graph_n8_lam1', got {self.amc_conf_kind!r}"
+            )
+        self.amc_gate_graph = str(amc.get("gate_graph", "n8")).lower()
+        if self.amc_gate_graph not in ("n8", "dense"):
+            raise ValueError(
+                "attn_mass_curriculum.gate_graph must be 'n8' or 'dense', "
+                f"got {self.amc_gate_graph!r}"
+            )
+        if self.amc_gate_graph != "n8" and self.amc_conf_kind not in (
+            "spectral_graph_n8",
+            "spectral_graph_n8_rel",
+            "spectral_graph_n8_l1imp",
+            "spectral_graph_n8_lam1",
+        ):
+            raise ValueError(
+                "attn_mass_curriculum.gate_graph is the λ gate support, "
+                "requires conf_kind 'spectral_graph_n8', "
+                "'spectral_graph_n8_rel', 'spectral_graph_n8_l1imp' or "
+                f"'spectral_graph_n8_lam1', got {self.amc_conf_kind!r}"
+            )
         # v39lam1gu_gap: decoder / temporal mix / Pred src-gate use
         # π̃ = 1 - (π_max - π) instead of π. Logged gate stats stay on raw π.
+        # Decoder-only base slot: g^dec_b = 1, g^dec_s = π_s otherwise.
+        # Temporal mix stays π/max(π). Logged active_mask stays raw π.
+        # None leaves the decoder on π. Index is fixed for train and eval.
+        raw_base = amc.get("decoder_base_slot", None)
+        if raw_base is None or raw_base == "":
+            self.amc_decoder_base_slot = None
+        else:
+            self.amc_decoder_base_slot = int(raw_base)
+            if self.amc_decoder_base_slot < 0 or self.amc_decoder_base_slot >= self.n_slots:
+                raise ValueError(
+                    "attn_mass_curriculum.decoder_base_slot must be in "
+                    f"0..{self.n_slots - 1}, got {self.amc_decoder_base_slot}"
+                )
         self.amc_pi_gap = bool(amc.get("pi_gap", False))
         if self.amc_pi_gap and (
             self.amc_gate_form != "purity_weight"
@@ -1616,13 +1788,18 @@ class ObjectCentricModel(pl.LightningModule):
 
         processor_kwargs: Dict[str, Any] = {"cycle": cycle}
         key_features = encoder_output.get("features_key")
+        key_rel = encoder_output.get("features_key_rel")
         if key_features is not None:
             # ScanOverTime takes the full (B, T, ...) tensor as key_inputs;
             # LatentProcessor (image) takes a single frame as key_features.
             if hasattr(self.processor, "next_state_key"):
                 processor_kwargs["key_inputs"] = key_features
+                if key_rel is not None:
+                    processor_kwargs["key_rel_inputs"] = key_rel
             else:
                 processor_kwargs["key_features"] = key_features
+                if key_rel is not None:
+                    processor_kwargs["key_rel_features"] = key_rel
         if self.attn_mass_enabled and self.amc_conf_kind in (
             "spectral",
             "spectral_gap",
@@ -1635,9 +1812,13 @@ class ObjectCentricModel(pl.LightningModule):
             "spectral_graph_n8_ind",
         ):
             # Z / X^bind for v37 / v37g / v37r C_s, v38 dense S, and v39 / v39n 8-neighbor S.
-            # Key-only curriculum exposes that as backbone_key; otherwise
-            # backbone_features is X^bind (raw X when the curriculum is off / mix=1).
-            bind = encoder_output.get("backbone_key")
+            # Key-only curriculum exposes X^bind as backbone_key. backbone_features
+            # stays the recon target: raw X when apply=key.
+            # gate_features=raw builds π on that raw X while Keys stay on X^bind.
+            if self.featcur_gate_features == "raw":
+                bind = None
+            else:
+                bind = encoder_output.get("backbone_key")
             if bind is None:
                 bind = encoder_output.get("backbone_features")
             if bind is None:
@@ -1703,7 +1884,11 @@ class ObjectCentricModel(pl.LightningModule):
                 pi_slot_gamma=self.amc_pi_slot_gamma,
                 pi_rival=self.amc_pi_rival,
                 pi_rival_k0=self.amc_pi_rival_k0,
+                a_slot_max=self.amc_a_slot_max,
+                s_form=self.amc_s_form,
+                gate_graph=self.amc_gate_graph,
                 pi_gap=self.amc_pi_gap,
+                decoder_base_slot=self.amc_decoder_base_slot,
                 eval_hard_thresh=(self.amc_eval_hard_thresh if not train else 0.0),
                 eval_perron_readout=(
                     bool(self.amc_perron_readout)
@@ -1802,6 +1987,26 @@ class ObjectCentricModel(pl.LightningModule):
             "processor": processor_output,
             "decoder": decoder_output,
         }
+        if self.ssync_enabled:
+            dots = processor_output.get("nosoftmax_dots")
+            attn = processor_output.get("state_attn_mask")
+            alpha = decoder_output.get("alpha")
+            if dots is None or attn is None or alpha is None:
+                raise ValueError(
+                    "SSync losses require processor.nosoftmax_dots, "
+                    "processor.state_attn_mask and decoder.alpha"
+                )
+            outputs.update(
+                ssync.selective_synergy_targets(
+                    dots,
+                    attn,
+                    alpha,
+                    dif_n_bd=self.dif_n_bd,
+                    dif_n_nbd=self.dif_n_nbd,
+                    dif_n_bd_noise=self.dif_n_bd_noise,
+                    merge_iou_threshold=self.merge_iou_threshold,
+                )
+            )
         outputs["targets"] = self.get_targets(inputs, outputs)
 
         return outputs
@@ -1881,6 +2086,10 @@ class ObjectCentricModel(pl.LightningModule):
     def compute_loss(self, outputs: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         losses = {}
         for name, loss_fn in self.loss_fns.items():
+            if name in ("loss_grp2deccls", "loss_dec2grpcls"):
+                start = self.synergistic_start_step
+                if start is not None and self.trainer.global_step < start:
+                    continue
             prediction = loss_fn.get_prediction(outputs)
             target = outputs["targets"][name]
             if name == 'loss_featrec' and self._expansion_active:
@@ -2571,6 +2780,41 @@ class ObjectCentricModel(pl.LightningModule):
         per_bt = weighted.sum(dim=(-1, -2)) / denom
         return per_bt.mean()
 
+    @torch.no_grad()
+    def _diag_stats(self, outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Raw-π and Slot Attention competition stats, independent of which path is gated.
+
+        mode_frac is the share of the batch taken by the single most frequent slot index,
+        so 1.0 means one learned slot wins in every clip.
+        """
+        out: Dict[str, torch.Tensor] = {}
+        proc = outputs.get("processor") or {}
+
+        def mode_frac(idx: torch.Tensor, n: int) -> torch.Tensor:
+            idx = idx.flatten()
+            return torch.bincount(idx, minlength=n).max().float() / max(idx.numel(), 1)
+
+        pi = proc.get("gate_conf")
+        if pi is not None and torch.is_floating_point(pi):
+            pi = pi.float()
+            q = pi / pi.sum(-1, keepdim=True).clamp_min(1e-12)
+            out["diag/pi_max"] = pi.amax(-1).mean()
+            out["diag/pi_entropy"] = (-(q * q.clamp_min(1e-12).log()).sum(-1)).mean()
+            out["diag/pi_mode_frac"] = mode_frac(pi.argmax(-1), pi.shape[-1])
+        att = (proc.get("corrector") or {}).get("masks")
+        if att is not None:
+            att = att.float()
+            n_slots = att.shape[-2]
+            top2 = att.topk(2, dim=-2).values
+            out["diag/attn_top"] = top2.select(-2, 0).mean()
+            out["diag/attn_margin"] = (
+                top2.select(-2, 0).clamp_min(1e-12).log()
+                - top2.select(-2, 1).clamp_min(1e-12).log()
+            ).mean()
+            out["diag/attn_mode_frac"] = mode_frac(att.argmax(-2), n_slots)
+            out["diag/attn_frame_mode_frac"] = mode_frac(att.mean(-1).argmax(-1), n_slots)
+        return out
+
     def _frame_encoder(self) -> nn.Module:
         """The inner FrameEncoder (unwraps MapOverTime for video input)."""
         return self.encoder.module if hasattr(self.encoder, "module") else self.encoder
@@ -2588,7 +2832,10 @@ class ObjectCentricModel(pl.LightningModule):
         inner = self._frame_encoder()
         step = self.trainer.global_step
         self._featcur_s = feature_curriculum_mix(
-            step, self.featcur_anneal_steps, self.featcur_schedule
+            step,
+            self.featcur_anneal_steps,
+            self.featcur_schedule,
+            mix_start=self.featcur_mix_start,
         )
         if self.featcur_anneal == "window":
             w = feature_curriculum_window(
@@ -2628,6 +2875,28 @@ class ObjectCentricModel(pl.LightningModule):
             sm = inner.feature_smoothing
             self._featcur_window = None if sm is None else sm.window
             self._featcur_h = 0.0
+        if self.featcur_key_center:
+            if self._key_center_modules is None:
+                self._key_center_modules = [
+                    m for m in self.modules() if isinstance(m, SlotAttention)
+                ]
+                if not self._key_center_modules:
+                    raise ValueError(
+                        "feature_curriculum.key_center found no SlotAttention module"
+                    )
+            for sa in self._key_center_modules:
+                sa.key_center = 1.0 - float(self._featcur_s)
+        if self.featcur_key_mix == "post_ln":
+            if self._key_mix_modules is None:
+                self._key_mix_modules = [
+                    m for m in self.modules() if isinstance(m, SlotAttention)
+                ]
+                if not self._key_mix_modules:
+                    raise ValueError(
+                        "feature_curriculum.key_mix=post_ln found no SlotAttention module"
+                    )
+            for sa in self._key_mix_modules:
+                sa.key_mix_s = float(self._featcur_s)
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         if self.featcur_enabled:
@@ -2652,6 +2921,8 @@ class ObjectCentricModel(pl.LightningModule):
 
         if self.featcur_enabled:
             inner = self._frame_encoder()
+            if self.featcur_key_center:
+                to_log["train/featcur_key_center"] = 1.0 - float(self._featcur_s)
             if self.featcur_anneal == "modes":
                 to_log["train/featcur_mix"] = float(inner.feature_modes_mix)
                 to_log["train/featcur_h"] = float(self._featcur_h)
@@ -2662,6 +2933,9 @@ class ObjectCentricModel(pl.LightningModule):
             elif self.featcur_anneal in ("ncut", "n8", "half", "rowcenter"):
                 to_log["train/featcur_mix"] = float(inner.feature_ncut_mix)
                 to_log["train/featcur_beta"] = 1.0 - float(inner.feature_ncut_mix)
+                gain = getattr(inner.feature_ncut, "last_xvid_gain", None)
+                if gain is not None and float(inner.feature_ncut_mix) < 1.0:
+                    to_log["train/featcur_xvid_gain"] = float(gain)
             else:
                 to_log["train/featcur_mix"] = float(inner.feature_smoothing_mix)
             to_log["train/featcur_s"] = float(self._featcur_s)
@@ -2769,6 +3043,9 @@ class ObjectCentricModel(pl.LightningModule):
                 values = metric(**batch, **outputs, **aux_outputs)
                 self._add_metric_to_log(to_log, f"train/{key}", values)
                 metric.reset()
+        if getattr(self, "diag_log", False):
+            to_log.update(self._diag_stats(outputs))
+
         self.log_dict(to_log, on_step=True, on_epoch=False, batch_size=outputs["batch_size"])
 
         del outputs  # Explicitly delete to save memory

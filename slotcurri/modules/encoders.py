@@ -219,8 +219,11 @@ class NcutRelationalLeveling(nn.Module):
         Z = x / ||x||,   W = ReLU(Z Z^T),   W_ii = 0
 
     Then x_rel = P x with P the row-normalized affinity. `barrier=True` (v36) first
-    takes the Fiedler vector of L = I - D^{-1/2} W D^{-1/2}, median-cuts into two
-    regions, and zeros W across the cut so leveling cannot mix the parts.
+    takes the Fiedler vector v of L_sym = I - D^{-1/2} W D^{-1/2} and zeros W
+    across the cut so leveling cannot mix the parts. `fiedler_cut="sym_median"`
+    (default) thresholds v at its median, so the two sides have equal size.
+    `fiedler_cut="rw_mean"` converts y = D^{-1/2} v, the Fiedler of
+    (D-W)y = λ D y, and thresholds y at its mean.
     `barrier=False` (v37) skips that cut: P is global on W, same mix / Key-only
     schedule as v36.
 
@@ -240,6 +243,49 @@ class NcutRelationalLeveling(nn.Module):
         W_ij = ReLU(z_i^T z_j - (τ_i+τ_j)/2),  W_ii = 0
     No extra mix knob. Barrier / n8 / glob_n8_mix must be off.
 
+    `xvid_energy=True` (v39lam1gu_xvid) rescales X^rel around the batch mean so
+    the part that differs across videos keeps the energy it had in raw X:
+        mu = mean of X over every token in the batch (B*T frames)
+        g^2 = E||X - mu||^2 / E||P X - mu||^2
+        X^rel <- mu + g (P X - mu)
+    P is a row average: it leaves mu and shrinks X - mu, so without the rescale
+    the batch-shared direction dominates the Keys after LayerNorm. Needs several
+    videos per batch; one scalar g per forward.
+
+    `xvid_energy="frame"` puts the whole energy match on the frame mean m_f of
+    P X and leaves the within-frame residual as P made it:
+        X^rel <- mu + g (m_f - mu) + (P X - m_f)
+        g^2 = (E||X - mu||^2 - E||P X - m_f||^2) / E||m_f - mu||^2
+    The residual sums to zero over each frame, so it is orthogonal to m_f - mu
+    and the energy is matched exactly. Within-frame cosine stays at or above
+    plain P X.
+    `xvid_energy="frame_video"` is the same split with the video mean m_v of
+    raw X in place of the batch mean mu. m_f stays the frame mean of P X.
+    frames_per_video must be the contiguous frame count in the flattened batch:
+        X^rel <- m_v + g (m_f - m_v) + (P X - m_f)
+        g^2 = (E||X - m_v||^2 - E||P X - m_f||^2) / E||m_f - m_v||^2
+    `xvid_energy="video"` puts that match on the video mean m_v of P X and
+    leaves the within-video residual as P made it. mu stays the batch mean of
+    raw X. frames_per_video must divide the flattened batch:
+        X^rel <- mu + g (m_v - mu) + (P X - m_v)
+        g^2 = (E||X - mu||^2 - E||P X - m_v||^2) / E||m_v - mu||^2
+
+    `xvid_power=β` (xvid_energy=True only) applies g^β instead of g:
+        X^rel <- mu + g^β (P X - mu),  β in [0, 1]
+    β=0 is plain P X and β=1 the full match. Every token is scaled the same way,
+    so β only sets how far the batch-shared direction dominates after LayerNorm;
+    within-frame cosine moves smoothly from plain P X toward the full match.
+    `last_xvid_gain` is the applied g^β.
+
+    `xvid_energy="balance"` has no knob. With C the channel centering that
+    LayerNorm applies, it gives the batch-shared part and everything else equal
+    energy:
+        g_bal^2 = ||C mu||^2 / E||C (P X - mu)||^2,   g = clamp(g_bal, 1, g_full)
+        X^rel <- mu + g (P X - mu)
+    g_full is the "all" gain, so the result stays between plain P X and the
+    full match. The LN batch-shared share then sits near 50% (per-token norms
+    differ, so not exactly).
+
     The Fiedler is batched subspace iteration (k=2) plus a 2x2 Rayleigh-Ritz, not
     a full `eigh`. Isolated rows keep the original token.
 
@@ -258,6 +304,9 @@ class NcutRelationalLeveling(nn.Module):
         n8: bool = False,
         glob_n8_mix: float = 0.0,
         row_center: bool = False,
+        xvid_energy: Union[bool, str] = False,
+        xvid_power: float = 1.0,
+        fiedler_cut: str = "sym_median",
     ):
         super().__init__()
         self.chunk_size = max(int(chunk_size), 1)
@@ -265,8 +314,41 @@ class NcutRelationalLeveling(nn.Module):
         self.n_iter = max(int(n_iter), 1)
         self.n8 = bool(n8)
         self.barrier = bool(barrier)
+        cut = str(fiedler_cut).lower()
+        if cut not in ("sym_median", "rw_mean"):
+            raise ValueError(
+                "NcutRelationalLeveling: fiedler_cut must be 'sym_median' or "
+                f"'rw_mean', got {fiedler_cut!r}"
+            )
+        self.fiedler_cut = cut
         self.glob_n8_mix = float(glob_n8_mix)
         self.row_center = bool(row_center)
+        if isinstance(xvid_energy, str):
+            mode = xvid_energy.lower()
+            mode = {"true": "all", "false": "off", "none": "off"}.get(mode, mode)
+        else:
+            mode = "all" if xvid_energy else "off"
+        if mode not in ("off", "all", "frame", "frame_video", "video", "balance"):
+            raise ValueError(
+                "NcutRelationalLeveling: xvid_energy must be false, true, 'frame', "
+                f"'frame_video', 'video' or 'balance', got {xvid_energy!r}"
+            )
+        self.xvid_mode = mode
+        # Contiguous frames per video after MapOverTime flattens (B, T).
+        # frame_video and video read this; other modes ignore it.
+        self.frames_per_video: Optional[int] = None
+        self.xvid_power = float(xvid_power)
+        if not 0.0 <= self.xvid_power <= 1.0:
+            raise ValueError(
+                "NcutRelationalLeveling: xvid_power must be in [0, 1], "
+                f"got {self.xvid_power}"
+            )
+        if self.xvid_power != 1.0 and mode != "all":
+            raise ValueError(
+                "NcutRelationalLeveling: xvid_power != 1 requires xvid_energy=true, "
+                f"got xvid_energy={xvid_energy!r}"
+            )
+        self.last_xvid_gain: Optional[float] = None
         if self.glob_n8_mix < 0.0 or self.glob_n8_mix > 1.0:
             raise ValueError(
                 "NcutRelationalLeveling: glob_n8_mix must be in [0, 1], "
@@ -300,22 +382,26 @@ class NcutRelationalLeveling(nn.Module):
                 "NcutRelationalLeveling: row_center=True cannot use glob_n8_mix>0"
             )
 
-    def _fiedler(self, w_norm: torch.Tensor) -> torch.Tensor:
+    def _fiedler(self, w_norm: torch.Tensor, d_inv_sqrt: torch.Tensor) -> torch.Tensor:
         """2nd-largest eigenvector of W_norm (Fiedler of L = I - W_norm).
 
-        Batched subspace iteration on k=2, then Rayleigh-Ritz. Deterministic
-        init (constant + linspace) so chunking is bit-stable.
+        The largest eigenvector of D^{-1/2} W D^{-1/2} is D^{1/2} 1. One vector
+        is multiplied by W_norm and then that direction is removed. No QR.
+        Init is linspace, per sample, so chunk size does not change the vector.
         """
         bsz, n_tokens, _ = w_norm.shape
-        ones = torch.ones(bsz, n_tokens, 1, device=w_norm.device, dtype=w_norm.dtype)
+        # u ∝ D^{1/2} 1. d_inv_sqrt is the same D^{-1/2} that built W_norm.
+        u = d_inv_sqrt.unsqueeze(-1).reciprocal()
+        u = u / u.norm(dim=1, keepdim=True).clamp_min(self.eps)
         grid = torch.linspace(-1.0, 1.0, n_tokens, device=w_norm.device, dtype=w_norm.dtype)
-        x = torch.cat([ones, grid.view(1, n_tokens, 1).expand(bsz, -1, -1)], dim=-1)
+        v = grid.view(1, n_tokens, 1).expand(bsz, -1, -1).contiguous()
+        v = v - (v * u).sum(dim=1, keepdim=True) * u
+        v = v / v.norm(dim=1, keepdim=True).clamp_min(self.eps)
         for _ in range(self.n_iter):
-            x, _ = torch.linalg.qr(torch.bmm(w_norm, x))
-        rax = torch.bmm(x.transpose(1, 2), torch.bmm(w_norm, x))
-        rax = 0.5 * (rax + rax.transpose(1, 2))
-        _, evecs = torch.linalg.eigh(rax)  # ascending: col 0 = smaller = Fiedler
-        return torch.bmm(x, evecs)[:, :, 0]
+            v = torch.bmm(w_norm, v)
+            v = v - (v * u).sum(dim=1, keepdim=True) * u
+            v = v / v.norm(dim=1, keepdim=True).clamp_min(self.eps)
+        return v.squeeze(-1)
 
     @torch.no_grad()
     def explain(self, x: torch.Tensor) -> dict:
@@ -361,9 +447,15 @@ class NcutRelationalLeveling(nn.Module):
                 degree = w.sum(dim=-1).clamp_min(self.eps)
                 d_inv_sqrt = degree.rsqrt()
                 w_norm = d_inv_sqrt.unsqueeze(-1) * w * d_inv_sqrt.unsqueeze(-2)
-                v2 = self._fiedler(w_norm)
-                threshold = v2.median(dim=-1, keepdim=True).values
-                region = v2 >= threshold  # (B, N)
+                v2 = self._fiedler(w_norm, d_inv_sqrt)
+                if self.fiedler_cut == "rw_mean":
+                    # y solves (D - W) y = λ D y. Mean threshold, not median.
+                    score = d_inv_sqrt * v2
+                    threshold = score.mean(dim=-1, keepdim=True)
+                else:
+                    score = v2
+                    threshold = v2.median(dim=-1, keepdim=True).values
+                region = score >= threshold  # (B, N)
                 same = region.unsqueeze(-1) == region.unsqueeze(-2)
                 w_tilde = w.masked_fill(~same, 0.0)
             else:
@@ -387,13 +479,80 @@ class NcutRelationalLeveling(nn.Module):
         return rel
 
     @torch.no_grad()
+    def _xvid_rescale(self, x: torch.Tensor, rel: torch.Tensor) -> torch.Tensor:
+        with torch.cuda.amp.autocast(enabled=False):
+            xf, rf = x.float(), rel.float()
+            mu = xf.mean(dim=(0, 1), keepdim=True)
+            num = (xf - mu).square().sum(-1).mean()
+            if self.xvid_mode == "frame":
+                m = rf.mean(dim=1, keepdim=True)
+                resid = rf - m
+                num = (num - resid.square().sum(-1).mean()).clamp_min(0.0)
+                den = (m - mu).square().sum(-1).mean().clamp_min(self.eps)
+                gain = (num / den).sqrt()
+                out = mu + gain * (m - mu) + resid
+            elif self.xvid_mode == "frame_video":
+                t = self.frames_per_video
+                if t is None or t < 1 or xf.shape[0] % int(t) != 0:
+                    raise ValueError(
+                        "NcutRelationalLeveling frame_video needs frames_per_video "
+                        f"to divide the batch, got T={t} and batch {xf.shape[0]}"
+                    )
+                b = xf.shape[0] // int(t)
+                n, d = xf.shape[1], xf.shape[2]
+                xx = xf.view(b, int(t), n, d)
+                rr = rf.view(b, int(t), n, d)
+                m_v = xx.mean(dim=(1, 2), keepdim=True)
+                m_f = rr.mean(dim=2, keepdim=True)
+                resid = rr - m_f
+                num = (
+                    (xx - m_v).square().sum(-1).mean() - resid.square().sum(-1).mean()
+                ).clamp_min(0.0)
+                den = (m_f - m_v).square().sum(-1).mean().clamp_min(self.eps)
+                gain = (num / den).sqrt()
+                out = (m_v + gain * (m_f - m_v) + resid).reshape(xf.shape)
+            elif self.xvid_mode == "video":
+                t = self.frames_per_video
+                if t is None or t < 1 or xf.shape[0] % int(t) != 0:
+                    raise ValueError(
+                        "NcutRelationalLeveling video needs frames_per_video "
+                        f"to divide the batch, got T={t} and batch {xf.shape[0]}"
+                    )
+                b = xf.shape[0] // int(t)
+                n, d = xf.shape[1], xf.shape[2]
+                rr = rf.view(b, int(t), n, d)
+                m_v = rr.mean(dim=(1, 2), keepdim=True)
+                resid = rr - m_v
+                num = (num - resid.square().sum(-1).mean()).clamp_min(0.0)
+                den = (m_v - mu).square().sum(-1).mean().clamp_min(self.eps)
+                gain = (num / den).sqrt()
+                out = (mu + gain * (m_v - mu) + resid).reshape(xf.shape)
+            elif self.xvid_mode == "balance":
+                d = rf - mu
+                g_full = (num / d.square().sum(-1).mean().clamp_min(self.eps)).sqrt()
+                shared = (mu - mu.mean(-1, keepdim=True)).square().sum()
+                rest = (d - d.mean(-1, keepdim=True)).square().sum(-1).mean()
+                gain = (shared / rest.clamp_min(self.eps)).sqrt()
+                gain = torch.minimum(gain.clamp_min(1.0), g_full.clamp_min(1.0))
+                out = mu + gain * d
+            else:
+                den = (rf - mu).square().sum(-1).mean().clamp_min(self.eps)
+                gain = (num / den).sqrt().pow(self.xvid_power)
+                out = mu + gain * (rf - mu)
+            self.last_xvid_gain = float(gain)
+            return out.to(dtype=rel.dtype)
+
+    @torch.no_grad()
     def _level(self, x: torch.Tensor) -> torch.Tensor:
         outs = []
         for i in range(0, x.shape[0], self.chunk_size):
             chunk = x[i : i + self.chunk_size]
             rel = self._level_chunk(chunk.float()).to(dtype=chunk.dtype)
             outs.append(rel)
-        return torch.cat(outs, dim=0)
+        rel = torch.cat(outs, dim=0)
+        if self.xvid_mode != "off":
+            rel = self._xvid_rescale(x, rel)
+        return rel
 
     def forward(self, x: torch.Tensor, mix: float) -> torch.Tensor:
         mix = float(mix)
@@ -564,6 +723,9 @@ class FrameEncoder(nn.Module):
         self.feature_ncut: Optional[nn.Module] = None
         self.feature_ncut_mix: float = 1.0
         self.feature_curriculum_apply: str = "tokens"
+        # bind: mix in DINO space, then MLP. post_ln: P stays on DINO, and the
+        # slot keys are blended after LayerNorm and W_k.
+        self.key_mix: str = "bind"
 
     def _curriculum_bind(self, tokens: torch.Tensor) -> torch.Tensor:
         """Train-only coarsened tokens (X^bind). Eval and mix=1 skip this."""
@@ -593,6 +755,27 @@ class FrameEncoder(nn.Module):
             return tokens, bind
         return bind, bind
 
+    def _post_ln_endpoints(
+        self, tokens: torch.Tensor
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """(raw X, DINO X^bind for π, X^rel for the key endpoint).
+
+        Active only for key_mix=post_ln while training and s < 1. The graph
+        runs once at s=0. π still sees (1-s) X^rel + s X.
+        """
+        if str(self.key_mix).lower() != "post_ln":
+            return None
+        if not self.training or tokens.ndim != 3:
+            return None
+        if str(self.feature_curriculum_apply).lower() != "key":
+            return None
+        if self.feature_ncut is None or float(self.feature_ncut_mix) >= 1.0:
+            return None
+        rel = self.feature_ncut(tokens, 0.0)
+        mix = float(self.feature_ncut_mix)
+        bind = (1.0 - mix) * rel + mix * tokens
+        return tokens, bind.to(dtype=tokens.dtype), rel
+
     def _project_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         features = tokens.clone()
         if self.pos_embed:
@@ -609,18 +792,34 @@ class FrameEncoder(nn.Module):
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         # images: batch x n_channels x height x width
         backbone_features = self.backbone(images)
+        rel_tokens = None
         if isinstance(backbone_features, dict):
             main = backbone_features[self.main_features_key]
-            target_tokens, key_tokens = self._curriculum_target_and_key(main)
+            post = self._post_ln_endpoints(main)
+            if post is None:
+                target_tokens, key_tokens = self._curriculum_target_and_key(main)
+            else:
+                target_tokens, key_tokens, rel_tokens = post
             backbone_features[self.main_features_key] = target_tokens
         else:
-            target_tokens, key_tokens = self._curriculum_target_and_key(backbone_features)
+            post = self._post_ln_endpoints(backbone_features)
+            if post is None:
+                target_tokens, key_tokens = self._curriculum_target_and_key(
+                    backbone_features
+                )
+            else:
+                target_tokens, key_tokens, rel_tokens = post
             backbone_features = target_tokens
 
         features = self._project_tokens(target_tokens)
-        features_key = (
-            None if key_tokens is target_tokens else self._project_tokens(key_tokens)
-        )
+        if rel_tokens is not None:
+            features_key = features
+            features_key_rel = self._project_tokens(rel_tokens)
+        else:
+            features_key = (
+                None if key_tokens is target_tokens else self._project_tokens(key_tokens)
+            )
+            features_key_rel = None
 
         if isinstance(backbone_features, dict):
             for k, backbone_feature in backbone_features.items():
@@ -647,8 +846,10 @@ class FrameEncoder(nn.Module):
             }
         if features_key is not None:
             out["features_key"] = features_key
-            # DINO-dim X^bind for spectral purity; projected Keys are features_key.
+            # DINO-dim X^bind for spectral purity. post_ln keys are blended later.
             out["backbone_key"] = key_tokens
+        if features_key_rel is not None:
+            out["features_key_rel"] = features_key_rel
         return out
 
 

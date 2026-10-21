@@ -34,6 +34,7 @@ def test_mlp_decoder(eval_upscale):
     assert outp["masks"].shape == (1, n_slots, n_output_patches)
     assert outp["masks"].min() >= 0.0 and outp["masks"].max() <= 1.0
     assert "slot_recons" not in outp
+    assert torch.allclose(torch.softmax(outp["alpha"], dim=1), outp["masks"])
 
 
 def test_mlp_decoder_slot_recons_matches_mix():
@@ -64,6 +65,12 @@ def test_mlp_decoder_return_ungated_matches_no_gate():
     assert not torch.allclose(both["reconstruction"], plain["reconstruction"], atol=1e-4)
     assert torch.allclose(both["masks"], decoder(inp, gate)["masks"], atol=1e-5)
     assert torch.allclose(both["masks_ungated"], plain["masks"], atol=1e-5)
+    assert torch.allclose(torch.softmax(both["alpha"], dim=1), both["masks_ungated"], atol=1e-5)
+    g = gate[:, :, None]
+    ungated = torch.softmax(both["alpha"], dim=1)
+    gated = ungated * (g + 1e-8)
+    gated = gated / gated.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    assert torch.allclose(gated, both["masks"], atol=1e-5)
 
 
 def test_mlp_decoder_ungated_complement_uses_pi_gap():

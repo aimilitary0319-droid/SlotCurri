@@ -108,9 +108,12 @@ class MLPDecoder(nn.Module):
         slots = slots + pos_emb
 
         recons, alpha = self.mlp(slots).split((self.outp_dim, 1), dim=-1)
+        # Raw slot logits, before any gate fill. SSync distills this α.
+        # Hard gating below rebinds `alpha` for the mix only.
+        alpha_raw = alpha
         # Softmax-over-slots mix with no gate. Same α / recon_s as the gated
         # path; only the mix weights change. Used by loss_featrec_ungated.
-        masks_ungated = torch.softmax(alpha, dim=1) if return_ungated else None
+        masks_ungated = torch.softmax(alpha_raw, dim=1) if return_ungated else None
 
         if active_mask is None:
             masks = torch.softmax(alpha, dim=1)
@@ -144,7 +147,11 @@ class MLPDecoder(nn.Module):
 
         recon = torch.sum(recons * masks, dim=1)
 
-        out = {"reconstruction": recon, "masks": masks.squeeze(-1)}
+        out = {
+            "reconstruction": recon,
+            "masks": masks.squeeze(-1),
+            "alpha": alpha_raw.squeeze(-1),
+        }
         if return_slot_recons:
             out["slot_recons"] = recons
         if return_ungated:

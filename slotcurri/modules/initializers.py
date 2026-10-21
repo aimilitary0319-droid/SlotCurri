@@ -29,16 +29,43 @@ class RandomInit(nn.Module):
 
 
 class FixedLearnedInit(nn.Module):
-    """Learned initialization with a fixed number of slots."""
+    """Learned initialization with a fixed number of slots.
 
-    def __init__(self, n_slots: int, dim: int, initial_std: Optional[float] = None):
+    Default draws each slot independently from N(0, 1/dim). `shared_init`
+    draws one shared vector and one noise vector per slot, both N(0, 1),
+    and stores slot = shared + noise. `identical_init` copies one N(0, 1)
+    vector into every slot, so the rows start equal. Either draw happens
+    once. Later steps train these vectors; they are not resampled.
+    """
+
+    def __init__(
+        self,
+        n_slots: int,
+        dim: int,
+        initial_std: Optional[float] = None,
+        shared_init: bool = False,
+        identical_init: bool = False,
+    ):
         super().__init__()
         self.n_slots = n_slots
         self.dim = dim
         if initial_std is None:
             initial_std = dim**-0.5
         self.initial_std = initial_std
-        self.slots = nn.Parameter(torch.randn(1, n_slots, dim) * initial_std)
+        self.shared_init = bool(shared_init)
+        self.identical_init = bool(identical_init)
+        if self.shared_init and self.identical_init:
+            raise ValueError("shared_init and identical_init cannot both be set")
+        if self.identical_init:
+            shared = torch.randn(1, 1, dim)
+            slots = shared.expand(1, n_slots, dim).clone()
+        elif self.shared_init:
+            shared = torch.randn(1, 1, dim)
+            noise = torch.randn(1, n_slots, dim)
+            slots = shared + noise
+        else:
+            slots = torch.randn(1, n_slots, dim) * initial_std
+        self.slots = nn.Parameter(slots)
 
     def forward(self, batch_size: int):
         return self.slots.expand(batch_size, -1, -1)

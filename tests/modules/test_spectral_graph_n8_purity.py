@@ -12,6 +12,7 @@ from slotcurri.modules.video import (
     _apply_r_n8,
     _apply_s_n8,
     _n8_affinity,
+    _n8_s_factors,
     _n8_gather,
     _pad1_hw,
     _shift_hw,
@@ -141,6 +142,105 @@ def test_n8_kernels_match_shift_hw_reference():
     assert torch.equal(weights, w_ref)
     assert torch.equal(_apply_s_n8(d_inv, weights, vec), _apply_s_n8_shift_hw(d_inv, weights, vec))
     assert torch.equal(_apply_r_n8(weights, vec), _apply_r_n8_shift_hw(weights, vec))
+
+
+def _n8_dinv_rr_dense(z, eps=1e-6):
+    """S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}, D̃_ii = sum_j R_ij^2."""
+    bsz, n_tokens, _ = z.shape
+    grid = int(math.sqrt(n_tokens))
+    rel = z.new_zeros(bsz, n_tokens, n_tokens)
+    for y in range(grid):
+        for x in range(grid):
+            i = y * grid + x
+            for dy, dx in _N8_OFFSETS:
+                yy, xx = y + dy, x + dx
+                if 0 <= yy < grid and 0 <= xx < grid:
+                    j = yy * grid + xx
+                    rel[:, i, j] = (z[:, i] * z[:, j]).sum(dim=-1).clamp_min(0.0)
+    squared = rel * rel
+    deg = squared.sum(dim=-1).clamp_min(eps)
+    d_inv = deg.rsqrt()
+    return d_inv.unsqueeze(-1) * squared * d_inv.unsqueeze(-2)
+
+
+def test_dinv_rr_matches_degree_scaled_squared_affinity():
+    torch.manual_seed(0)
+    z = torch.nn.functional.normalize(torch.randn(2, 16, 5), dim=-1)
+    vec = torch.randn(2, 16, 3)
+    d_inv, weights = _n8_s_factors(z, 1e-6, "dinv_rr")
+    got = _apply_s_n8(d_inv, weights, vec)
+    exp = torch.bmm(_n8_dinv_rr_dense(z), vec)
+    assert torch.allclose(got, exp, atol=1e-5, rtol=1e-5)
+    sym_d, sym_w = _n8_s_factors(z, 1e-6, "sym")
+    sym = _apply_s_n8(sym_d, sym_w, vec)
+    assert not torch.allclose(got, sym, atol=1e-4)
+
+
+def test_processor_gate_uses_dinv_rr_when_asked():
+    torch.manual_seed(1)
+    att = torch.softmax(torch.randn(2, 3, 16), dim=1)
+    feat = torch.randn(2, 16, 5)
+    processor = LatentProcessor(StubCorrector(att), predictor=None)
+    kwargs = dict(
+        gate_p=None,
+        default_idx=[],
+        gate_form="purity_weight",
+        conf_kind="spectral_graph_n8_lam1",
+        bind_features=feat,
+        state_max_norm=True,
+    )
+    out = processor(torch.randn(2, 3, 8), torch.randn(2, 16, 8), s_form="dinv_rr", **kwargs)
+    expected, _, _ = spectral_graph_n8_eigs(att, feat, use_lambda1=True, s_form="dinv_rr")
+    assert torch.allclose(out["active_mask"], expected, atol=1e-5)
+    plain = processor(torch.randn(2, 3, 8), torch.randn(2, 16, 8), **kwargs)
+    assert not torch.allclose(out["active_mask"], plain["active_mask"], atol=1e-4)
+
+
+def test_dense_gate_uses_every_pair():
+    torch.manual_seed(0)
+    feat = torch.randn(1, 5, 4)
+    att = torch.softmax(torch.randn(1, 2, 5), dim=1)
+    pi, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, s_form="dinv_rr", gate_graph="dense", n_iter=6
+    )
+    assert pi.shape == (1, 2)
+    assert torch.isfinite(pi).all()
+    z = torch.nn.functional.normalize(feat.float(), dim=-1)
+    rel = torch.bmm(z, z.transpose(1, 2)).clamp_min(0)
+    rel.diagonal(dim1=-2, dim2=-1).zero_()
+    squared = rel * rel
+    deg = squared.sum(-1).clamp_min(1e-6)
+    s = deg.rsqrt().unsqueeze(-1) * squared * deg.rsqrt().unsqueeze(-2)
+    from slotcurri.modules.video import _relation_graph_S
+
+    assert torch.allclose(_relation_graph_S(z, 1e-6, "dinv_rr"), s, atol=1e-5)
+
+
+def test_rwmean_yaml_uses_dinv_rr_gate_graph():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/movi_e_attnmass_v39lam1gu_rwmean.yaml"
+    )
+    amc = cfg.model.attn_mass_curriculum
+    assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+    assert amc["s_form"] == "dinv_rr"
+    assert amc["gate_graph"] == "n8"
+    assert "xvid_energy" not in cfg.model.feature_curriculum
+    xframe = configuration.load_config(
+        "configs/slotcurri/movi_e_attnmass_v39lam1gu_rwmean_xframe.yaml"
+    )
+    assert xframe.experiment_name == "movi_e_attnmass_v39lam1gu_rwmean_xframe"
+    assert xframe.model.feature_curriculum["xvid_energy"] == "frame"
+    assert xframe.model.feature_curriculum["fiedler_cut"] == "rw_mean"
+    assert xframe.model.attn_mass_curriculum["s_form"] == "dinv_rr"
+    assert xframe.model.attn_mass_curriculum["gate_graph"] == "n8"
+    assert xframe.model.initializer["shared_init"] is True
+    plain = configuration.load_config(
+        "configs/slotcurri/movi_e_attnmass_v39lam1gu.yaml"
+    )
+    assert plain.model.attn_mass_curriculum.get("s_form", "sym") == "sym"
+    assert plain.model.attn_mass_curriculum.get("gate_graph", "n8") == "n8"
 
 
 def test_matches_hand_formula_and_is_detached():
@@ -659,6 +759,41 @@ def test_sqrt_pi_is_sqrt_of_lam1_on_original_g():
         conf_kind="spectral_graph_n8_lam1",
         bind_features=feat,
         sqrt_pi=True,
+    )
+    assert torch.allclose(out["active_mask"], pi, atol=1e-5)
+
+
+def test_a_slot_max_divides_a_by_per_patch_winner():
+    """v39lam1gu_nomaxnorm_amax: G reads a / max_s a. Winner on each patch is 1."""
+    torch.manual_seed(0)
+    att = torch.softmax(torch.randn(2, 3, 16), dim=1)
+    feat = torch.randn(2, 16, 6)
+    z = torch.nn.functional.normalize(feat.float(), dim=-1)
+    a = att.float()
+    a_n = a / a.amax(dim=1, keepdim=True).clamp_min(1e-6)
+    assert torch.allclose(a_n.amax(dim=1), torch.ones_like(a_n[:, 0]))
+    lam1, _ = _top2_algebraic_n8(
+        z, a_n, n_iter=16, eps=1e-6, lam1_only=True
+    )
+    pi, lam1_out, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, a_slot_max=True, chunk_size=1
+    )
+    assert torch.allclose(pi, lam1.clamp_min(0.0), atol=1e-6)
+    assert torch.allclose(lam1_out, lam1, atol=1e-6)
+    plain, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, chunk_size=1
+    )
+    assert not torch.allclose(pi, plain, atol=1e-3)
+    processor = LatentProcessor(StubCorrector(att), predictor=None)
+    out = processor(
+        torch.randn(2, 3, 8),
+        torch.randn(2, 16, 8),
+        gate_p=None,
+        default_idx=[],
+        gate_form="purity_weight",
+        conf_kind="spectral_graph_n8_lam1",
+        bind_features=feat,
+        a_slot_max=True,
     )
     assert torch.allclose(out["active_mask"], pi, atol=1e-5)
 

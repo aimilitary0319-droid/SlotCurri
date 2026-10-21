@@ -109,6 +109,43 @@ def test_no_barrier_is_global_relu_cosine_leveling():
     assert bool(exp_cut["region"].any()) and bool((~exp_cut["region"]).any())
 
 
+def test_fiedler_matches_second_eigenvector():
+    """Deflated power iteration tracks the 2nd-largest eigenvector of S."""
+    x = _two_cluster_tokens(n_per=8, noise=0.05)
+    ncut = NcutRelationalLeveling(chunk_size=1, barrier=True, n_iter=8)
+    exp = ncut.explain(x)
+    z = F.normalize(x.float(), dim=-1)
+    w = torch.bmm(z, z.transpose(1, 2)).clamp_min(0)
+    w.diagonal(dim1=-2, dim2=-1).zero_()
+    degree = w.sum(-1).clamp_min(ncut.eps)
+    d_inv = degree.rsqrt()
+    s = d_inv.unsqueeze(-1) * w * d_inv.unsqueeze(-2)
+    evals, evecs = torch.linalg.eigh(s[0])
+    exact = evecs[:, -2]
+    got = exp["v2"][0]
+    cos = float((exact * got).sum().abs() / (exact.norm() * got.norm()).clamp_min(1e-8))
+    assert cos > 0.99
+
+
+def test_rw_mean_uses_degree_scaled_fiedler():
+    """y = D^{-1/2} v, cut at mean(y). Partition matches that rule."""
+    x = _two_cluster_tokens(n_per=6, noise=0.05)
+    # Unequal degrees: repeat the first cluster so one side has more mass.
+    x = torch.cat([x[:, :6].repeat(1, 3, 1), x[:, 6:]], dim=1)
+    ncut = NcutRelationalLeveling(chunk_size=1, barrier=True, fiedler_cut="rw_mean")
+    exp = ncut.explain(x)
+    z = F.normalize(x.float(), dim=-1)
+    w = torch.bmm(z, z.transpose(1, 2)).clamp_min(0)
+    w.diagonal(dim1=-2, dim2=-1).zero_()
+    degree = w.sum(-1).clamp_min(ncut.eps)
+    y = degree.rsqrt() * exp["v2"]
+    expect = y >= y.mean(dim=-1, keepdim=True)
+    assert torch.equal(exp["region"], expect)
+    # Sign of v flips the labels, not the groups.
+    same = exp["region"].unsqueeze(-1) == exp["region"].unsqueeze(-2)
+    assert bool(same.any()) and bool((~same).any())
+
+
 def test_no_barrier_blockdiag_still_does_not_mix_orthogonal_clusters():
     # Cross-cluster ReLU cosine is 0, so global P is still block-diagonal.
     x = _two_cluster_tokens(noise=0.0)

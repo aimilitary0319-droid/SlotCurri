@@ -40,6 +40,8 @@ class ModelConfig:
     # First N training steps replace the λ1 gate with ones (decoder, temporal
     # mix, Pred source gate). Key curriculum keeps its own clock. 0 disables.
     slotcontrast_steps: int = 0
+    # Log raw-π and Slot Attention competition stats under diag/ (train only).
+    diag_log: bool = False
     attn_mass_curriculum: Optional[Dict[str, Any]] = None
     # Direction-only supervision on the predictor's residual step. Requires the predictor to
     # be built with vel_dim, since without the velocity input there is little for it to fit.
@@ -88,6 +90,13 @@ class ModelConfig:
     modules_to_load: Optional[Dict[str, str]] = None
     experiment_name: Optional[str] = "default_experiment"
     experiment_group: Optional[str] = "default_group"
+    # SSync selective distillation. Absent unless the two cls losses are set.
+    # synergistic_start_step is an absolute step, not a fraction of max_steps.
+    dif_n_bd: int = 1
+    dif_n_nbd: int = 1
+    dif_n_bd_noise: int = 1
+    merge_iou_threshold: float = 0.7
+    synergistic_start_step: Optional[int] = None
 
 
 @dataclass

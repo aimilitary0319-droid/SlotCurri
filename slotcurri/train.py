@@ -1,8 +1,10 @@
 import argparse
+import json
 import logging
 import os
 import pathlib
 import random
+import time
 import warnings
 from typing import Any, Dict, Optional
 
@@ -150,6 +152,40 @@ def _setup_trainer_config(trainer_config: Dict[str, Any]) -> Dict[str, Any]:
     return trainer_config
 
 
+def _resolve_feature_curriculum_start(model, config, args, log_path, seed: int) -> None:
+    """Set s0 from one random frame per training video when mix_start is auto.
+
+    Rank 0 estimates once and records the median in the log dir. Later processes
+    and resumes read that file, so a restart does not draw a new s0.
+    """
+    if not getattr(model, "featcur_mix_start_auto", False):
+        return
+    cached = os.environ.get("FEATCUR_MIX_START")
+    if cached:
+        model.featcur_mix_start = float(cached)
+        log_info(f"Feature-curriculum s0 = {model.featcur_mix_start:.6f} (from parent)")
+        return
+    from slotcurri.featcur_start import load_or_estimate_mix_start
+
+    if utils.get_rank() != 0:
+        path = None if log_path is None else log_path / "featcur_mix_start.json"
+        deadline = time.time() + 6 * 60 * 60
+        while path is not None and not path.is_file():
+            if time.time() > deadline:
+                raise RuntimeError(f"Timed out waiting for {path}")
+            time.sleep(2.0)
+        if path is None or not path.is_file():
+            raise RuntimeError("mix_start=auto on a non-zero rank has no saved s0")
+        with open(path) as f:
+            model.featcur_mix_start = float(json.load(f)["mix_start"])
+    else:
+        model.featcur_mix_start = load_or_estimate_mix_start(
+            config, log_path, args.data_dir, seed
+        )
+    os.environ["FEATCUR_MIX_START"] = f"{model.featcur_mix_start:.8f}"
+    log_info(f"Feature-curriculum s0 = {model.featcur_mix_start:.6f}")
+
+
 def main(args, config_overrides=None):
     rank_zero = utils.get_rank() == 0
     if config_overrides is None:
@@ -238,6 +274,7 @@ def main(args, config_overrides=None):
         val_metrics = None
 
     model = models.build(config.model, config.optimizer, train_metrics, val_metrics)
+    _resolve_feature_curriculum_start(model, config, args, log_path, seed)
 
     callbacks = _setup_callbacks(args, config, log_path, dataset)
     loggers = _setup_loggers(args, config, log_path)

@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Rectangle
 
 from slotcurri import configuration, data, models
@@ -30,10 +31,25 @@ CKPT = ROOT / "logs/_ytvis_attnmass_v39lam1gu/checkpoints/slotcurri_step=step=10
 DATA_DIR = os.environ.get("VIDEOSAUR_DATA_DIR", "/workspace/dataset")
 
 NAVY = "#1F3A5F"
-RUST = "#C45C26"
+RUST = "#C45C26"  # attention a_s
+REL = "#D8D8D8"  # relation edges R and S
+SLOT_COLORS = (
+    "#E23B3B",
+    "#2F6FED",
+    "#1AAE6F",
+    "#F0A202",
+    "#7B3FF2",
+    "#E85D9A",
+    "#14B8C4",
+)
 INK = "#111111"
 GRAY = "#6E6E6E"
 N8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+
+
+def _hex_rgb(hex_color: str) -> tuple[float, float, float]:
+    h = hex_color.lstrip("#")
+    return tuple(int(h[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
 
 
 def style() -> None:
@@ -272,7 +288,7 @@ def panel_relu(ax, rgb, z, grid, q):
     xpix0, xpix1 = int(round(x0 * pw)), int(round((x1 + 1) * pw))
     crop = rgb[ypix0:ypix1, xpix0:xpix1]
     ch, cw = crop.shape[:2]
-    ax.imshow(np.clip(crop * 0.78, 0, 1), origin="upper")
+    ax.imshow(np.clip(crop * 0.92, 0, 1), origin="upper")
     gy, gx = y1 - y0 + 1, x1 - x0 + 1
     for k in range(gx + 1):
         x = k * cw / gx
@@ -294,31 +310,28 @@ def panel_relu(ax, rgb, z, grid, q):
                 if (y2, x2) <= (y, x):
                     continue
                 r = max(0.0, float(np.dot(z[i], z[y2 * grid + x2])))
-                t = float(np.clip((r - 0.35) / 0.60, 0.0, 1.0)) ** 1.4
-                if t < 0.04:
-                    continue
                 x_a, y_a = loc(x, y)
                 x_b, y_b = loc(x2, y2)
                 ax.plot(
                     [x_a, x_b],
                     [y_a, y_b],
-                    color=(1.0, 1.0, 1.0, 0.08 + 0.42 * t),
-                    lw=0.35 + 1.7 * t,
+                    color=(*_hex_rgb(REL), 0.08 + 0.82 * r),
+                    lw=0.25 + 1.7 * r,
                     zorder=4,
                     solid_capstyle="round",
                 )
-    # one patch: 8-neighbor stencil, width ∝ ReLU cosine
+    # one patch: 8-neighbor stencil, still gray
     cx, cy = loc(qx, qy)
-    ax.add_patch(Circle((cx, cy), 0.38 * cw / gx, facecolor=RUST, edgecolor="white", lw=1.2, zorder=6))
+    ax.add_patch(Circle((cx, cy), 0.34 * cw / gx, facecolor=REL, edgecolor="white", lw=1.0, zorder=6))
     for dy, dx in N8:
         y2, x2 = qy + dy, qx + dx
         if not (x0 <= x2 <= x1 and y0 <= y2 <= y1):
             continue
         r = max(0.0, float(np.dot(z[q], z[y2 * grid + x2])))
         nx, ny = loc(x2, y2)
-        ax.plot([cx, nx], [cy, ny], color=RUST, lw=0.7 + 4.2 * r, zorder=7, solid_capstyle="round")
+        ax.plot([cx, nx], [cy, ny], color=REL, lw=0.8 + 2.6 * r, zorder=7, solid_capstyle="round")
         ax.add_patch(
-            Circle((nx, ny), 0.26 * cw / gx, facecolor="white", edgecolor=RUST, lw=1.1, zorder=8)
+            Circle((nx, ny), 0.22 * cw / gx, facecolor="white", edgecolor=REL, lw=1.0, zorder=8)
         )
     ax.set_xlim(0, cw)
     ax.set_ylim(ch, 0)
@@ -327,18 +340,81 @@ def panel_relu(ax, rgb, z, grid, q):
     caption(ax, r"$R_{ij}=\mathrm{ReLU}(z_i^{T}\,z_j)$  if $j\in N_8(i)$, else 0")
 
 
-def panel_gate(ax, rgb, z, a, grid):
+def relation_edges(z: np.ndarray, grid: int):
+    """Undirected 8-neighbor edges with S_ij = R_ij / sqrt(d_i d_j)."""
+    n = grid * grid
+    deg = np.zeros(n, dtype=np.float64)
+    raw = []
+    for y in range(grid):
+        for x in range(grid):
+            i = y * grid + x
+            for dy, dx in N8:
+                y2, x2 = y + dy, x + dx
+                if not (0 <= y2 < grid and 0 <= x2 < grid):
+                    continue
+                j = y2 * grid + x2
+                if j <= i:
+                    continue
+                r = max(0.0, float(np.dot(z[i], z[j])))
+                deg[i] += r
+                deg[j] += r
+                raw.append((x, y, x2, y2, i, j, r))
+    dinv = 1.0 / np.sqrt(np.clip(deg, 1e-8, None))
+    edges = []
+    for x, y, x2, y2, i, j, r in raw:
+        edges.append((x, y, x2, y2, r * dinv[i] * dinv[j]))
+    return edges
+
+
+def panel_s(ax, rgb, z, grid, box=None):
+    """Full frame: every 8-neighbor relation edge, width ∝ S. Gray, not attention."""
+    h, w = rgb.shape[:2]
+    xs, ys = centers(grid, h, w)
+    ax.imshow(rgb, origin="upper")
+    edges = relation_edges(z, grid)
+    sval = np.array([e[-1] for e in edges], dtype=np.float64)
+    t = sval / max(float(sval.max()), 1e-8)
+    segs = [[(xs[x], ys[y]), (xs[x2], ys[y2])] for x, y, x2, y2, _ in edges]
+    rel = np.zeros((len(t), 4))
+    rel[:, 0] = rel[:, 1] = rel[:, 2] = 0.90
+    rel[:, 3] = 0.10 + 0.80 * t
+    ax.add_collection(
+        LineCollection(segs, colors=rel, linewidths=0.25 + 1.15 * t, zorder=4, capstyle="round")
+    )
+    if box is not None:
+        x0, y0, x1, y1 = box
+        pw, ph = w / grid, h / grid
+        box_xy = (x0 * pw, y0 * ph)
+        box_wh = ((x1 - x0 + 1) * pw, (y1 - y0 + 1) * ph)
+        ax.add_patch(
+            Rectangle(
+                box_xy, *box_wh, fill=False, edgecolor="white", lw=3.4, zorder=6,
+            )
+        )
+        ax.add_patch(
+            Rectangle(
+                box_xy, *box_wh, fill=False, edgecolor="#4A4A4A", lw=1.7, zorder=7,
+            )
+        )
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.set_axis_off()
+    ax.set_title(r"(a)  $S$ on the whole frame", fontsize=13, color=INK, loc="left", pad=8)
+    caption(ax, r"gray edges: $S_{ij}=R_{ij}/\sqrt{d_i d_j}$ on every 8-neighbor")
+
+
+def panel_gate(ax, rgb, z, a, grid, title: str, node_scale: float = 1.0):
     h, w = rgb.shape[:2]
     xs, ys = centers(grid, h, w)
     pw, ph = w / grid, h / grid
-    ax.imshow(rgb * 0.50, origin="upper")
+    ax.imshow(np.clip(rgb * 0.62, 0, 1), origin="upper")
     a_hw = a.reshape(grid, grid)
     ax.imshow(
         a_hw,
-        cmap="Blues",
+        cmap="Oranges",
         origin="upper",
         extent=[0, w, h, 0],
-        alpha=0.28,
+        alpha=0.30,
         interpolation="nearest",
         vmin=0.0,
         vmax=max(float(a.max()), 1e-6),
@@ -348,6 +424,7 @@ def panel_gate(ax, rgb, z, a, grid):
     segs, widths, cols = [], [], []
     ath = 0.40 * float(a.max())
     keep = peak_component(a, grid, ath)
+    rust = _hex_rgb(RUST)
     for i, j, x, y, x2, y2 in pairs:
         if not (keep[i] and keep[j]):
             continue
@@ -357,11 +434,11 @@ def panel_gate(ax, rgb, z, a, grid):
             continue
         segs.append([(xs[x], ys[y]), (xs[x2], ys[y2])])
         t = float(np.clip(g, 0.0, 1.0))
-        widths.append(0.35 + 1.1 * t)
-        cols.append((1.0, 0.92, 0.72, 0.25 + 0.45 * t))
+        widths.append((0.30 + 0.95 * t) * node_scale)
+        cols.append((*rust, 0.35 + 0.55 * t))
     if segs:
-        ax.add_collection(LineCollection(segs, colors=cols, linewidths=widths, zorder=4))
-    r0 = 0.28 * min(pw, ph)
+        ax.add_collection(LineCollection(segs, colors=cols, linewidths=widths, zorder=4, capstyle="round"))
+    r0 = 0.22 * min(pw, ph) * node_scale
     for i in range(grid * grid):
         if not keep[i]:
             continue
@@ -369,19 +446,71 @@ def panel_gate(ax, rgb, z, a, grid):
         ax.add_patch(
             Circle(
                 (xs[x], ys[y]),
-                r0 * (0.40 + 0.70 * float(a[i])),
+                r0 * (0.45 + 0.70 * float(a[i])),
                 facecolor=RUST,
                 edgecolor="white",
-                lw=0.35,
-                alpha=0.90,
+                lw=0.25,
+                alpha=0.92,
                 zorder=6,
             )
         )
     ax.set_xlim(0, w)
     ax.set_ylim(h, 0)
     ax.set_axis_off()
-    ax.set_title(r"(c)  Weight by this slot's $a_s$", fontsize=13, color=INK, loc="left", pad=8)
-    caption(ax, r"$S=D^{-1/2}RD^{-1/2}$" + "    " + r"$G_s=\mathrm{diag}(a_s)\,S\,\mathrm{diag}(a_s)$")
+    ax.set_title(title, fontsize=11, color=INK, loc="left", pad=4)
+
+
+def panel_all_slots(ax, rgb, z, att, grid):
+    """Every slot's graph on one frame. Same drawing as before, more transparent."""
+    h, w = rgb.shape[:2]
+    xs, ys = centers(grid, h, w)
+    pw, ph = w / grid, h / grid
+    ax.imshow(rgb, origin="upper")
+    pairs = n8_undirected(grid)
+    n_slots = int(att.shape[0])
+    order = sorted(range(n_slots), key=lambda k: float(att[k].sum()), reverse=True)
+    r0 = 0.18 * min(pw, ph)
+    for draw_i, k in enumerate(order):
+        a_s = att[k]
+        color = _hex_rgb(SLOT_COLORS[k % len(SLOT_COLORS)])
+        ath = 0.40 * float(a_s.max())
+        keep = peak_component(a_s, grid, ath)
+        segs, widths = [], []
+        for i, j, x, y, x2, y2 in pairs:
+            if not (keep[i] and keep[j]):
+                continue
+            r = max(0.0, float(np.dot(z[i], z[j])))
+            g = float(a_s[i] * a_s[j] * r)
+            if g < 0.08 * ath * ath:
+                continue
+            segs.append([(xs[x], ys[y]), (xs[x2], ys[y2])])
+            widths.append(0.85 + 1.45 * float(np.clip(g, 0.0, 1.0)))
+        zorder = 4 + draw_i
+        if segs:
+            ink = np.tile([*color, 0.82], (len(segs), 1))
+            ax.add_collection(
+                LineCollection(segs, colors=ink, linewidths=widths, zorder=zorder, capstyle="round")
+            )
+        for i in range(grid * grid):
+            if not keep[i]:
+                continue
+            x, y = i % grid, i // grid
+            ax.add_patch(
+                Circle(
+                    (xs[x], ys[y]),
+                    r0 * (0.55 + 0.85 * float(a_s[i])),
+                    facecolor=color,
+                    edgecolor="white",
+                    lw=0.45,
+                    alpha=0.88,
+                    zorder=20 + draw_i,
+                )
+            )
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.set_axis_off()
+    ax.set_title("(c)  Slots on one frame", fontsize=13, color=INK, loc="left", pad=8)
+    caption(ax, r"$G_s=\mathrm{diag}(a_s)\,S\,\mathrm{diag}(a_s)$   ·   color $=$ slot")
 
 
 def main():
@@ -414,33 +543,31 @@ def main():
     q = int(a_s.argmax())
     _, _, x0, y0, x1, y1 = crop_around(q, grid, rad=4)
 
-    fig = plt.figure(figsize=(16.0, 9.0), dpi=180)
+    n_slots = int(a.shape[0])
+    fig = plt.figure(figsize=(16.4, 6.6), dpi=160)
     fig.suptitle(
-        "Each slot induces an 8-neighbor patch graph",
+        "Relation edges, then every slot on one frame",
         fontsize=18,
         color=INK,
-        x=0.035,
+        x=0.02,
         ha="left",
-        y=0.975,
+        y=0.985,
     )
-    gs = fig.add_gridspec(1, 3, wspace=0.10, left=0.03, right=0.99, top=0.86, bottom=0.22)
-    panel_grid(fig.add_subplot(gs[0, 0]), rgb, grid, box=(x0, y0, x1, y1))
-    panel_relu(fig.add_subplot(gs[0, 1]), rgb, z, grid, q)
-    panel_gate(fig.add_subplot(gs[0, 2]), rgb, z, a_s, grid)
-    fig.text(
-        0.035,
-        0.045,
-        r"$a_s$: last Slot-Attention iteration, softmax over slots.   "
-        "A slot that owns little mass induces a small graph.  That scale is the occupancy signal.",
-        fontsize=12,
-        color=INK,
-    )
-    fig.text(
-        0.035,
-        0.018,
-        f"YTVIS val  ·  v39lam1gu  ·  slot {s}  ·  {grid}×{grid} patches",
-        fontsize=9,
-        color=GRAY,
+    gs = fig.add_gridspec(1, 3, wspace=0.06, left=0.02, right=0.99, top=0.84, bottom=0.12)
+    panel_relu(fig.add_subplot(gs[0, 0]), rgb, z, grid, q)
+    panel_s(fig.add_subplot(gs[0, 1]), rgb, z, grid, box=(x0, y0, x1, y1))
+    panel_all_slots(fig.add_subplot(gs[0, 2]), rgb, z, a, grid)
+    fig.text(0.02, 0.025, r"gray edges $=$ relation $R$ and $S$", fontsize=11, color=INK)
+    fig.legend(
+        handles=[
+            Line2D([0], [0], color=SLOT_COLORS[k], lw=3.5, solid_capstyle="round", label=f"slot {k}")
+            for k in range(n_slots)
+        ],
+        loc="lower right",
+        ncol=n_slots,
+        frameon=False,
+        fontsize=11,
+        bbox_to_anchor=(0.99, 0.005),
     )
     OUT.mkdir(parents=True, exist_ok=True)
     path = OUT / "07_slot_graph_n8.png"

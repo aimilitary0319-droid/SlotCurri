@@ -164,6 +164,45 @@ class TorchLoss(Loss):
         return self.loss_fn(prediction, target)
 
 
+class MSECLSLoss(TorchLoss):
+    """Softmax the student logits and match a detached one-hot teacher with MSE.
+
+    Predictions are (N, S) patch logits. An empty patch set returns a zero that
+    stays connected to the logits so the backward pass still runs.
+    """
+
+    def __init__(self, pred_key: str, target_key: str, temperature: float = 1.0, **kwargs):
+        super().__init__(pred_key, target_key, loss="MSELoss", **kwargs)
+        self.T = temperature
+
+    def get_target(self, inputs: Dict[str, Any], outputs: Dict[str, Any]) -> torch.Tensor:
+        target = utils.read_path(outputs, elements=self.target_path, error=False)
+        if target is None:
+            target = utils.read_path(inputs, elements=self.target_path)
+        target = target.detach().long()
+        if target.numel() == 0:
+            return target
+
+        pred = utils.read_path(outputs, elements=self.pred_path)
+        n_classes = pred.shape[1]
+        target_oh = torch.nn.functional.one_hot(target, num_classes=n_classes)
+        if target_oh.dim() > 2:
+            d = target_oh.dim()
+            target_oh = target_oh.permute(0, d - 1, *range(1, d - 1))
+        return target_oh.to(dtype=pred.dtype, device=pred.device)
+
+    def get_prediction(self, outputs: Dict[str, Any]) -> torch.Tensor:
+        logits = utils.read_path(outputs, elements=self.pred_path)
+        if logits.numel() == 0:
+            return logits
+        return torch.softmax(logits / self.T, dim=1)
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if prediction.numel() == 0 or target.numel() == 0:
+            return prediction.sum() * 0.0
+        return self.loss_fn(prediction, target)
+
+
 class MSELoss(TorchLoss):
     def __init__(self, pred_key: str, target_key: str, **kwargs):
         super().__init__(pred_key, target_key, loss="MSELoss", **kwargs)

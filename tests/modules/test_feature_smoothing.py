@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from slotcurri.featcur_start import closed_form_s
 from slotcurri.models import (
     feature_curriculum_bandwidth,
     feature_curriculum_mix,
@@ -39,6 +40,40 @@ def test_mix_schedule_endpoints_and_monotonicity():
     # cosine passes through 1/2 at the midpoint; linear is the identity ramp
     assert abs(feature_curriculum_mix(15000, 30000, "cosine") - 0.5) < 1e-9
     assert abs(feature_curriculum_mix(7500, 30000, "linear") - 0.25) < 1e-9
+    # s(t) = s0 + (1 - s0) * u(t): start at s0, still raw at the end of the anneal.
+    s0 = 0.1
+    assert abs(feature_curriculum_mix(0, 30000, "cosine", mix_start=s0) - s0) < 1e-9
+    assert abs(feature_curriculum_mix(30000, 30000, "cosine", mix_start=s0) - 1.0) < 1e-9
+    assert abs(feature_curriculum_mix(15000, 30000, "cosine", mix_start=s0) - (s0 + 0.5 * (1.0 - s0))) < 1e-9
+
+
+def test_closed_form_s_matches_half_energy_crossing():
+    g = torch.Generator().manual_seed(0)
+    raw = torch.randn(40, 8, generator=g)
+    direction = torch.zeros(8)
+    direction[0] = 1.0
+    # Varying magnitude along one axis, so centering does not erase it.
+    rel = torch.randn(40, 1, generator=g) * direction
+    s = closed_form_s(raw, rel)
+    assert 0.0 < s < 1.0
+
+    def alpha(mix):
+        mixed = (1.0 - mix) * rel + mix * raw
+        xc = mixed - mixed.mean(0, keepdim=True)
+        energy = torch.linalg.svdvals(xc).square()
+        return float((energy[0] / energy.sum()).item())
+
+    assert alpha(0.0) > 0.5
+    # Fixed-axis energy is exactly half. The true leading share stays near
+    # that value when the axis does not rotate.
+    mixed = (1.0 - s) * rel + s * raw
+    rel_c = rel - rel.mean(0, keepdim=True)
+    v = torch.linalg.svd(rel_c, full_matrices=False).Vh[0]
+    centered = mixed - mixed.mean(0, keepdim=True)
+    q = float((centered @ v).square().sum())
+    total = float(centered.square().sum())
+    assert abs(q / total - 0.5) < 1e-4
+    assert abs(alpha(s) - 0.5) < 0.03
 
 
 def test_uniform_gate_replaces_float_masks_and_keeps_alias():

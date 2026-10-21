@@ -220,6 +220,23 @@ def _as_float_gate(gate: torch.Tensor) -> torch.Tensor:
     return gate.float() if gate.dtype == torch.bool else gate
 
 
+def _decoder_base_one(gate: torch.Tensor, index: int) -> torch.Tensor:
+    """Decoder-only g_b = 1. Other slots keep π. Does not write back into `gate`."""
+    if not torch.is_floating_point(gate) or gate.ndim != 2:
+        raise ValueError(
+            "decoder_base_slot expects a float gate (B, S), "
+            f"got {None if gate is None else tuple(gate.shape)} {getattr(gate, 'dtype', None)}"
+        )
+    idx = int(index)
+    if idx < 0 or idx >= gate.shape[-1]:
+        raise ValueError(
+            f"decoder_base_slot index {idx} is outside 0..{gate.shape[-1] - 1}"
+        )
+    out = gate.clone()
+    out[..., idx] = 1
+    return out
+
+
 def _apply_default_slots(gate: torch.Tensor, default_list) -> torch.Tensor:
     """Force listed slots fully on (float gates). Empty list is a no-op."""
     if not default_list:
@@ -617,14 +634,19 @@ def spectral_cs_impurity(
     return rho.to(dtype=att.dtype)
 
 
-def _relation_graph_S(z: torch.Tensor, eps: float) -> torch.Tensor:
-    """Symmetric normalized ReLU-cosine graph S = D^{-1/2} R D^{-1/2}.
+def _relation_graph_S(z: torch.Tensor, eps: float, s_form: str = "sym") -> torch.Tensor:
+    """Symmetric normalized ReLU-cosine graph. All pairs, diagonal 0.
 
-    z is L2-normalized (B, N, D). R_ij = ReLU(z_i^T z_j), R_ii = 0. Isolated
-    rows get D_ii = eps so S stays defined; those rows are ~0.
+    sym:     S = D^{-1/2} R D^{-1/2}, R_ij = ReLU(z_i^T z_j).
+    dinv_rr: S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}, D̃_ii = sum_j R_ij^2.
     """
+    form = str(s_form).lower()
     rel = torch.bmm(z, z.transpose(1, 2)).clamp_min(0.0)
     rel.diagonal(dim1=-2, dim2=-1).zero_()
+    if form == "dinv_rr":
+        rel = rel * rel
+    elif form != "sym":
+        raise ValueError(f"s_form must be 'sym' or 'dinv_rr', got {s_form!r}")
     deg = rel.sum(dim=-1).clamp_min(eps)
     d_inv = deg.rsqrt()
     return d_inv.unsqueeze(-1) * rel * d_inv.unsqueeze(-2)
@@ -714,6 +736,24 @@ def _n8_affinity(z: torch.Tensor, eps: float):
         deg = deg + r
     d_inv = deg.clamp_min(eps).rsqrt()
     return d_inv, torch.stack(weights, dim=1)
+
+
+def _n8_s_factors(z: torch.Tensor, eps: float, s_form: str = "sym"):
+    """Factors so `_apply_s_n8(d_inv, weights, v)` is S v.
+
+    sym:     S = D^{-1/2} R D^{-1/2}. D_ii = sum_j R_ij.
+    dinv_rr: S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}.
+             (R ⊙ R)_ij = R_ij^2, D̃_ii = sum_j R_ij^2.
+    """
+    form = str(s_form).lower()
+    d_inv_sqrt, weights = _n8_affinity(z, eps)
+    if form == "sym":
+        return d_inv_sqrt, weights
+    if form == "dinv_rr":
+        squared = weights * weights
+        deg = squared.sum(dim=1).clamp_min(eps)
+        return deg.rsqrt(), squared
+    raise ValueError(f"s_form must be 'sym' or 'dinv_rr', got {s_form!r}")
 
 
 def _apply_s_n8(
@@ -905,14 +945,21 @@ def _top2_algebraic_g(
 
 
 def _top2_algebraic_diag_s_diag(
-    s_mat: torch.Tensor, a: torch.Tensor, n_iter: int, eps: float
+    s_mat: torch.Tensor,
+    a: torch.Tensor,
+    n_iter: int,
+    eps: float,
+    return_q1: bool = False,
+    lam1_only: bool = False,
 ):
     """Algebraic λ1 ≥ λ2 of G_s = diag(a_s) S diag(a_s) for dense S (v38)."""
 
     def apply_g(basis: torch.Tensor) -> torch.Tensor:
         return _apply_g_diag_s_diag(s_mat, a, basis)
 
-    return _top2_algebraic_g(apply_g, a, n_iter, eps)
+    return _top2_algebraic_g(
+        apply_g, a, n_iter, eps, return_q1=return_q1, lam1_only=lam1_only
+    )
 
 
 def _top2_algebraic_n8(
@@ -923,13 +970,15 @@ def _top2_algebraic_n8(
     return_q1: bool = False,
     lam1_only: bool = False,
     sqrt_a: bool = False,
+    s_form: str = "sym",
 ):
     """Algebraic λ1 ≥ λ2 of G_s on the 8-neighbor ReLU-cosine S (v39).
 
     lam1_only is v39lam1: Perron power pair, no k=8 Ritz / λ2.
     sqrt_a (v39lam1gu_asqrt): G_s = diag(sqrt(a)) S diag(sqrt(a)).
+    s_form "dinv_rr": S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}, D̃_ii = sum_j R_ij^2.
     """
-    d_inv, weights = _n8_affinity(z, eps)
+    d_inv, weights = _n8_s_factors(z, eps, s_form)
     gate_a = a.clamp_min(0.0).sqrt() if sqrt_a else a
 
     def apply_g(basis: torch.Tensor) -> torch.Tensor:
@@ -1028,11 +1077,18 @@ def spectral_graph_n8_eigs(
     slot_gamma: float = 1.0,
     rival: bool = False,
     rival_k0: float = 2.0,
+    a_slot_max: bool = False,
+    s_form: str = "sym",
+    gate_graph: str = "n8",
 ):
     """Detached n8 spectrum: π, λ1, λ2 each (B, S). π is the v39 / v39n / v39s / v39lam1 gate.
 
     slot_gamma (v39lam1gu_gsharp2_asqrt): a <- a^γ / sum_s a^γ per patch before G.
+    a_slot_max (v39lam1gu_nomaxnorm_amax): a <- a / max_s a per patch before G.
+    The winner on each patch is 1. sqrt_a, if on, runs after that.
     sqrt_a replaces a with sqrt(a) in G_s = diag(a) S diag(a).
+    s_form "dinv_rr" builds S = D̃^{-1/2} (R ⊙ R) D̃^{-1/2}, D̃_ii = sum_j R_ij^2.
+    gate_graph "dense" uses every pair. "n8" keeps the 8-neighbor support.
     sqrt_pi keeps that G and sets π = sqrt(max(λ1, 0)). λ1 itself stays raw.
     rival (v39lam1gu_rival): the diagonal of G is w = r/(r+K_0-1) instead of a.
     rival_k0 "auto" sets K_0 = (K+1)/2 from the slot axis of att.
@@ -1048,10 +1104,10 @@ def spectral_graph_n8_eigs(
         raise ValueError(
             "sqrt_pi keeps G_s = diag(a) S diag(a); do not combine with sqrt_a"
         )
-    if rival and (sqrt_a or sqrt_pi or slot_gamma != 1.0):
+    if rival and (sqrt_a or sqrt_pi or slot_gamma != 1.0 or a_slot_max):
         raise ValueError(
             "rival replaces a with w = r/(r+K_0-1) inside G; do not combine "
-            "with sqrt_a, sqrt_pi, or slot_gamma"
+            "with sqrt_a, sqrt_pi, slot_gamma, or a_slot_max"
         )
     rival_k0_auto = isinstance(rival_k0, str) and rival_k0.strip().lower() == "auto"
     if isinstance(rival_k0, str) and not rival_k0_auto:
@@ -1084,7 +1140,11 @@ def spectral_graph_n8_eigs(
             f"spectral-graph-n8 purity batch/token mismatch: att "
             f"{tuple(att.shape)} vs features {tuple(features.shape)}"
         )
-    _square_grid(att.shape[-1])
+    graph = str(gate_graph).lower()
+    if graph not in ("n8", "dense"):
+        raise ValueError(f"gate_graph must be 'n8' or 'dense', got {gate_graph!r}")
+    if graph == "n8":
+        _square_grid(att.shape[-1])
 
     amp_ctx = (
         torch.cuda.amp.autocast(enabled=False) if att.is_cuda else nullcontext()
@@ -1095,6 +1155,9 @@ def spectral_graph_n8_eigs(
         if slot_gamma != 1.0:
             a = a.clamp_min(0.0).pow(slot_gamma)
             a = a / a.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        if a_slot_max:
+            # Per patch, slot axis. Winner becomes 1; losers keep a / a_max.
+            a = a / a.amax(dim=1, keepdim=True).clamp_min(eps)
         if rival:
             k0 = rival_k0
             if rival_k0_auto:
@@ -1114,15 +1177,28 @@ def spectral_graph_n8_eigs(
         for i in range(0, bsz, step):
             z_c = z[i : i + step]
             a_c = a[i : i + step]
-            packed = _top2_algebraic_n8(
-                z_c,
-                a_c,
-                n_iter,
-                eps,
-                return_q1=return_q1,
-                lam1_only=use_lambda1,
-                sqrt_a=sqrt_a,
-            )
+            if graph == "dense":
+                gate_a = a_c.clamp_min(0.0).sqrt() if sqrt_a else a_c
+                s_mat = _relation_graph_S(z_c, eps, s_form)
+                packed = _top2_algebraic_diag_s_diag(
+                    s_mat,
+                    gate_a,
+                    n_iter,
+                    eps,
+                    return_q1=return_q1,
+                    lam1_only=use_lambda1,
+                )
+            else:
+                packed = _top2_algebraic_n8(
+                    z_c,
+                    a_c,
+                    n_iter,
+                    eps,
+                    return_q1=return_q1,
+                    lam1_only=use_lambda1,
+                    sqrt_a=sqrt_a,
+                    s_form=s_form,
+                )
             if return_q1:
                 lam1, lam2, q1 = packed
                 q1_out[i : i + step] = q1.squeeze(-1)
@@ -1558,6 +1634,7 @@ class LatentProcessor(nn.Module):
         conf_kind: str = "entropy",
         gate_detach: bool = False,
         key_features: Optional[torch.Tensor] = None,
+        key_rel_features: Optional[torch.Tensor] = None,
         purity_normalize: bool = False,
         state_gate_form: Optional[str] = None,
         state_mul_decoder: bool = False,
@@ -1580,8 +1657,12 @@ class LatentProcessor(nn.Module):
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
         pi_rival_k0: float = 2.0,
+        a_slot_max: bool = False,
+        s_form: str = "sym",
+        gate_graph: str = "n8",
         pi_gap: bool = False,
         uniform_gate: bool = False,
+        decoder_base_slot: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         # state: batch x n_slots x slot_dim (1 7 64)
         if onetoone:
@@ -1606,14 +1687,22 @@ class LatentProcessor(nn.Module):
                 corr_kwargs.update(self.first_step_corrector_args)
             if key_features is not None:
                 corr_kwargs["key_features"] = key_features
+            if key_rel_features is not None:
+                corr_kwargs["key_rel_features"] = key_rel_features
             corrector_output = self.corrector(state, inputs, **corr_kwargs)
             updated_state = corrector_output[self.state_key]
             state_attn_mask = corrector_output['masks'] if 'masks' in corrector_output else None
+            nosoftmax_dots = corrector_output.get("dots") if corrector_output is not None else None
+            if nosoftmax_dots is None and state_attn_mask is not None:
+                # Keep the ScanOverTime output tree a tensor on every frame.
+                # Stubs that only emit masks get zeros; SlotAttention emits dots.
+                nosoftmax_dots = torch.zeros_like(state_attn_mask)
         else:
             # Run predictor without updating on current inputs
             corrector_output = None
             updated_state = state
             state_attn_mask = None
+            nosoftmax_dots = None
 
         # --- attention-mass gating: hold non-active slots' priors at their incoming state ---
         # `state_attn_mask` is the last-iteration softmax-over-slots attention (B, S, F).
@@ -1773,6 +1862,9 @@ class LatentProcessor(nn.Module):
                         slot_gamma=pi_slot_gamma,
                         rival=bool(pi_rival),
                         rival_k0=pi_rival_k0,
+                        a_slot_max=bool(a_slot_max),
+                        s_form=s_form,
+                        gate_graph=gate_graph,
                     )
                     if eval_perron_readout:
                         gate_conf, n8_lam1, _, n8_q1 = packed_eigs
@@ -2248,12 +2340,27 @@ class LatentProcessor(nn.Module):
                 )
             decoder_gate = _perron_spatial_gate(active_mask, n8_q1)
 
+        # Decoder g_b = 1, other slots stay π. Temporal mix, Pred src-gate, and
+        # logged active_mask keep the original π (state_mask / active_mask).
+        if decoder_base_slot is not None:
+            if decoder_gate is not None:
+                raise ValueError(
+                    "decoder_base_slot cannot be combined with eval_perron_readout"
+                )
+            if active_mask is None or not torch.is_floating_point(active_mask):
+                raise ValueError(
+                    "decoder_base_slot needs the float decoder π, "
+                    f"got {None if active_mask is None else active_mask.dtype}"
+                )
+            decoder_gate = _decoder_base_one(active_mask, int(decoder_base_slot))
+
         out = {
             "state": updated_state,
             "state_predicted": predicted_state,
             "state_predicted_pregate": predicted_pregate,
             "corrector": corrector_output,
             "state_attn_mask": state_attn_mask,
+            "nosoftmax_dots": nosoftmax_dots,
             "active_mask": active_mask,
             # Always present so the output tree shape is constant; equals active_mask
             # unless gate_p_state or state_gate_form gave the temporal mix its own gate.
@@ -2322,6 +2429,10 @@ class MapOverTime(nn.Module):
 
             flattened_args.append(arg.flatten(0, 1))
 
+        for mod in self.module.modules():
+            if hasattr(mod, "frames_per_video"):
+                mod.frames_per_video = seq_len
+
         outputs = self.module(*flattened_args, **kwargs)
 
         if isinstance(outputs, Mapping):
@@ -2381,6 +2492,7 @@ class ScanOverTime(nn.Module):
         conf_kind: str = "entropy",
         gate_detach: bool = False,
         key_inputs: Optional[torch.Tensor] = None,
+        key_rel_inputs: Optional[torch.Tensor] = None,
         purity_normalize: bool = False,
         state_gate_form: Optional[str] = None,
         state_mul_decoder: bool = False,
@@ -2401,9 +2513,13 @@ class ScanOverTime(nn.Module):
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
         pi_rival_k0: float = 2.0,
-        pi_gap: bool = False,
-        uniform_gate: bool = False,
-    ):
+            a_slot_max: bool = False,
+            s_form: str = "sym",
+            gate_graph: str = "n8",
+            pi_gap: bool = False,
+            uniform_gate: bool = False,
+            decoder_base_slot: Optional[int] = None,
+        ):
         # initial_state: batch x ...
         # inputs: batch x n_frames x ...
         seq_len = inputs.shape[1]
@@ -2445,8 +2561,12 @@ class ScanOverTime(nn.Module):
             pi_slot_gamma=pi_slot_gamma,
             pi_rival=pi_rival,
             pi_rival_k0=pi_rival_k0,
+            a_slot_max=a_slot_max,
+            s_form=s_form,
+            gate_graph=gate_graph,
             pi_gap=pi_gap,
             uniform_gate=uniform_gate,
+            decoder_base_slot=decoder_base_slot,
         )
 
         state = initial_state
@@ -2472,6 +2592,8 @@ class ScanOverTime(nn.Module):
             kwargs["decoder_gate_prev"] = decoder_gate_prev
             if key_inputs is not None:
                 kwargs["key_features"] = key_inputs[:, t]
+            if key_rel_inputs is not None:
+                kwargs["key_rel_features"] = key_rel_inputs[:, t]
             if bind_inputs is not None:
                 kwargs["bind_features"] = bind_inputs[:, t]
             if self.pass_step:
@@ -2528,7 +2650,7 @@ class ScanOverTime(nn.Module):
                 self.last_anchor_frames = anchors.detach().to("cpu")
                 return self._cycle_from_anchors(
                     outputs, inputs, gate_kwargs, median_ema, anchors, key_inputs,
-                    bind_inputs,
+                    bind_inputs, key_rel_inputs,
                 )
             if mode != "last":
                 raise ValueError(f"unknown cycle mode {cycle!r}")
@@ -2554,6 +2676,8 @@ class ScanOverTime(nn.Module):
                 kwargs["decoder_gate_prev"] = decoder_gate_prev
                 if key_inputs is not None:
                     kwargs["key_features"] = key_inputs[:, back_t]
+                if key_rel_inputs is not None:
+                    kwargs["key_rel_features"] = key_rel_inputs[:, back_t]
                 if bind_inputs is not None:
                     kwargs["bind_features"] = bind_inputs[:, back_t]
                 out = self.module(state, inputs[:, back_t], **kwargs)
@@ -2579,6 +2703,7 @@ class ScanOverTime(nn.Module):
         anchors: torch.Tensor,
         key_inputs: Optional[torch.Tensor] = None,
         bind_inputs: Optional[torch.Tensor] = None,
+        key_rel_inputs: Optional[torch.Tensor] = None,
     ):
         """Backward sweep from a per-sample anchor frame, stitched with the forward sweep.
 
@@ -2663,6 +2788,8 @@ class ScanOverTime(nn.Module):
             kwargs["decoder_gate_prev"] = decoder_gate_prev
             if key_inputs is not None:
                 kwargs["key_features"] = key_inputs[:, t]
+            if key_rel_inputs is not None:
+                kwargs["key_rel_features"] = key_rel_inputs[:, t]
             if bind_inputs is not None:
                 kwargs["bind_features"] = bind_inputs[:, t]
             # no time_step: the first-step corrector args never apply on re-inference
