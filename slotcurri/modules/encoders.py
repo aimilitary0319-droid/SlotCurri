@@ -269,6 +269,12 @@ class NcutRelationalLeveling(nn.Module):
     raw X. frames_per_video must divide the flattened batch:
         X^rel <- mu + g (m_v - mu) + (P X - m_v)
         g^2 = (E||X - mu||^2 - E||P X - m_v||^2) / E||m_v - mu||^2
+    `xvid_energy="loc_gap"` widens, at each patch index, the gap between one
+    video's temporal mean of P X and the batch temporal mean of P X. The
+    temporal residual is not rescaled. frames_per_video must divide the batch:
+        m_v[n] = mean_t P X[t, n],  m_b[n] = mean_{batch} P X[t, n]
+        X^rel <- P X + (g - 1) (m_v - m_b)
+        g^2 = (E||X - mu||^2 - E||P X - m_v||^2 - E||m_b - mu||^2) / E||m_v - m_b||^2
 
     `xvid_power=β` (xvid_energy=True only) applies g^β instead of g:
         X^rel <- mu + g^β (P X - mu),  β in [0, 1]
@@ -328,14 +334,14 @@ class NcutRelationalLeveling(nn.Module):
             mode = {"true": "all", "false": "off", "none": "off"}.get(mode, mode)
         else:
             mode = "all" if xvid_energy else "off"
-        if mode not in ("off", "all", "frame", "frame_video", "video", "balance"):
+        if mode not in ("off", "all", "frame", "frame_video", "video", "loc_gap", "balance"):
             raise ValueError(
                 "NcutRelationalLeveling: xvid_energy must be false, true, 'frame', "
-                f"'frame_video', 'video' or 'balance', got {xvid_energy!r}"
+                f"'frame_video', 'video', 'loc_gap' or 'balance', got {xvid_energy!r}"
             )
         self.xvid_mode = mode
         # Contiguous frames per video after MapOverTime flattens (B, T).
-        # frame_video and video read this; other modes ignore it.
+        # frame_video, video, and loc_gap read this; other modes ignore it.
         self.frames_per_video: Optional[int] = None
         self.xvid_power = float(xvid_power)
         if not 0.0 <= self.xvid_power <= 1.0:
@@ -527,6 +533,28 @@ class NcutRelationalLeveling(nn.Module):
                 den = (m_v - mu).square().sum(-1).mean().clamp_min(self.eps)
                 gain = (num / den).sqrt()
                 out = (mu + gain * (m_v - mu) + resid).reshape(xf.shape)
+            elif self.xvid_mode == "loc_gap":
+                t = self.frames_per_video
+                if t is None or t < 1 or xf.shape[0] % int(t) != 0:
+                    raise ValueError(
+                        "NcutRelationalLeveling loc_gap needs frames_per_video "
+                        f"to divide the batch, got T={t} and batch {xf.shape[0]}"
+                    )
+                b = xf.shape[0] // int(t)
+                n, d = xf.shape[1], xf.shape[2]
+                xx = xf.view(b, int(t), n, d)
+                rr = rf.view(b, int(t), n, d)
+                m_v = rr.mean(dim=1, keepdim=True)
+                m_b = rr.mean(dim=(0, 1), keepdim=True)
+                resid = rr - m_v
+                num = (
+                    num
+                    - resid.square().sum(-1).mean()
+                    - (m_b - mu).square().sum(-1).mean()
+                ).clamp_min(0.0)
+                den = (m_v - m_b).square().sum(-1).mean().clamp_min(self.eps)
+                gain = (num / den).sqrt()
+                out = (rr + (gain - 1.0) * (m_v - m_b)).reshape(xf.shape)
             elif self.xvid_mode == "balance":
                 d = rf - mu
                 g_full = (num / d.square().sum(-1).mean().clamp_min(self.eps)).sqrt()
