@@ -241,6 +241,15 @@ def test_rwmean_yaml_uses_dinv_rr_gate_graph():
     )
     assert plain.model.attn_mass_curriculum.get("s_form", "sym") == "sym"
     assert plain.model.attn_mass_curriculum.get("gate_graph", "n8") == "n8"
+    rwcut = configuration.load_config(
+        "configs/slotcurri/movi_e_attnmass_v39lam1gu_rwcut_xframe.yaml"
+    )
+    assert rwcut.experiment_name == "movi_e_attnmass_v39lam1gu_rwcut_xframe"
+    assert rwcut.model.feature_curriculum["xvid_energy"] == "frame"
+    assert rwcut.model.feature_curriculum["barrier"] is True
+    assert rwcut.model.feature_curriculum["fiedler_cut"] == "rw_mean"
+    assert rwcut.model.attn_mass_curriculum.get("s_form", "sym") == "sym"
+    assert "shared_init" not in rwcut.model.initializer
 
 
 def test_matches_hand_formula_and_is_detached():
