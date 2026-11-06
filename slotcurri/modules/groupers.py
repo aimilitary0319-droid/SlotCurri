@@ -322,14 +322,12 @@ class SlotAttention(nn.Module):
         slots = self.norm_slots(slots) # 1 7 64
         queries = self.to_q(slots)
 
-        # Plain softmax is the September 2026 v39lam1gu competition: dots, softmax,
-        # and the patch mean stay in the trainer autocast dtype. Variants keep the
-        # fp32 block below. fp16 flushes a losing slot to 0, and eps=1e-8 flushes
-        # too, so a margin or entmax row can be 0/0.
+        # Plain softmax stays in the trainer autocast dtype, including logit_div
+        # (v39lam1gu_t2 divides by 2). Margin, entmax, and the other variants keep
+        # the fp32 block: fp16 flushes a losing slot to 0, and eps=1e-8 flushes too.
         legacy_softmax = (
             self.attn_norm == "softmax"
             and not self.dot_ktemp
-            and self.logit_div == 1.0
             and not self.tie_break
             and not self.pi_attn_norm
             and not self.margin_gate_slot_norm
@@ -337,6 +335,7 @@ class SlotAttention(nn.Module):
         )
         if legacy_softmax:
             dots = torch.einsum("bsd, bfd -> bsf", queries, keys) * self.scale
+            dots = dots / self.logit_div
             pre_norm_attn = torch.softmax(dots, dim=1)  # b slot patch
             attn = pre_norm_attn + self.eps
             attn = attn / attn.sum(-1, keepdim=True)
