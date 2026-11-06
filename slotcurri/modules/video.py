@@ -874,6 +874,70 @@ def _apply_g_diag_s_diag(
     return a.unsqueeze(-1) * sav
 
 
+def _lanczos_lam1(
+    apply_g: Callable[[torch.Tensor], torch.Tensor],
+    a: torch.Tensor,
+    n_steps: int,
+    eps: float,
+    return_q1: bool = False,
+):
+    """Largest eigenvalue of G by Lanczos from +ones. λ2 is not computed.
+
+    The basis is the Krylov subspace of G itself. The λ2 shift used below
+    shrinks the Perron gap, so it is not applied here. `n_steps` width-1
+    matvecs build the basis; one more matvec is the Rayleigh quotient of the
+    top Ritz vector, which is the returned λ1. Steps are capped at N.
+    """
+    bsz, n_slots, n_tokens = a.shape
+    m = int(n_steps)
+    if m < 1:
+        raise ValueError(f"lanczos_steps must be >= 1, got {n_steps}")
+    m = min(m, n_tokens)
+    q = torch.ones(bsz, n_slots, n_tokens, 1, device=a.device, dtype=a.dtype)
+    q = q / q.norm(dim=2, keepdim=True).clamp_min(eps)
+    basis_cols = []
+    alphas = []
+    offs = []
+    q_prev = torch.zeros_like(q)
+    beta = q.new_zeros(bsz, n_slots, 1, 1)
+    for _ in range(m):
+        w = apply_g(q) - beta * q_prev
+        alpha = (q * w).sum(dim=2, keepdim=True)
+        w = w - alpha * q
+        # Modified Gram-Schmidt, twice. One pass loses the Perron vector
+        # once the flat-graph gap makes later Krylov vectors nearly parallel.
+        for _pass in range(2):
+            for qj in basis_cols:
+                w = w - (w * qj).sum(dim=2, keepdim=True) * qj
+            w = w - (w * q).sum(dim=2, keepdim=True) * q
+        beta_next = w.norm(dim=2, keepdim=True).clamp_min(eps)
+        basis_cols.append(q)
+        alphas.append(alpha.squeeze(-1).squeeze(-1))
+        offs.append(beta_next.squeeze(-1).squeeze(-1))
+        q_prev = q
+        q = w / beta_next
+        beta = beta_next
+    diag = torch.stack(alphas, dim=-1)
+    eye = torch.eye(m, device=a.device, dtype=a.dtype)
+    tri = diag.unsqueeze(-1) * eye
+    if m > 1:
+        off = torch.stack(offs[:-1], dim=-1)
+        idx = torch.arange(m - 1, device=a.device)
+        tri = tri.clone()
+        tri[:, :, idx, idx + 1] = off
+        tri[:, :, idx + 1, idx] = off
+    weights = torch.linalg.eigh(tri).eigenvectors[..., -1]
+    y = torch.zeros_like(q)
+    for j, qj in enumerate(basis_cols):
+        y = y + qj * weights[..., j].view(bsz, n_slots, 1, 1)
+    y = y / y.norm(dim=2, keepdim=True).clamp_min(eps)
+    lam1 = (y * apply_g(y)).sum(dim=2).squeeze(-1)
+    zero = a.new_zeros(bsz, n_slots)
+    if return_q1:
+        return lam1, zero, y
+    return lam1, zero
+
+
 def _top2_algebraic_g(
     apply_g: Callable[[torch.Tensor], torch.Tensor],
     a: torch.Tensor,
@@ -883,6 +947,7 @@ def _top2_algebraic_g(
     lam1_only: bool = False,
     ritz_k: Optional[int] = None,
     ritz_iters: Optional[int] = None,
+    lanczos_steps: Optional[int] = None,
 ):
     """Algebraic λ1 ≥ λ2 of G_s given Gv = apply_g(v).
 
@@ -890,6 +955,7 @@ def _top2_algebraic_g(
     spectral radius is λ1, so |λ_min| ≤ λ1. A +ones power iteration gives the
     Perron pair (q1, q1^T G q1). v39lam1 (`lam1_only`) stops there: occupancy
     only needs that pair, and the k=8 Ritz below exists to resolve λ2.
+    `lanczos_steps` replaces both with a Krylov estimate of λ1.
 
     Otherwise shift H = G + (λ1 + eps) I so H is PSD with condition ~2, then
     a k=8 subspace iteration + Rayleigh-Ritz; the two largest Ritz values
@@ -904,6 +970,8 @@ def _top2_algebraic_g(
             )
             return zero, zero, q0
         return zero, zero
+    if lanczos_steps is not None:
+        return _lanczos_lam1(apply_g, a, lanczos_steps, eps, return_q1)
 
     n_iter = max(int(n_iter), 1)
     ones = torch.ones(
@@ -960,6 +1028,7 @@ def _top2_algebraic_diag_s_diag(
     lam1_only: bool = False,
     ritz_k: Optional[int] = None,
     ritz_iters: Optional[int] = None,
+    lanczos_steps: Optional[int] = None,
 ):
     """Algebraic λ1 ≥ λ2 of G_s = diag(a_s) S diag(a_s) for dense S (v38)."""
 
@@ -970,6 +1039,7 @@ def _top2_algebraic_diag_s_diag(
         apply_g, a, n_iter, eps,
         return_q1=return_q1, lam1_only=lam1_only,
         ritz_k=ritz_k, ritz_iters=ritz_iters,
+        lanczos_steps=lanczos_steps,
     )
 
 
@@ -982,6 +1052,7 @@ def _top2_algebraic_n8(
     lam1_only: bool = False,
     ritz_k: Optional[int] = None,
     ritz_iters: Optional[int] = None,
+    lanczos_steps: Optional[int] = None,
     sqrt_a: bool = False,
     s_form: str = "sym",
 ):
@@ -1001,6 +1072,7 @@ def _top2_algebraic_n8(
         apply_g, a, n_iter, eps,
         return_q1=return_q1, lam1_only=lam1_only,
         ritz_k=ritz_k, ritz_iters=ritz_iters,
+        lanczos_steps=lanczos_steps,
     )
 
 
@@ -1089,6 +1161,7 @@ def spectral_graph_n8_eigs(
     lam1_ritz: bool = False,
     ritz_k: Optional[int] = None,
     ritz_iters: Optional[int] = None,
+    lanczos_steps: Optional[int] = None,
     return_q1: bool = False,
     sqrt_a: bool = False,
     sqrt_pi: bool = False,
@@ -1148,7 +1221,20 @@ def spectral_graph_n8_eigs(
             "lam1_ritz keeps π = max(λ1, 0) and only changes which λ1: "
             "the k=8 Ritz value instead of the Perron power Rayleigh"
         )
+    if lanczos_steps is not None and int(lanczos_steps) < 1:
+        raise ValueError(
+            f"lanczos_steps must be >= 1, got {lanczos_steps}"
+        )
+    if lanczos_steps is not None and not use_lambda1:
+        raise ValueError(
+            "lanczos_steps keeps π = max(λ1, 0); it is a λ1 solver"
+        )
+    if lanczos_steps is not None and lam1_ritz:
+        raise ValueError(
+            "lanczos_steps replaces lam1_ritz; set only one λ1 solver"
+        )
     # v39lam1gu_ritzlam1: still π = max(λ1, 0), but λ1 is the k=8 Ritz value.
+    # lanczos_steps: π = max(λ1, 0) with λ1 from m-step Lanczos.
     # The power-only early return is the current v39lam1 path.
     lam1_only = bool(use_lambda1) and not bool(lam1_ritz)
     if features is None:
@@ -1215,6 +1301,7 @@ def spectral_graph_n8_eigs(
                     lam1_only=lam1_only,
                     ritz_k=ritz_k,
                     ritz_iters=ritz_iters,
+                    lanczos_steps=lanczos_steps,
                 )
             else:
                 packed = _top2_algebraic_n8(
@@ -1226,6 +1313,7 @@ def spectral_graph_n8_eigs(
                     lam1_only=lam1_only,
                     ritz_k=ritz_k,
                     ritz_iters=ritz_iters,
+                    lanczos_steps=lanczos_steps,
                     sqrt_a=sqrt_a,
                     s_form=s_form,
                 )
@@ -1687,6 +1775,7 @@ class LatentProcessor(nn.Module):
         lam1_ritz: bool = False,
         lam1_ritz_k: Optional[int] = None,
         lam1_ritz_iters: Optional[int] = None,
+        lam1_lanczos_steps: Optional[int] = None,
         sqrt_pi: bool = False,
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
@@ -1894,6 +1983,7 @@ class LatentProcessor(nn.Module):
                         lam1_ritz=bool(lam1_ritz),
                         ritz_k=lam1_ritz_k,
                         ritz_iters=lam1_ritz_iters,
+                        lanczos_steps=lam1_lanczos_steps,
                         return_q1=bool(eval_perron_readout),
                         sqrt_a=bool(sqrt_a),
                         sqrt_pi=bool(sqrt_pi),
@@ -2554,6 +2644,7 @@ class ScanOverTime(nn.Module):
         lam1_ritz: bool = False,
         lam1_ritz_k: Optional[int] = None,
         lam1_ritz_iters: Optional[int] = None,
+        lam1_lanczos_steps: Optional[int] = None,
         sqrt_pi: bool = False,
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
@@ -2606,6 +2697,7 @@ class ScanOverTime(nn.Module):
             lam1_ritz=lam1_ritz,
             lam1_ritz_k=lam1_ritz_k,
             lam1_ritz_iters=lam1_ritz_iters,
+            lam1_lanczos_steps=lam1_lanczos_steps,
             sqrt_pi=sqrt_pi,
             pi_slot_gamma=pi_slot_gamma,
             pi_rival=pi_rival,

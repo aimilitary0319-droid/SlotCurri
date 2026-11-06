@@ -1363,6 +1363,27 @@ class ObjectCentricModel(pl.LightningModule):
                 "attn_mass_curriculum.lam1_ritz_iters must be >= 0, "
                 f"got {self.amc_lam1_ritz_iters}"
             )
+        # None keeps power or Ritz. lanczos16 sets 16 Krylov steps on G.
+        raw_lanczos = amc.get("lam1_lanczos_steps", None)
+        self.amc_lam1_lanczos_steps = (
+            None if raw_lanczos in (None, "") else int(raw_lanczos)
+        )
+        if self.amc_lam1_lanczos_steps is not None:
+            if self.amc_conf_kind != "spectral_graph_n8_lam1":
+                raise ValueError(
+                    "attn_mass_curriculum.lam1_lanczos_steps requires "
+                    "conf_kind='spectral_graph_n8_lam1' so π stays max(λ1, 0), "
+                    f"got {self.amc_conf_kind!r}"
+                )
+            if self.amc_lam1_ritz:
+                raise ValueError(
+                    "attn_mass_curriculum.lam1_lanczos_steps replaces lam1_ritz"
+                )
+            if self.amc_lam1_lanczos_steps < 1:
+                raise ValueError(
+                    "attn_mass_curriculum.lam1_lanczos_steps must be >= 1, "
+                    f"got {self.amc_lam1_lanczos_steps}"
+                )
         # Default True rewrites an all-zero Pred source-gate row to uniform.
         # False leaves that row as 0/0.
         self.amc_src_gate_zero_uniform = bool(amc.get("src_gate_zero_uniform", True))
@@ -1914,6 +1935,7 @@ class ObjectCentricModel(pl.LightningModule):
                 lam1_ritz=self.amc_lam1_ritz,
                 lam1_ritz_k=self.amc_lam1_ritz_k,
                 lam1_ritz_iters=self.amc_lam1_ritz_iters,
+                lam1_lanczos_steps=self.amc_lam1_lanczos_steps,
                 sqrt_pi=self.amc_sqrt_pi,
                 pi_slot_gamma=self.amc_pi_slot_gamma,
                 pi_rival=self.amc_pi_rival,

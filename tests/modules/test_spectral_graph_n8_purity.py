@@ -8,11 +8,13 @@ import torch
 from slotcurri.modules.video import (
     LatentProcessor,
     _N8_OFFSETS,
+    _apply_g_diag_s_diag,
     _apply_g_n8,
     _apply_r_n8,
     _apply_s_n8,
     _n8_affinity,
     _n8_s_factors,
+    _relation_graph_S,
     _n8_gather,
     _pad1_hw,
     _shift_hw,
@@ -645,6 +647,150 @@ def test_lam1_ritz2_tracks_full_k8():
     rel_power = (power - full).abs() / full.clamp_min(1e-8)
     assert rel.median() < 5e-4
     assert rel.median() < rel_power.median()
+
+
+def test_lam1_lanczos16_beats_ritz2_on_flat_graph():
+    """16-step Lanczos stays closer to exact λ1 than k=2 × 2 Ritz."""
+    torch.manual_seed(3)
+    n = 144
+    att = torch.softmax(0.15 * torch.randn(2, 7, n), dim=1)
+    feat = torch.randn(2, n, 16)
+    z = torch.nn.functional.normalize(feat.float(), dim=-1)
+    a = att.float()
+    d_inv, weights = _n8_s_factors(z, 1e-6, "sym")
+    cols = []
+    for start in range(0, n, 48):
+        k = min(48, n - start)
+        basis = a.new_zeros(a.shape[0], a.shape[1], n, k)
+        idx = torch.arange(k)
+        basis[:, :, start + idx, idx] = 1
+        cols.append(_apply_g_n8(d_inv, weights, a, basis))
+    gram = torch.cat(cols, dim=-1)
+    gram = 0.5 * (gram + gram.transpose(-1, -2))
+    exact = torch.linalg.eigvalsh(gram)[..., -1]
+    got, lam1, lam2 = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16, chunk_size=1
+    )
+    ritz2, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lam1_ritz=True,
+        ritz_k=2, ritz_iters=2, chunk_size=1,
+    )
+    rel = (got - exact).abs() / exact.clamp_min(1e-8)
+    rel_ritz = (ritz2 - exact).abs() / exact.clamp_min(1e-8)
+    assert torch.equal(lam2, torch.zeros_like(lam2))
+    assert torch.allclose(got, lam1.clamp_min(0.0), atol=1e-6)
+    assert rel.median() < rel_ritz.median()
+    assert float(rel.median()) < 5e-3
+    with pytest.raises(ValueError, match="replaces lam1_ritz"):
+        spectral_graph_n8_eigs(
+            att, feat, use_lambda1=True, lam1_ritz=True, lanczos_steps=16
+        )
+
+
+def test_lam1_lanczos16_properties():
+    """Rayleigh, batching, and the rejected argument combinations."""
+    torch.manual_seed(3)
+    att = torch.softmax(0.15 * torch.randn(2, 7, 144), dim=1)
+    feat = torch.randn(2, 144, 16)
+    pi, lam, lam2, q1 = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16, chunk_size=1, return_q1=True
+    )
+    z = torch.nn.functional.normalize(feat.float(), dim=-1)
+    d_inv, weights = _n8_s_factors(z, 1e-6, "sym")
+    gy = _apply_g_n8(d_inv, weights, att.float(), q1.unsqueeze(-1)).squeeze(-1)
+    ray = (q1.float() * gy).sum(-1)
+    assert torch.allclose(ray, lam.float(), atol=1e-6)
+    assert torch.equal(lam2, torch.zeros_like(lam2))
+    assert torch.allclose(pi, lam.clamp_min(0), atol=1e-6)
+    assert not pi.requires_grad and not q1.requires_grad
+    att_g = att.detach().clone().requires_grad_(True)
+    feat_g = feat.detach().clone().requires_grad_(True)
+    pi_g, _, _ = spectral_graph_n8_eigs(
+        att_g, feat_g, use_lambda1=True, lanczos_steps=16
+    )
+    assert not pi_g.requires_grad
+    alone, _, _ = spectral_graph_n8_eigs(
+        att[:1], feat[:1], use_lambda1=True, lanczos_steps=16, chunk_size=8
+    )
+    both, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16, chunk_size=1
+    )
+    assert torch.allclose(alone, both[:1], atol=1e-6)
+    again, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16
+    )
+    assert torch.equal(both, again)
+    power, _, _ = spectral_graph_n8_eigs(att, feat, use_lambda1=True)
+    power_explicit, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=None
+    )
+    assert torch.equal(power, power_explicit)
+    small_att = torch.softmax(torch.randn(1, 3, 9), dim=1)
+    small_feat = torch.randn(1, 9, 4)
+    capped, _, _ = spectral_graph_n8_eigs(
+        small_att, small_feat, use_lambda1=True, lanczos_steps=16
+    )
+    at_n, _, _ = spectral_graph_n8_eigs(
+        small_att, small_feat, use_lambda1=True, lanczos_steps=9
+    )
+    assert torch.equal(capped, at_n)
+    assert torch.isfinite(capped).all()
+    zpi, zlam, zlam2 = spectral_graph_n8_eigs(
+        torch.ones(1, 2, 1), torch.randn(1, 1, 4), use_lambda1=True, lanczos_steps=16
+    )
+    assert torch.equal(zpi, torch.zeros_like(zpi))
+    assert torch.equal(zlam, torch.zeros_like(zlam))
+    assert torch.equal(zlam2, torch.zeros_like(zlam2))
+    hpi, _, _ = spectral_graph_n8_eigs(
+        att.half(), feat.half(), use_lambda1=True, lanczos_steps=16
+    )
+    assert hpi.dtype == torch.float16 and torch.isfinite(hpi).all()
+    sa_pi, sa_lam, _, sa_q = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16, sqrt_a=True, return_q1=True
+    )
+    gy = _apply_g_n8(
+        d_inv, weights, att.float().clamp_min(0).sqrt(), sa_q.unsqueeze(-1)
+    ).squeeze(-1)
+    assert torch.allclose((sa_q.float() * gy).sum(-1), sa_lam.float(), atol=1e-5)
+    assert torch.allclose(sa_pi, sa_lam.clamp_min(0), atol=1e-6)
+    datt = torch.softmax(0.15 * torch.randn(2, 4, 36), dim=1)
+    dfeat = torch.randn(2, 36, 8)
+    dpi, dlam, _, dq = spectral_graph_n8_eigs(
+        datt, dfeat, use_lambda1=True, lanczos_steps=16,
+        gate_graph="dense", return_q1=True,
+    )
+    dz = torch.nn.functional.normalize(dfeat.float(), dim=-1)
+    gy = _apply_g_diag_s_diag(
+        _relation_graph_S(dz, 1e-6, "sym"), datt.float(), dq.unsqueeze(-1)
+    ).squeeze(-1)
+    assert torch.allclose((dq.float() * gy).sum(-1), dlam.float(), atol=1e-5)
+    assert torch.allclose(dpi, dlam.clamp_min(0), atol=1e-6)
+    for kwargs in (
+        dict(use_lambda1=False, lanczos_steps=16),
+        dict(use_lambda1=True, lam1_ritz=True, lanczos_steps=16),
+        dict(use_lambda1=True, lanczos_steps=0),
+    ):
+        with pytest.raises(ValueError):
+            spectral_graph_n8_eigs(datt, dfeat, **kwargs)
+
+
+def test_ytvis_lanczos16_config():
+    from slotcurri import configuration
+
+    cfg = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu_lanczos16.yaml"
+    )
+    parent = configuration.load_config(
+        "configs/slotcurri/ytvis2021_attnmass_v39lam1gu.yaml"
+    )
+    assert cfg.experiment_name == "ytvis_attnmass_v39lam1gu_lanczos16"
+    assert int(cfg.globals["NUM_SLOTS"]) == int(parent.globals["NUM_SLOTS"]) == 7
+    amc = cfg.model.attn_mass_curriculum
+    assert amc["conf_kind"] == "spectral_graph_n8_lam1"
+    assert int(amc["lam1_lanczos_steps"]) == 16
+    assert bool(amc.get("lam1_ritz", False)) is False
+    assert bool(amc["src_gate_zero_uniform"]) is False
+    assert bool(parent.model.attn_mass_curriculum.get("lam1_ritz", False)) is False
 
 
 def test_lam1_matches_hand_formula_and_is_detached():
