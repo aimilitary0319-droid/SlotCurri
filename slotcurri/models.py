@@ -1336,6 +1336,18 @@ class ObjectCentricModel(pl.LightningModule):
                     "attn_mass_curriculum.decoder_base_slot must be in "
                     f"0..{self.n_slots - 1}, got {self.amc_decoder_base_slot}"
                 )
+        # v39lam1gu_ritzlam1: π = max(Ritz λ1, 0). Default v39lam1 uses the
+        # Perron power Rayleigh and skips the k=8 subspace.
+        self.amc_lam1_ritz = bool(amc.get("lam1_ritz", False))
+        if self.amc_lam1_ritz and self.amc_conf_kind != "spectral_graph_n8_lam1":
+            raise ValueError(
+                "attn_mass_curriculum.lam1_ritz requires "
+                "conf_kind='spectral_graph_n8_lam1' so π stays max(λ1, 0), "
+                f"got {self.amc_conf_kind!r}"
+            )
+        # Default True rewrites an all-zero Pred source-gate row to uniform.
+        # False leaves that row as 0/0.
+        self.amc_src_gate_zero_uniform = bool(amc.get("src_gate_zero_uniform", True))
         self.amc_pi_gap = bool(amc.get("pi_gap", False))
         if self.amc_pi_gap and (
             self.amc_gate_form != "purity_weight"
@@ -1849,6 +1861,7 @@ class ObjectCentricModel(pl.LightningModule):
                     if train or self.amc_eval_predictor_src_gate is None
                     else bool(self.amc_eval_predictor_src_gate)
                 ),
+                predictor_src_zero_uniform=self.amc_src_gate_zero_uniform,
                 predictor_src_max_norm=self.amc_predictor_src_max_norm,
                 predictor_src_self=self.amc_predictor_src_self,
                 predictor_pair_isolate=(
@@ -1880,6 +1893,7 @@ class ObjectCentricModel(pl.LightningModule):
                 n8_support_rel=self.amc_n8_support_rel,
                 spectral_proj_dim=self.amc_spectral_proj_dim,
                 sqrt_a=self.amc_sqrt_a,
+                lam1_ritz=self.amc_lam1_ritz,
                 sqrt_pi=self.amc_sqrt_pi,
                 pi_slot_gamma=self.amc_pi_slot_gamma,
                 pi_rival=self.amc_pi_rival,

@@ -1071,6 +1071,7 @@ def spectral_graph_n8_eigs(
     divide_by_lambda1: bool = False,
     l1_minus_imp: bool = False,
     use_lambda1: bool = False,
+    lam1_ritz: bool = False,
     return_q1: bool = False,
     sqrt_a: bool = False,
     sqrt_pi: bool = False,
@@ -1125,6 +1126,14 @@ def spectral_graph_n8_eigs(
             "spectral_graph_n8_eigs: divide_by_lambda1, "
             "l1_minus_imp and use_lambda1 are mutually exclusive"
         )
+    if lam1_ritz and not use_lambda1:
+        raise ValueError(
+            "lam1_ritz keeps π = max(λ1, 0) and only changes which λ1: "
+            "the k=8 Ritz value instead of the Perron power Rayleigh"
+        )
+    # v39lam1gu_ritzlam1: still π = max(λ1, 0), but λ1 is the k=8 Ritz value.
+    # The power-only early return is the current v39lam1 path.
+    lam1_only = bool(use_lambda1) and not bool(lam1_ritz)
     if features is None:
         raise ValueError(
             "conf_kind='spectral_graph_n8' requires bind_features "
@@ -1186,7 +1195,7 @@ def spectral_graph_n8_eigs(
                     n_iter,
                     eps,
                     return_q1=return_q1,
-                    lam1_only=use_lambda1,
+                    lam1_only=lam1_only,
                 )
             else:
                 packed = _top2_algebraic_n8(
@@ -1195,7 +1204,7 @@ def spectral_graph_n8_eigs(
                     n_iter,
                     eps,
                     return_q1=return_q1,
-                    lam1_only=use_lambda1,
+                    lam1_only=lam1_only,
                     sqrt_a=sqrt_a,
                     s_form=s_form,
                 )
@@ -1614,6 +1623,7 @@ class LatentProcessor(nn.Module):
         state_max_norm: bool = False,
         predictor_ungated: bool = False,
         predictor_src_gate: bool = False,
+        predictor_src_zero_uniform: bool = True,
         predictor_src_max_norm: bool = False,
         predictor_src_self: bool = False,
         predictor_pair_isolate: bool = False,
@@ -1653,6 +1663,7 @@ class LatentProcessor(nn.Module):
         eval_perron_readout: bool = False,
         pi_gamma: float = 1.0,
         sqrt_a: bool = False,
+        lam1_ritz: bool = False,
         sqrt_pi: bool = False,
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
@@ -1843,7 +1854,8 @@ class LatentProcessor(nn.Module):
                     # v39n (spectral_graph_n8_rel): that gap divided by λ1.
                     # v39s (spectral_graph_n8_l1imp): [λ1 - λ2⁺/(λ1+ε)]_+.
                     # v39lam1 (spectral_graph_n8_lam1): π = max(λ1, 0); no λ2.
-                    # λ1, q1 are the Perron power pair (skip k=8 Ritz).
+                    # λ1, q1 are the Perron power pair (skip k=8 Ritz), unless
+                    # lam1_ritz: then λ1 is the k=8 Ritz value and π stays max(λ1, 0).
                     # Curriculum P stays global. Raw A, bind tokens, detached.
                     # n8_lam1 is kept so a split temporal mix (v39l1) can use
                     # scale while the decoder keeps the gap π. v39lam1 sets
@@ -1856,6 +1868,7 @@ class LatentProcessor(nn.Module):
                         divide_by_lambda1=(ck == "spectral_graph_n8_rel"),
                         l1_minus_imp=(ck == "spectral_graph_n8_l1imp"),
                         use_lambda1=(ck == "spectral_graph_n8_lam1"),
+                        lam1_ritz=bool(lam1_ritz),
                         return_q1=bool(eval_perron_readout),
                         sqrt_a=bool(sqrt_a),
                         sqrt_pi=bool(sqrt_pi),
@@ -2206,6 +2219,9 @@ class LatentProcessor(nn.Module):
                 pred_kwargs["key_weights"] = _pair_isolate_weights(src_g).to(
                     dtype=updated_state.dtype
                 )
+        if "key_weights" in pred_kwargs and not predictor_src_zero_uniform:
+            # All-zero gate row stays 0/0. The default rewrites it to uniform.
+            pred_kwargs["key_weight_zero_uniform"] = False
         # v39lam1gu_umix defers Pred until π̄ and u_t are known.
         if self.predictor and not predictor_input_mix:
             predicted_state = self.predictor(updated_state, **pred_kwargs)
@@ -2475,6 +2491,7 @@ class ScanOverTime(nn.Module):
         state_max_norm: bool = False,
         predictor_ungated: bool = False,
         predictor_src_gate: bool = False,
+        predictor_src_zero_uniform: bool = True,
         predictor_src_max_norm: bool = False,
         predictor_src_self: bool = False,
         predictor_pair_isolate: bool = False,
@@ -2509,6 +2526,7 @@ class ScanOverTime(nn.Module):
         eval_perron_readout: bool = False,
         pi_gamma: float = 1.0,
         sqrt_a: bool = False,
+        lam1_ritz: bool = False,
         sqrt_pi: bool = False,
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
@@ -2531,6 +2549,7 @@ class ScanOverTime(nn.Module):
             state_max_norm=state_max_norm,
             predictor_ungated=predictor_ungated,
             predictor_src_gate=predictor_src_gate,
+            predictor_src_zero_uniform=predictor_src_zero_uniform,
             predictor_src_max_norm=predictor_src_max_norm,
             predictor_src_self=predictor_src_self,
             predictor_pair_isolate=predictor_pair_isolate,
@@ -2557,6 +2576,7 @@ class ScanOverTime(nn.Module):
             eval_perron_readout=eval_perron_readout,
             pi_gamma=pi_gamma,
             sqrt_a=sqrt_a,
+            lam1_ritz=lam1_ritz,
             sqrt_pi=sqrt_pi,
             pi_slot_gamma=pi_slot_gamma,
             pi_rival=pi_rival,

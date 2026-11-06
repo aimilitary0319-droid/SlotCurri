@@ -460,6 +460,7 @@ class Attention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         key_weights: Optional[torch.Tensor] = None,
         key_weight_eps: float = 1e-6,
+        key_weight_zero_uniform: bool = True,
         return_weights: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         key = key if key is not None else query
@@ -526,8 +527,9 @@ class Attention(nn.Module):
                         f"`key_weights` should have shape {expected}, but has shape "
                         f"{tuple(key_weights.shape)}"
                     )
-                alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
-                g = torch.where(alive, g, torch.ones_like(g))
+                if key_weight_zero_uniform:
+                    alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
+                    g = torch.where(alive, g, torch.ones_like(g))
                 log_g = torch.where(
                     g > 0, g.log(), torch.full_like(g, float("-inf"))
                 )
@@ -543,8 +545,9 @@ class Attention(nn.Module):
                     )
                 # Per-query row: if a query is fully blocked, fall back to uniform
                 # rather than 0/0 NaN (same policy as the per-key src-gate).
-                alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
-                g = torch.where(alive, g, torch.ones_like(g))
+                if key_weight_zero_uniform:
+                    alive = g.sum(dim=-1, keepdim=True) > float(key_weight_eps)
+                    g = torch.where(alive, g, torch.ones_like(g))
                 log_g = torch.where(
                     g > 0, g.log(), torch.full_like(g, float("-inf"))
                 )
@@ -648,6 +651,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
         keys: Optional[torch.Tensor] = None,
         values: Optional[torch.Tensor] = None,
         key_weights: Optional[torch.Tensor] = None,
+        key_weight_zero_uniform: bool = True,
         return_weights: bool = False,
     ) -> torch.Tensor:
         keys = keys if keys is not None else x
@@ -659,6 +663,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             key_weights=key_weights,
+            key_weight_zero_uniform=key_weight_zero_uniform,
             return_weights=return_weights,
         )
         x = self.dropout1(x)
@@ -692,6 +697,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
         memory: Optional[torch.Tensor] = None,
         vel: Optional[torch.Tensor] = None,
         key_weights: Optional[torch.Tensor] = None,
+        key_weight_zero_uniform: bool = True,
     ) -> torch.Tensor:
         x = src
         if self.norm_first:
@@ -701,6 +707,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
                 self._sa_block(
                     h, src_mask, src_key_padding_mask, keys=kv, values=kv,
                     key_weights=key_weights,
+                    key_weight_zero_uniform=key_weight_zero_uniform,
                 )
             )
             x = x + self.scale2(self._ff_block(self.norm2(x)))
@@ -712,6 +719,7 @@ class TransformerEncoderLayer(nn.TransformerEncoderLayer):
                     self._sa_block(
                         x, src_mask, src_key_padding_mask, keys=kv, values=kv,
                         key_weights=key_weights,
+                        key_weight_zero_uniform=key_weight_zero_uniform,
                     )
                 )
             )
@@ -772,11 +780,15 @@ class TransformerEncoder(nn.Module):
         memory: Optional[torch.Tensor] = None,
         vel: Optional[torch.Tensor] = None,
         key_weights: Optional[torch.Tensor] = None,
+        key_weight_zero_uniform: bool = True,
     ) -> torch.Tensor:
         x = inp
 
         for block in self.blocks:
-            x = block(x, mask, key_padding_mask, memory, vel, key_weights)
+            x = block(
+                x, mask, key_padding_mask, memory, vel, key_weights,
+                key_weight_zero_uniform,
+            )
 
         return x
 

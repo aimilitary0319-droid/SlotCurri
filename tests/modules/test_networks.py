@@ -112,6 +112,14 @@ def test_attention_key_weights_is_gated_softmax():
     _, attn_1 = attention(q, key_weights=torch.ones(bs, n), return_weights=True)
     _, attn_u = attention(q, return_weights=True)
     assert torch.allclose(attn_1, attn_u, atol=1e-5)
+    dead = torch.zeros(bs, n)
+    _, attn_dead = attention(q, key_weights=dead, return_weights=True)
+    assert torch.isfinite(attn_dead).all()
+    assert torch.allclose(attn_dead, attn_u, atol=1e-5)
+    _, attn_nan = attention(
+        q, key_weights=dead, key_weight_zero_uniform=False, return_weights=True
+    )
+    assert torch.isnan(attn_nan).all()
 
 
 @pytest.mark.parametrize("memory", [False, True])

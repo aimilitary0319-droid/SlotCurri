@@ -618,6 +618,12 @@ def test_lam1_is_perron_power_pair():
     assert torch.allclose(q1_out, q1.squeeze(-1), atol=1e-6)
     lam1_ritz, _ = _top2_algebraic_n8(z, a, n_iter=16, eps=1e-6, lam1_only=False)
     assert not torch.allclose(lam1, lam1_ritz, atol=0.0, rtol=0.0)
+    pi_ritz, lam1_r, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lam1_ritz=True, chunk_size=1
+    )
+    assert torch.allclose(pi_ritz, lam1_ritz.clamp_min(0.0), atol=1e-5)
+    assert torch.allclose(lam1_r, lam1_ritz, atol=1e-5)
+    assert not torch.allclose(pi_ritz, pi, atol=1e-5)
 
 
 def test_lam1_matches_hand_formula_and_is_detached():
