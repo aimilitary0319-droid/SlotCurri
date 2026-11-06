@@ -322,53 +322,78 @@ class SlotAttention(nn.Module):
         slots = self.norm_slots(slots) # 1 7 64
         queries = self.to_q(slots)
 
-        # fp16 flushes a losing slot's scores to 0, and eps=1e-8 flushes too,
-        # so the patch mean is 0/0. Competition and the mean stay in fp32.
-        amp_ctx = (
-            torch.cuda.amp.autocast(enabled=False) if queries.is_cuda else nullcontext()
+        # Plain softmax is the September 2026 v39lam1gu competition: dots, softmax,
+        # and the patch mean stay in the trainer autocast dtype. Variants keep the
+        # fp32 block below. fp16 flushes a losing slot to 0, and eps=1e-8 flushes
+        # too, so a margin or entmax row can be 0/0.
+        legacy_softmax = (
+            self.attn_norm == "softmax"
+            and not self.dot_ktemp
+            and self.logit_div == 1.0
+            and not self.tie_break
+            and not self.pi_attn_norm
+            and not self.margin_gate_slot_norm
+            and not self.pi_logit_center
         )
-        with amp_ctx:
-            q = queries.float()
-            k = keys.float()
-            if self.dot_ktemp:
-                dots = dot_ktemp_logits(
-                    q, k, self.dot_ktemp_odds, sqrt_width=self.dot_ktemp_sqrt
-                )
-            else:
-                dots = torch.einsum("bsd, bfd -> bsf", q, k) * self.scale
-            dots = dots / self.logit_div
-            if self.tie_break and self.training:
-                dots = break_slot_ties(
-                    dots,
-                    steps=self.tie_break_steps,
-                    lr=self.tie_break_lr,
-                    noise_std=self.tie_break_noise,
-                )
-            pre_norm_attn = attention_over_slots(dots, self.attn_norm)  # b slot patch
-            attn = margin_update_weights(
-                pre_norm_attn,
-                self.eps,
-                slot_norm=self.attn_norm == "margin" and self.margin_slot_norm,
-                power=self.margin_update_power if self.attn_norm == "margin" else 1.0,
-            )
-            updates = torch.einsum("bsf, bfd -> bsd", attn, values.float())
-            # π reads this map. The slot update above stays on pre_norm_attn
-            # unless margin_slot_norm / margin_update_power reweights it.
-            # Detach: π is already a no-grad gate, so this Jacobian must not train dots.
-            # margin_gate_slot_norm feeds π the same slot-sum used by the update:
-            # a tie of 0.5 becomes 1/S, a unique win stays 1. The patch mean is unchanged.
+        if legacy_softmax:
+            dots = torch.einsum("bsd, bfd -> bsf", queries, keys) * self.scale
+            pre_norm_attn = torch.softmax(dots, dim=1)  # b slot patch
+            attn = pre_norm_attn + self.eps
+            attn = attn / attn.sum(-1, keepdim=True)
+            updates = torch.einsum("bsf, bfd -> bsd", attn, values)
             pi_attn = None
-            if self.pi_attn_norm:
-                pi_attn = attention_over_slots(dots, self.pi_attn_norm).detach()
-            elif self.margin_gate_slot_norm:
-                pi_attn = (
-                    pre_norm_attn
-                    / pre_norm_attn.sum(dim=1, keepdim=True).clamp_min(float(self.eps))
-                ).detach()
-            elif self.pi_logit_center:
-                pi_attn = torch.softmax(
-                    dots - dots.mean(dim=-1, keepdim=True), dim=1
-                ).detach()
+        else:
+            amp_ctx = (
+                torch.cuda.amp.autocast(enabled=False)
+                if queries.is_cuda
+                else nullcontext()
+            )
+            with amp_ctx:
+                q = queries.float()
+                k = keys.float()
+                if self.dot_ktemp:
+                    dots = dot_ktemp_logits(
+                        q, k, self.dot_ktemp_odds, sqrt_width=self.dot_ktemp_sqrt
+                    )
+                else:
+                    dots = torch.einsum("bsd, bfd -> bsf", q, k) * self.scale
+                dots = dots / self.logit_div
+                if self.tie_break and self.training:
+                    dots = break_slot_ties(
+                        dots,
+                        steps=self.tie_break_steps,
+                        lr=self.tie_break_lr,
+                        noise_std=self.tie_break_noise,
+                    )
+                pre_norm_attn = attention_over_slots(dots, self.attn_norm)
+                attn = margin_update_weights(
+                    pre_norm_attn,
+                    self.eps,
+                    slot_norm=self.attn_norm == "margin" and self.margin_slot_norm,
+                    power=(
+                        self.margin_update_power if self.attn_norm == "margin" else 1.0
+                    ),
+                )
+                updates = torch.einsum("bsf, bfd -> bsd", attn, values.float())
+                # π reads this map. The slot update above stays on pre_norm_attn
+                # unless margin_slot_norm / margin_update_power reweights it.
+                # Detach: π is already a no-grad gate, so this Jacobian must not
+                # train dots. margin_gate_slot_norm feeds π the same slot-sum
+                # used by the update: a tie of 0.5 becomes 1/S, a unique win stays 1.
+                pi_attn = None
+                if self.pi_attn_norm:
+                    pi_attn = attention_over_slots(dots, self.pi_attn_norm).detach()
+                elif self.margin_gate_slot_norm:
+                    pi_attn = (
+                        pre_norm_attn
+                        / pre_norm_attn.sum(dim=1, keepdim=True).clamp_min(
+                            float(self.eps)
+                        )
+                    ).detach()
+                elif self.pi_logit_center:
+                    pi_attn = torch.softmax(
+                        dots - dots.mean(dim=-1, keepdim=True), dim=1
+                    ).detach()
         updates = updates.to(dtype=slots.dtype)
         pre_norm_attn = pre_norm_attn.to(dtype=slots.dtype)
         # Last-iteration pre-softmax logits. SSync reads these; the slot update
