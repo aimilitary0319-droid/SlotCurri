@@ -881,6 +881,8 @@ def _top2_algebraic_g(
     eps: float,
     return_q1: bool = False,
     lam1_only: bool = False,
+    ritz_k: Optional[int] = None,
+    ritz_iters: Optional[int] = None,
 ):
     """Algebraic λ1 ≥ λ2 of G_s given Gv = apply_g(v).
 
@@ -919,7 +921,12 @@ def _top2_algebraic_g(
         return lam1, zero
     shift = lam1.clamp_min(0.0) + float(eps)
 
-    n_k = int(min(8, n_tokens))
+    n_k = int(min(8 if ritz_k is None else ritz_k, n_tokens))
+    if n_k < 2:
+        raise ValueError(f"ritz_k must be >= 2, got {ritz_k}")
+    n_sub = n_iter if ritz_iters is None else int(ritz_iters)
+    if n_sub < 0:
+        raise ValueError(f"ritz_iters must be >= 0, got {ritz_iters}")
     grid = torch.linspace(0.0, 1.0, n_tokens, device=a.device, dtype=a.dtype)
     cols = [q1.squeeze(-1)]
     for freq in range(1, n_k):
@@ -931,7 +938,7 @@ def _top2_algebraic_g(
     def apply_h(basis: torch.Tensor) -> torch.Tensor:
         return apply_g(basis) + (shift.unsqueeze(-1).unsqueeze(-1) * basis)
 
-    for _ in range(n_iter):
+    for _ in range(n_sub):
         q = _qr_mgs(apply_h(q) + float(eps) * q, eps)
 
     hq = apply_h(q)
@@ -951,6 +958,8 @@ def _top2_algebraic_diag_s_diag(
     eps: float,
     return_q1: bool = False,
     lam1_only: bool = False,
+    ritz_k: Optional[int] = None,
+    ritz_iters: Optional[int] = None,
 ):
     """Algebraic λ1 ≥ λ2 of G_s = diag(a_s) S diag(a_s) for dense S (v38)."""
 
@@ -958,7 +967,9 @@ def _top2_algebraic_diag_s_diag(
         return _apply_g_diag_s_diag(s_mat, a, basis)
 
     return _top2_algebraic_g(
-        apply_g, a, n_iter, eps, return_q1=return_q1, lam1_only=lam1_only
+        apply_g, a, n_iter, eps,
+        return_q1=return_q1, lam1_only=lam1_only,
+        ritz_k=ritz_k, ritz_iters=ritz_iters,
     )
 
 
@@ -969,6 +980,8 @@ def _top2_algebraic_n8(
     eps: float,
     return_q1: bool = False,
     lam1_only: bool = False,
+    ritz_k: Optional[int] = None,
+    ritz_iters: Optional[int] = None,
     sqrt_a: bool = False,
     s_form: str = "sym",
 ):
@@ -985,7 +998,9 @@ def _top2_algebraic_n8(
         return _apply_g_n8(d_inv, weights, gate_a, basis)
 
     return _top2_algebraic_g(
-        apply_g, a, n_iter, eps, return_q1=return_q1, lam1_only=lam1_only
+        apply_g, a, n_iter, eps,
+        return_q1=return_q1, lam1_only=lam1_only,
+        ritz_k=ritz_k, ritz_iters=ritz_iters,
     )
 
 
@@ -1072,6 +1087,8 @@ def spectral_graph_n8_eigs(
     l1_minus_imp: bool = False,
     use_lambda1: bool = False,
     lam1_ritz: bool = False,
+    ritz_k: Optional[int] = None,
+    ritz_iters: Optional[int] = None,
     return_q1: bool = False,
     sqrt_a: bool = False,
     sqrt_pi: bool = False,
@@ -1196,6 +1213,8 @@ def spectral_graph_n8_eigs(
                     eps,
                     return_q1=return_q1,
                     lam1_only=lam1_only,
+                    ritz_k=ritz_k,
+                    ritz_iters=ritz_iters,
                 )
             else:
                 packed = _top2_algebraic_n8(
@@ -1205,6 +1224,8 @@ def spectral_graph_n8_eigs(
                     eps,
                     return_q1=return_q1,
                     lam1_only=lam1_only,
+                    ritz_k=ritz_k,
+                    ritz_iters=ritz_iters,
                     sqrt_a=sqrt_a,
                     s_form=s_form,
                 )
@@ -1664,6 +1685,8 @@ class LatentProcessor(nn.Module):
         pi_gamma: float = 1.0,
         sqrt_a: bool = False,
         lam1_ritz: bool = False,
+        lam1_ritz_k: Optional[int] = None,
+        lam1_ritz_iters: Optional[int] = None,
         sqrt_pi: bool = False,
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
@@ -1869,6 +1892,8 @@ class LatentProcessor(nn.Module):
                         l1_minus_imp=(ck == "spectral_graph_n8_l1imp"),
                         use_lambda1=(ck == "spectral_graph_n8_lam1"),
                         lam1_ritz=bool(lam1_ritz),
+                        ritz_k=lam1_ritz_k,
+                        ritz_iters=lam1_ritz_iters,
                         return_q1=bool(eval_perron_readout),
                         sqrt_a=bool(sqrt_a),
                         sqrt_pi=bool(sqrt_pi),
@@ -2527,6 +2552,8 @@ class ScanOverTime(nn.Module):
         pi_gamma: float = 1.0,
         sqrt_a: bool = False,
         lam1_ritz: bool = False,
+        lam1_ritz_k: Optional[int] = None,
+        lam1_ritz_iters: Optional[int] = None,
         sqrt_pi: bool = False,
         pi_slot_gamma: float = 1.0,
         pi_rival: bool = False,
@@ -2577,6 +2604,8 @@ class ScanOverTime(nn.Module):
             pi_gamma=pi_gamma,
             sqrt_a=sqrt_a,
             lam1_ritz=lam1_ritz,
+            lam1_ritz_k=lam1_ritz_k,
+            lam1_ritz_iters=lam1_ritz_iters,
             sqrt_pi=sqrt_pi,
             pi_slot_gamma=pi_slot_gamma,
             pi_rival=pi_rival,

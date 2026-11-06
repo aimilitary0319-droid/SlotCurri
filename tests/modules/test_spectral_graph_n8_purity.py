@@ -626,6 +626,27 @@ def test_lam1_is_perron_power_pair():
     assert not torch.allclose(pi_ritz, pi, atol=1e-5)
 
 
+def test_lam1_ritz2_tracks_full_k8():
+    """k=2 and 2 subspace steps stay near the k=8, 16-step Ritz λ1."""
+    torch.manual_seed(0)
+    att = torch.softmax(torch.randn(2, 11, 576), dim=1)
+    feat = torch.randn(2, 576, 16)
+    full, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lam1_ritz=True, chunk_size=1
+    )
+    cheap, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lam1_ritz=True,
+        ritz_k=2, ritz_iters=2, chunk_size=1,
+    )
+    power, _, _ = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lam1_ritz=False, chunk_size=1
+    )
+    rel = (cheap - full).abs() / full.clamp_min(1e-8)
+    rel_power = (power - full).abs() / full.clamp_min(1e-8)
+    assert rel.median() < 5e-4
+    assert rel.median() < rel_power.median()
+
+
 def test_lam1_matches_hand_formula_and_is_detached():
     torch.manual_seed(0)
     att = torch.softmax(torch.randn(2, 4, 16), dim=1)

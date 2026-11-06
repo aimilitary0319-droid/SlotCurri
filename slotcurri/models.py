@@ -1345,6 +1345,24 @@ class ObjectCentricModel(pl.LightningModule):
                 "conf_kind='spectral_graph_n8_lam1' so π stays max(λ1, 0), "
                 f"got {self.amc_conf_kind!r}"
             )
+        # None keeps the full k=8, n_iter subspace. ritz2 sets k=2, iters=2.
+        raw_k = amc.get("lam1_ritz_k", None)
+        raw_iters = amc.get("lam1_ritz_iters", None)
+        self.amc_lam1_ritz_k = None if raw_k in (None, "") else int(raw_k)
+        self.amc_lam1_ritz_iters = None if raw_iters in (None, "") else int(raw_iters)
+        if (self.amc_lam1_ritz_k is not None or self.amc_lam1_ritz_iters is not None) and not self.amc_lam1_ritz:
+            raise ValueError(
+                "attn_mass_curriculum.lam1_ritz_k / lam1_ritz_iters require lam1_ritz: true"
+            )
+        if self.amc_lam1_ritz_k is not None and self.amc_lam1_ritz_k < 2:
+            raise ValueError(
+                f"attn_mass_curriculum.lam1_ritz_k must be >= 2, got {self.amc_lam1_ritz_k}"
+            )
+        if self.amc_lam1_ritz_iters is not None and self.amc_lam1_ritz_iters < 0:
+            raise ValueError(
+                "attn_mass_curriculum.lam1_ritz_iters must be >= 0, "
+                f"got {self.amc_lam1_ritz_iters}"
+            )
         # Default True rewrites an all-zero Pred source-gate row to uniform.
         # False leaves that row as 0/0.
         self.amc_src_gate_zero_uniform = bool(amc.get("src_gate_zero_uniform", True))
@@ -1894,6 +1912,8 @@ class ObjectCentricModel(pl.LightningModule):
                 spectral_proj_dim=self.amc_spectral_proj_dim,
                 sqrt_a=self.amc_sqrt_a,
                 lam1_ritz=self.amc_lam1_ritz,
+                lam1_ritz_k=self.amc_lam1_ritz_k,
+                lam1_ritz_iters=self.amc_lam1_ritz_iters,
                 sqrt_pi=self.amc_sqrt_pi,
                 pi_slot_gamma=self.amc_pi_slot_gamma,
                 pi_rival=self.amc_pi_rival,
