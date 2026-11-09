@@ -823,6 +823,9 @@ class ObjectCentricModel(pl.LightningModule):
         # keep scalar π. perron_readout: train+eval. eval_perron_readout: eval only.
         self.amc_perron_readout = bool(amc.get("perron_readout", False))
         self.amc_eval_perron_readout = bool(amc.get("eval_perron_readout", False))
+        # Eval-only. Keeps the training λ1 solver (Lanczos) and replaces the
+        # readout q1 with the +ones power-iteration Perron vector of the same G.
+        self.amc_eval_perron_power_q1 = bool(amc.get("eval_perron_power_q1", False))
         # Optional eval-only Pred source-gate. None = same as train
         # (predictor_src_gate). False = vanilla Pred SA at eval only.
         _eval_src = amc.get("eval_predictor_src_gate", None)
@@ -1949,6 +1952,9 @@ class ObjectCentricModel(pl.LightningModule):
                 eval_perron_readout=(
                     bool(self.amc_perron_readout)
                     or (not train and bool(self.amc_eval_perron_readout))
+                ),
+                eval_perron_power_q1=(
+                    not train and bool(self.amc_eval_perron_power_q1)
                 ),
                 pi_gamma=(
                     1.0 if train else float(self.amc_eval_pi_gamma)

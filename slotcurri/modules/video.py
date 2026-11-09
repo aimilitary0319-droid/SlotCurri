@@ -874,6 +874,27 @@ def _apply_g_diag_s_diag(
     return a.unsqueeze(-1) * sav
 
 
+def _power_perron_q1(
+    apply_g: Callable[[torch.Tensor], torch.Tensor],
+    a: torch.Tensor,
+    n_iter: int,
+    eps: float,
+) -> torch.Tensor:
+    """Perron vector of G by power iteration from +ones.
+
+    For a nonnegative symmetric G this stays in the nonnegative cone, which is
+    the q1 used by the v39lam1 power path. (B, S, N, 1).
+    """
+    bsz, n_slots, n_tokens = a.shape
+    ones = torch.ones(bsz, n_slots, n_tokens, 1, device=a.device, dtype=a.dtype)
+    q1 = ones / ones.norm(dim=2, keepdim=True).clamp_min(eps)
+    for _ in range(max(int(n_iter), 1)):
+        gq = apply_g(q1)
+        nrm = gq.norm(dim=2, keepdim=True)
+        q1 = torch.where(nrm > float(eps), gq / nrm.clamp_min(eps), q1)
+    return q1
+
+
 def _lanczos_lam1(
     apply_g: Callable[[torch.Tensor], torch.Tensor],
     a: torch.Tensor,
@@ -948,6 +969,7 @@ def _top2_algebraic_g(
     ritz_k: Optional[int] = None,
     ritz_iters: Optional[int] = None,
     lanczos_steps: Optional[int] = None,
+    perron_power_q1: bool = False,
 ):
     """Algebraic λ1 ≥ λ2 of G_s given Gv = apply_g(v).
 
@@ -956,6 +978,8 @@ def _top2_algebraic_g(
     Perron pair (q1, q1^T G q1). v39lam1 (`lam1_only`) stops there: occupancy
     only needs that pair, and the k=8 Ritz below exists to resolve λ2.
     `lanczos_steps` replaces both with a Krylov estimate of λ1.
+    `perron_power_q1` keeps that Lanczos λ1 and swaps only the returned q1
+    for the +ones power-iteration vector of the same G.
 
     Otherwise shift H = G + (λ1 + eps) I so H is PSD with condition ~2, then
     a k=8 subspace iteration + Rayleigh-Ritz; the two largest Ritz values
@@ -971,17 +995,13 @@ def _top2_algebraic_g(
             return zero, zero, q0
         return zero, zero
     if lanczos_steps is not None:
-        return _lanczos_lam1(apply_g, a, lanczos_steps, eps, return_q1)
+        packed = _lanczos_lam1(apply_g, a, lanczos_steps, eps, return_q1)
+        if return_q1 and perron_power_q1:
+            lam1, lam2, _ = packed
+            return lam1, lam2, _power_perron_q1(apply_g, a, n_iter, eps)
+        return packed
 
-    n_iter = max(int(n_iter), 1)
-    ones = torch.ones(
-        bsz, n_slots, n_tokens, 1, device=a.device, dtype=a.dtype
-    )
-    q1 = ones / ones.norm(dim=2, keepdim=True).clamp_min(eps)
-    for _ in range(n_iter):
-        gq = apply_g(q1)
-        nrm = gq.norm(dim=2, keepdim=True)
-        q1 = torch.where(nrm > float(eps), gq / nrm.clamp_min(eps), q1)
+    q1 = _power_perron_q1(apply_g, a, n_iter, eps)
     lam1 = (q1 * apply_g(q1)).sum(dim=2).squeeze(-1)
     if lam1_only:
         if return_q1:
@@ -1029,6 +1049,7 @@ def _top2_algebraic_diag_s_diag(
     ritz_k: Optional[int] = None,
     ritz_iters: Optional[int] = None,
     lanczos_steps: Optional[int] = None,
+    perron_power_q1: bool = False,
 ):
     """Algebraic λ1 ≥ λ2 of G_s = diag(a_s) S diag(a_s) for dense S (v38)."""
 
@@ -1040,6 +1061,7 @@ def _top2_algebraic_diag_s_diag(
         return_q1=return_q1, lam1_only=lam1_only,
         ritz_k=ritz_k, ritz_iters=ritz_iters,
         lanczos_steps=lanczos_steps,
+        perron_power_q1=perron_power_q1,
     )
 
 
@@ -1055,6 +1077,7 @@ def _top2_algebraic_n8(
     lanczos_steps: Optional[int] = None,
     sqrt_a: bool = False,
     s_form: str = "sym",
+    perron_power_q1: bool = False,
 ):
     """Algebraic λ1 ≥ λ2 of G_s on the 8-neighbor ReLU-cosine S (v39).
 
@@ -1073,6 +1096,7 @@ def _top2_algebraic_n8(
         return_q1=return_q1, lam1_only=lam1_only,
         ritz_k=ritz_k, ritz_iters=ritz_iters,
         lanczos_steps=lanczos_steps,
+        perron_power_q1=perron_power_q1,
     )
 
 
@@ -1171,6 +1195,7 @@ def spectral_graph_n8_eigs(
     a_slot_max: bool = False,
     s_form: str = "sym",
     gate_graph: str = "n8",
+    perron_power_q1: bool = False,
 ):
     """Detached n8 spectrum: π, λ1, λ2 each (B, S). π is the v39 / v39n / v39s / v39lam1 gate.
 
@@ -1302,6 +1327,7 @@ def spectral_graph_n8_eigs(
                     ritz_k=ritz_k,
                     ritz_iters=ritz_iters,
                     lanczos_steps=lanczos_steps,
+                    perron_power_q1=perron_power_q1,
                 )
             else:
                 packed = _top2_algebraic_n8(
@@ -1316,6 +1342,7 @@ def spectral_graph_n8_eigs(
                     lanczos_steps=lanczos_steps,
                     sqrt_a=sqrt_a,
                     s_form=s_form,
+                    perron_power_q1=perron_power_q1,
                 )
             if return_q1:
                 lam1, lam2, q1 = packed
@@ -1770,6 +1797,7 @@ class LatentProcessor(nn.Module):
         spectral_proj_dim: int = 0,
         eval_hard_thresh: float = 0.0,
         eval_perron_readout: bool = False,
+        eval_perron_power_q1: bool = False,
         pi_gamma: float = 1.0,
         sqrt_a: bool = False,
         lam1_ritz: bool = False,
@@ -1985,6 +2013,7 @@ class LatentProcessor(nn.Module):
                         ritz_iters=lam1_ritz_iters,
                         lanczos_steps=lam1_lanczos_steps,
                         return_q1=bool(eval_perron_readout),
+                        perron_power_q1=bool(eval_perron_power_q1),
                         sqrt_a=bool(sqrt_a),
                         sqrt_pi=bool(sqrt_pi),
                         slot_gamma=pi_slot_gamma,
@@ -2639,6 +2668,7 @@ class ScanOverTime(nn.Module):
         spectral_proj_dim: int = 0,
         eval_hard_thresh: float = 0.0,
         eval_perron_readout: bool = False,
+        eval_perron_power_q1: bool = False,
         pi_gamma: float = 1.0,
         sqrt_a: bool = False,
         lam1_ritz: bool = False,
@@ -2692,6 +2722,7 @@ class ScanOverTime(nn.Module):
             spectral_proj_dim=spectral_proj_dim,
             eval_hard_thresh=eval_hard_thresh,
             eval_perron_readout=eval_perron_readout,
+            eval_perron_power_q1=eval_perron_power_q1,
             pi_gamma=pi_gamma,
             sqrt_a=sqrt_a,
             lam1_ritz=lam1_ritz,

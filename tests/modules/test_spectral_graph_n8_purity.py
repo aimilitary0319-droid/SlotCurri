@@ -774,6 +774,28 @@ def test_lam1_lanczos16_properties():
             spectral_graph_n8_eigs(datt, dfeat, **kwargs)
 
 
+def test_lanczos16_perron_power_q1_keeps_lambda_swaps_vector():
+    """Readout q1 can be the power-iteration vector while λ1 stays Lanczos."""
+    torch.manual_seed(3)
+    att = torch.softmax(0.15 * torch.randn(2, 7, 144), dim=1)
+    feat = torch.randn(2, 144, 16)
+    pi_l, lam_l, _, q_l = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16, chunk_size=1, return_q1=True
+    )
+    _, _, _, q_p = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, chunk_size=1, return_q1=True
+    )
+    pi_h, lam_h, _, q_h = spectral_graph_n8_eigs(
+        att, feat, use_lambda1=True, lanczos_steps=16, chunk_size=1,
+        return_q1=True, perron_power_q1=True,
+    )
+    assert torch.equal(pi_h, pi_l)
+    assert torch.equal(lam_h, lam_l)
+    assert torch.allclose(q_h, q_p, atol=1e-5)
+    assert q_h.min() >= -1e-6
+    assert not torch.allclose(q_h, q_l, atol=1e-3)
+
+
 def test_ytvis_lanczos16_config():
     from slotcurri import configuration
 
