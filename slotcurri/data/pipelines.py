@@ -3,6 +3,7 @@ from functools import partial
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
+import torch
 import webdataset as wds
 
 from slotcurri.data import transforms
@@ -73,6 +74,7 @@ class ImagePipeline(DataPipeline):
         shuffle: bool = False,
         shuffle_size: int = 1000,
         duplicate: Optional[Dict[str, str]] = None,
+        as_single_frame_video: bool = False,
     ):
         super().__init__(keys)
         self.transforms = transforms
@@ -82,6 +84,15 @@ class ImagePipeline(DataPipeline):
         self.is_video_dataset = is_video_dataset
         self.one_frame_per_video = one_frame_per_video
         self.duplicate = duplicate
+        # Still images (COCO) enter the video model as length-1 clips: image
+        # (C, H, W) becomes video (1, C, H, W). Keys stay the shard keys; the
+        # rename happens after filtering and transforms.
+        self.as_single_frame_video = bool(as_single_frame_video)
+        if self.as_single_frame_video and self.is_video_dataset:
+            raise ValueError(
+                "as_single_frame_video expects image samples. "
+                "is_video_dataset already splits a video into frames."
+            )
 
     def get_num_samples(self, num_orig_samples: int) -> Optional[int]:
         if self.video_size is not None:
@@ -111,6 +122,9 @@ class ImagePipeline(DataPipeline):
 
         if self.transforms is not None:
             dataset = dataset.map_dict(**self.transforms)
+
+        if self.as_single_frame_video:
+            dataset = dataset.map(promote_image_sample_to_video)
 
         return dataset
 
@@ -221,6 +235,31 @@ def split_to_chunks(
                 chunked_data[key] = value
             chunked_data["__key__"] = f"{key}_{chunk_id}"
             yield chunked_data
+
+
+def _unsqueeze_time(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.unsqueeze(0)
+    if isinstance(value, np.ndarray):
+        return np.expand_dims(value, 0)
+    raise TypeError(
+        "as_single_frame_video expected a tensor or ndarray, "
+        f"got {type(value).__name__}"
+    )
+
+
+def promote_image_sample_to_video(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn one still image into a length-1 video sample.
+
+    The video model reads `video` with a time axis. Shard filtering still uses
+    `image` (and `segmentations` on val); this runs after those transforms.
+    """
+    if "image" not in sample:
+        raise KeyError("as_single_frame_video requires an 'image' entry")
+    sample["video"] = _unsqueeze_time(sample.pop("image"))
+    if "segmentations" in sample:
+        sample["segmentations"] = _unsqueeze_time(sample["segmentations"])
+    return sample
 
 
 def copy_dict_entries(dictionary: Dict[str, Any], copy_from_to: Dict[str, str]) -> Dict[str, Any]:
